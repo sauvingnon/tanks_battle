@@ -193,25 +193,44 @@ EOF
 
 ### HTTPS
 
-Браузер разрешает `wss://` только с валидным сертификатом, поэтому для боевого
-домена нужен TLS:
+Браузер разрешает `wss://` только с валидным сертификатом. Домен игры —
+`tanksbattle.dotnetdon.ru`, `docker-compose.yml` и `docker/nginx-tls.conf` уже
+на него настроены. Клиент сам выберет `ws://` или `wss://` по протоколу
+страницы — менять код не нужно.
+
+**Порядок важен**: `nginx-tls.conf` ссылается на файлы сертификата, которых
+ещё нет. Если задеплоить этот конфиг раньше, чем сертификат появится на
+сервере, `web` не запустится. Поэтому сертификат выпускается **до** пуша в
+`main`:
 
 ```bash
-sudo certbot certonly --standalone -d tanks.example.com
+sudo apt-get update && sudo apt-get install -y certbot
+cd /srv/tanks_battle
+docker compose stop web
+sudo certbot certonly --standalone -d tanksbattle.dotnetdon.ru
+docker compose start web
 ```
 
-Затем в `docker/nginx-tls.conf` подставить свой домен, а в `docker-compose.yml`
-раскомментировать порт `443` и оба монтирования, после чего:
+Дальше — обычный пуш в `main`: автодеплой поднимет `web` уже с TLS.
+
+Правки `docker-compose.yml` и `nginx-tls.conf` нужно **коммитить в
+репозиторий**, а не редактировать вручную на сервере: деплой делает
+`git reset --hard origin/main` и стирает всё, что отличается от коммита.
+Сертификаты в `/etc/letsencrypt` это не трогает — они не в репозитории.
+
+Автопродление: пакет `certbot` сам ставит systemd-таймер, который дважды в
+день проверяет срок годности. Но `standalone`-плагину на момент продления
+нужен свободный порт 80, поэтому `web` нужно на секунду останавливать —
+хуки делают это автоматически:
 
 ```bash
-docker compose up -d --build web
+sudo mkdir -p /etc/letsencrypt/renewal-hooks/{pre,post}
+printf '#!/bin/sh\ndocker compose -f /srv/tanks_battle/docker-compose.yml stop web\n' \
+  | sudo tee /etc/letsencrypt/renewal-hooks/pre/stop-web.sh
+printf '#!/bin/sh\ndocker compose -f /srv/tanks_battle/docker-compose.yml start web\n' \
+  | sudo tee /etc/letsencrypt/renewal-hooks/post/start-web.sh
+sudo chmod +x /etc/letsencrypt/renewal-hooks/pre/stop-web.sh /etc/letsencrypt/renewal-hooks/post/start-web.sh
 ```
-
-Клиент сам выберет `ws://` или `wss://` по протоколу страницы — менять код не нужно.
-
-Правки `docker-compose.yml` под TLS нужно **закоммитить в репозиторий**, а не
-править на сервере: деплой делает `git reset --hard origin/main` и стирает всё,
-что отличается от коммита. Сертификаты в `/etc/letsencrypt` это не трогает.
 
 ## Что дальше
 
