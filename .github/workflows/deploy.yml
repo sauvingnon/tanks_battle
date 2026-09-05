@@ -1,0 +1,140 @@
+name: Deploy to Server
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+# Два пуша подряд не должны драться за один и тот же сервер.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  # Сначала прогоняем то, что можно проверить без сервера. Если игра сломана,
+  # на VPS она не поедет — деплой просто не запустится.
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Та же мажорная версия, что в docker/*.Dockerfile — CI должен
+          # проверять ровно то, что поедет на сервер.
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run typecheck
+      - run: npm run check:map
+      - run: npm run check:combat
+      - run: npm run check:smoothness
+
+      # Сборка обоих артефактов: ошибки vite/esbuild лучше поймать здесь,
+      # а не на сервере посреди `docker compose up`.
+      - run: npm run build
+      - run: npm run build:server
+
+  deploy:
+    needs: checks
+    runs-on: ubuntu-latest
+    env:
+      PROJECT_DIR: /srv/tanks_battle
+      REPO_SSH: git@github.com:sauvingnon/tanks_battle.git
+
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          # Ключ хоста забираем заранее: соединение проверяется по-настоящему,
+          # а не отключением проверки через StrictHostKeyChecking=no.
+          ssh-keyscan -p "${{ secrets.SSH_PORT || 22 }}" -H "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+          # Алиас `target`: дальше каждый шаг пишется просто как `ssh target`.
+          printf 'Host target\n  HostName %s\n  User %s\n  Port %s\n  IdentityFile ~/.ssh/id_ed25519\n  IdentitiesOnly yes\n' \
+            "${{ secrets.SSH_HOST }}" "${{ secrets.SSH_USER }}" "${{ secrets.SSH_PORT || 22 }}" > ~/.ssh/config
+          chmod 600 ~/.ssh/config
+
+      # Скрипты уходят на сервер через `bash -s` и heredoc в кавычках: раннер
+      # ничего в них не подставляет, поэтому кавычки и $ пишутся как обычно.
+      - name: Setup Git deploy key on server
+        run: |
+          ssh target 'bash -s' <<'REMOTE'
+          set -e
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          cat > ~/.ssh/id_tanks <<'KEY'
+          ${{ secrets.GIT_DEPLOY_KEY }}
+          KEY
+          chmod 600 ~/.ssh/id_tanks
+          ssh-keyscan -H github.com >> ~/.ssh/known_hosts 2>/dev/null
+          # Запись в ~/.ssh/config добавляем один раз: шаг гоняется на каждый деплой.
+          if ! grep -q 'IdentityFile ~/.ssh/id_tanks' ~/.ssh/config 2>/dev/null; then
+            printf 'Host github.com\n  IdentityFile ~/.ssh/id_tanks\n  IdentitiesOnly yes\n' >> ~/.ssh/config
+            chmod 600 ~/.ssh/config
+          fi
+          REMOTE
+
+      - name: Prepare project dir
+        run: |
+          ssh target 'bash -s' <<'REMOTE'
+          set -e
+          if ! command -v git >/dev/null; then
+            echo "Git не найден, ставлю..."
+            sudo apt-get update && sudo apt-get install -y git
+          fi
+          if ! sudo docker compose version >/dev/null 2>&1; then
+            echo "Docker с плагином compose не установлен — см. раздел «Деплой» в README" >&2
+            exit 1
+          fi
+          sudo mkdir -p ${{ env.PROJECT_DIR }}
+          sudo chown -R $(id -u):$(id -g) ${{ env.PROJECT_DIR }}
+          if [ ! -d ${{ env.PROJECT_DIR }}/.git ]; then
+            git clone ${{ env.REPO_SSH }} ${{ env.PROJECT_DIR }}
+          fi
+          REMOTE
+
+      - name: Deploy
+        run: |
+          ssh target 'bash -s' <<'REMOTE'
+          set -e
+          cd ${{ env.PROJECT_DIR }}
+          git fetch origin main
+          git reset --hard origin/main
+          # Без `down`: `up -d --build` пересоздаёт только изменившиеся контейнеры,
+          # так что простой измеряется секундами, а не временем сборки образа.
+          sudo docker compose up -d --build --remove-orphans
+          sudo docker image prune -f
+          REMOTE
+
+      - name: Health check
+        run: |
+          ssh target 'bash -s' <<'REMOTE'
+          set -e
+          cd ${{ env.PROJECT_DIR }}
+          sudo docker compose ps
+
+          # Имена контейнеров не хардкодим: их задаёт compose по имени каталога.
+          for service in server web; do
+            cid=$(sudo docker compose ps -q $service)
+            status=$(sudo docker inspect -f '{{.State.Status}}' "$cid" 2>/dev/null || echo missing)
+            echo "$service -> $status"
+            if [ "$status" != running ]; then
+              echo "Контейнер $service не работает"
+              sudo docker compose logs --tail=50 $service
+              exit 1
+            fi
+          done
+
+          # nginx поднимается быстрее игрового сервера, поэтому даём ему до 30 с.
+          for i in $(seq 1 15); do
+            if curl -fsS http://127.0.0.1/health; then echo; echo "Игра отвечает"; exit 0; fi
+            sleep 2
+          done
+          echo "/health не ответил за 30 с"
+          sudo docker compose logs --tail=50
+          exit 1
+          REMOTE
