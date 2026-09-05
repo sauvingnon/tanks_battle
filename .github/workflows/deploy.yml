@@ -86,7 +86,9 @@ jobs:
             echo "Git не найден, ставлю..."
             sudo apt-get update && sudo apt-get install -y git
           fi
-          if ! sudo docker compose version >/dev/null 2>&1; then
+          # Без sudo: плагин compose лежит в ~/.docker/cli-plugins пользователя,
+          # а не root — под sudo docker его не находит.
+          if ! docker compose version >/dev/null 2>&1; then
             echo "Docker с плагином compose не установлен — см. раздел «Деплой» в README" >&2
             exit 1
           fi
@@ -106,8 +108,8 @@ jobs:
           git reset --hard origin/main
           # Без `down`: `up -d --build` пересоздаёт только изменившиеся контейнеры,
           # так что простой измеряется секундами, а не временем сборки образа.
-          sudo docker compose up -d --build --remove-orphans
-          sudo docker image prune -f
+          docker compose up -d --build --remove-orphans
+          docker image prune -f
           REMOTE
 
       - name: Health check
@@ -115,16 +117,16 @@ jobs:
           ssh target 'bash -s' <<'REMOTE'
           set -e
           cd ${{ env.PROJECT_DIR }}
-          sudo docker compose ps
+          docker compose ps
 
           # Имена контейнеров не хардкодим: их задаёт compose по имени каталога.
           for service in server web; do
-            cid=$(sudo docker compose ps -q $service)
-            status=$(sudo docker inspect -f '{{.State.Status}}' "$cid" 2>/dev/null || echo missing)
+            cid=$(docker compose ps -q $service)
+            status=$(docker inspect -f '{{.State.Status}}' "$cid" 2>/dev/null || echo missing)
             echo "$service -> $status"
             if [ "$status" != running ]; then
               echo "Контейнер $service не работает"
-              sudo docker compose logs --tail=50 $service
+              docker compose logs --tail=50 $service
               exit 1
             fi
           done
@@ -135,6 +137,6 @@ jobs:
             sleep 2
           done
           echo "/health не ответил за 30 с"
-          sudo docker compose logs --tail=50
+          docker compose logs --tail=50
           exit 1
           REMOTE
