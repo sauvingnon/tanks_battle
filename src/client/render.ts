@@ -1,9 +1,12 @@
 import * as THREE from 'three';
 
-import type { Box } from '../shared/types.js';
+import { MAX_HP, SHELL_HEIGHT } from '../shared/constants.js';
+import { BOOM_GROUND, BOOM_HIT, BOOM_KILL, type Box, type BoomKind } from '../shared/types.js';
 
 /** Цвета корпусов; сервер присылает индекс в этой палитре. */
 const PALETTE = [0x4f7d5a, 0x7a5f9c, 0xa8632f, 0x3f6f96, 0x8a8f3a, 0x9c4a52, 0x3f8f88, 0x8a6a44];
+
+const UP = new THREE.Vector3(0, 1, 0);
 
 const CAMERA_DISTANCE = 15;
 const CAMERA_BASE_HEIGHT = 3.4;
@@ -22,14 +25,44 @@ const LABEL_HEIGHT = 3.7;
 /** Дальше этого ники не рисуем — всё равно нечитаемо, а DOM грузится. */
 const LABEL_MAX_DISTANCE = 160;
 
+/** Как выглядит взрыв каждого вида: радиус, время жизни, цвет и есть ли кольцо по земле. */
+const BOOM_PRESETS: Record<BoomKind, { radius: number; life: number; color: number; ring: boolean }> =
+  {
+    [BOOM_GROUND]: { radius: 1.6, life: 0.34, color: 0xffb257, ring: false },
+    [BOOM_HIT]: { radius: 2.2, life: 0.4, color: 0xffd27a, ring: false },
+    [BOOM_KILL]: { radius: 4.2, life: 0.75, color: 0xff8a3c, ring: true },
+  };
+
+/** Вспышка у дульного среза, когда стреляет чужой танк. */
+const MUZZLE_PRESET = { radius: 1.1, life: 0.12, color: 0xfff0c0, ring: false };
+
 export interface TankHandle {
   root: THREE.Group;
   turret: THREE.Group;
   label: HTMLElement;
+  hpFill: HTMLElement;
   /** Размеры подписи в пикселях, замеряются один раз — текст не меняется. */
   labelHalfWidth: number;
   labelHeight: number;
   labelVisible: boolean;
+  /** Подбитый танк не рисуется и не подписывается. */
+  alive: boolean;
+  hp: number;
+}
+
+interface ShellHandle {
+  mesh: THREE.Mesh;
+  /** Помечается каждый кадр: непомеченные снаряды сервер больше не присылает. */
+  seen: boolean;
+}
+
+interface Effect {
+  group: THREE.Group;
+  flash: THREE.Mesh;
+  ring: THREE.Mesh;
+  life: number;
+  duration: number;
+  radius: number;
 }
 
 export class Scene3D {
@@ -38,6 +71,10 @@ export class Scene3D {
 
   private readonly renderer: THREE.WebGLRenderer;
   private readonly tanks = new Map<number, TankHandle>();
+  private readonly shells = new Map<number, ShellHandle>();
+  private readonly shellPool: THREE.Mesh[] = [];
+  private readonly effects: Effect[] = [];
+  private readonly effectPool: Effect[] = [];
 
   /** Переиспользуемые буферы — чтобы не мусорить в куче каждый кадр. */
   private readonly projected = new THREE.Vector3();
@@ -51,7 +88,13 @@ export class Scene3D {
     turret: new THREE.BoxGeometry(2, 0.75, 2.3),
     barrel: new THREE.CylinderGeometry(0.14, 0.16, 3, 12),
     cupola: new THREE.CylinderGeometry(0.34, 0.34, 0.3, 12),
+    shell: new THREE.CapsuleGeometry(0.16, 0.7, 4, 8),
+    flash: new THREE.SphereGeometry(1, 12, 10),
+    ring: new THREE.RingGeometry(0.72, 1, 28),
   };
+
+  /** Снаряд светится сам: он мелкий и должен читаться на любом фоне. */
+  private readonly shellMaterial = new THREE.MeshBasicMaterial({ color: 0xffd27a });
 
   private readonly trackMaterial = new THREE.MeshStandardMaterial({
     color: 0x23262b,
@@ -208,21 +251,56 @@ export class Scene3D {
 
     const label = document.createElement('div');
     label.className = isSelf ? 'nameplate is-self' : 'nameplate';
-    label.textContent = name;
+
+    const text = document.createElement('span');
+    text.textContent = name;
+    label.appendChild(text);
+
+    // Полоска здоровья фиксированной ширины: меняется только заливка, поэтому
+    // размеры подписи остаются постоянными и их можно замерить один раз.
+    const bar = document.createElement('i');
+    bar.className = 'np-hp';
+    const hpFill = document.createElement('b');
+    bar.appendChild(hpFill);
+    label.appendChild(bar);
+
     this.labelContainer.appendChild(label);
 
     const handle: TankHandle = {
       root,
       turret,
       label,
+      hpFill,
       // Читаем размеры один раз: offsetWidth каждый кадр заставлял бы браузер
       // пересчитывать раскладку на все подписи сразу.
       labelHalfWidth: Math.round(label.offsetWidth / 2),
       labelHeight: label.offsetHeight,
       labelVisible: true,
+      alive: true,
+      hp: MAX_HP,
     };
     this.tanks.set(id, handle);
     return handle;
+  }
+
+  /** Здоровье и «жив ли»: подбитый корпус убираем со сцены до респавна. */
+  setTankHealth(id: number, hp: number, alive: boolean): void {
+    const handle = this.tanks.get(id);
+    if (!handle) return;
+
+    if (hp !== handle.hp) {
+      handle.hp = hp;
+      const fraction = Math.max(0, Math.min(1, hp / MAX_HP));
+      handle.hpFill.style.width = `${(fraction * 100).toFixed(0)}%`;
+      // Зелёный -> жёлтый -> красный по мере потери брони.
+      handle.hpFill.style.background = `hsl(${Math.round(fraction * 105)} 70% 48%)`;
+    }
+
+    if (alive !== handle.alive) {
+      handle.alive = alive;
+      handle.root.visible = alive;
+      // Подпись погасит updateLabels(): она и так каждый кадр решает, видно ли её.
+    }
   }
 
   removeTank(id: number): void {
@@ -268,7 +346,125 @@ export class Scene3D {
     this.camera.lookAt(this.cameraTarget);
   }
 
-  render(): void {
+  // --- Снаряды ---
+
+  /**
+   * Ставит меши по списку из снапшота. Снаряды живут по id: те, кого в списке нет,
+   * уже взорвались — их меш уходит в пул, а взрыв прилетает отдельным событием.
+   */
+  syncShells(list: Array<{ id: number; x: number; z: number; angle: number }>): void {
+    for (const handle of this.shells.values()) handle.seen = false;
+
+    for (const shell of list) {
+      let handle = this.shells.get(shell.id);
+      if (!handle) {
+        const mesh = this.shellPool.pop() ?? new THREE.Mesh(this.geo.shell, this.shellMaterial);
+        mesh.visible = true;
+        this.scene.add(mesh);
+        handle = { mesh, seen: true };
+        this.shells.set(shell.id, handle);
+      }
+      handle.seen = true;
+      handle.mesh.position.set(shell.x, SHELL_HEIGHT, shell.z);
+      // Капсула стоит вдоль Y — кладём её вдоль полёта.
+      handle.mesh.rotation.set(Math.PI / 2, 0, 0);
+      handle.mesh.rotateOnWorldAxis(UP, shell.angle);
+    }
+
+    for (const [id, handle] of this.shells) {
+      if (handle.seen) continue;
+      this.scene.remove(handle.mesh);
+      this.shellPool.push(handle.mesh);
+      this.shells.delete(id);
+    }
+  }
+
+  clearShells(): void {
+    this.syncShells([]);
+  }
+
+  // --- Взрывы ---
+
+  boom(x: number, z: number, kind: BoomKind): void {
+    this.spawnEffect(x, z, BOOM_PRESETS[kind], kind === BOOM_GROUND ? 0.6 : 1.4);
+  }
+
+  /** Вспышка выстрела: рисуем её у дульного среза чужого танка. */
+  muzzleFlash(x: number, z: number): void {
+    this.spawnEffect(x, z, MUZZLE_PRESET, SHELL_HEIGHT);
+  }
+
+  private spawnEffect(
+    x: number,
+    z: number,
+    preset: { radius: number; life: number; color: number; ring: boolean },
+    height: number,
+  ): void {
+    const fx = this.effectPool.pop() ?? this.createEffect();
+    fx.group.position.set(x, height, z);
+    fx.group.visible = true;
+    fx.life = preset.life;
+    fx.duration = preset.life;
+    fx.radius = preset.radius;
+    (fx.flash.material as THREE.MeshBasicMaterial).color.setHex(preset.color);
+    (fx.ring.material as THREE.MeshBasicMaterial).color.setHex(preset.color);
+    fx.ring.visible = preset.ring;
+    // Кольцо стелется по земле независимо от того, на какой высоте рвануло.
+    fx.ring.position.y = 0.15 - height;
+    this.effects.push(fx);
+  }
+
+  private createEffect(): Effect {
+    const group = new THREE.Group();
+    group.visible = false;
+
+    const flash = new THREE.Mesh(
+      this.geo.flash,
+      new THREE.MeshBasicMaterial({ transparent: true, depthWrite: false }),
+    );
+    group.add(flash);
+
+    const ring = new THREE.Mesh(
+      this.geo.ring,
+      new THREE.MeshBasicMaterial({
+        transparent: true,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+      }),
+    );
+    ring.rotation.x = -Math.PI / 2;
+    group.add(ring);
+
+    this.scene.add(group);
+    return { group, flash, ring, life: 0, duration: 1, radius: 1 };
+  }
+
+  private updateEffects(dt: number): void {
+    for (let i = this.effects.length - 1; i >= 0; i--) {
+      const fx = this.effects[i];
+      fx.life -= dt;
+      if (fx.life <= 0) {
+        fx.group.visible = false;
+        this.effects.splice(i, 1);
+        this.effectPool.push(fx);
+        continue;
+      }
+
+      const t = 1 - fx.life / fx.duration; // 0 в момент взрыва, 1 в конце
+      const fade = (1 - t) * (1 - t);
+
+      const scale = fx.radius * (0.35 + t * 0.85);
+      fx.flash.scale.setScalar(scale);
+      (fx.flash.material as THREE.MeshBasicMaterial).opacity = fade * 0.9;
+
+      if (!fx.ring.visible) continue;
+      fx.ring.scale.setScalar(fx.radius * (0.4 + t * 2.4));
+      (fx.ring.material as THREE.MeshBasicMaterial).opacity = fade * 0.55;
+    }
+  }
+
+  render(dt: number): void {
+    this.updateEffects(dt);
     this.renderer.render(this.scene, this.camera);
     this.updateLabels();
   }
@@ -291,7 +487,10 @@ export class Scene3D {
 
       // z вне [-1, 1] значит «за камерой или за дальней плоскостью».
       const visible =
-        distance < LABEL_MAX_DISTANCE && this.projected.z > -1 && this.projected.z < 1;
+        handle.alive &&
+        distance < LABEL_MAX_DISTANCE &&
+        this.projected.z > -1 &&
+        this.projected.z < 1;
 
       if (visible !== handle.labelVisible) {
         handle.label.style.display = visible ? '' : 'none';

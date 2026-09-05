@@ -6,12 +6,16 @@ import {
   MAP_HALF,
   MAX_REVERSE,
   MAX_SPEED,
+  MUZZLE_OFFSET,
+  SHELL_LIFETIME,
+  SHELL_RADIUS,
+  SHELL_SPEED,
   TANK_RADIUS,
   TURN_RATE_FULL,
   TURN_RATE_STILL,
   TURRET_RATE,
 } from './constants.js';
-import type { Box, Input, TankState } from './types.js';
+import type { Box, Input, ShellState, TankState } from './types.js';
 
 export function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
@@ -118,6 +122,51 @@ function resolveObstacles(state: TankState, obstacles: Box[]): void {
     }
     state.speed *= BUMP_DAMPING;
   }
+}
+
+// --- Снаряды ---
+
+/** Снаряд, вылетающий из башни танка. Скорость танка не добавляется — так проще целиться. */
+export function spawnShell(id: number, owner: number, state: TankState): ShellState {
+  const a = state.turret;
+  return {
+    id,
+    owner,
+    x: state.x + Math.sin(a) * MUZZLE_OFFSET,
+    z: state.z + Math.cos(a) * MUZZLE_OFFSET,
+    vx: Math.sin(a) * SHELL_SPEED,
+    vz: Math.cos(a) * SHELL_SPEED,
+    life: SHELL_LIFETIME,
+  };
+}
+
+/** Один шаг снаряда: прямая, без гравитации. */
+export function stepShell(shell: ShellState, dt: number): void {
+  shell.x += shell.vx * dt;
+  shell.z += shell.vz * dt;
+  shell.life -= dt;
+}
+
+/** Снаряд задел прямоугольник (вид сверху; все препятствия выше траектории). */
+export function shellHitsBox(shell: ShellState, box: Box): boolean {
+  return (
+    Math.abs(shell.x - box.x) <= box.w / 2 + SHELL_RADIUS &&
+    Math.abs(shell.z - box.z) <= box.d / 2 + SHELL_RADIUS
+  );
+}
+
+/** Снаряд задел корпус танка. */
+export function shellHitsTank(shell: ShellState, tank: TankState): boolean {
+  const dx = tank.x - shell.x;
+  const dz = tank.z - shell.z;
+  const r = TANK_RADIUS + SHELL_RADIUS;
+  return dx * dx + dz * dz <= r * r;
+}
+
+/** Снаряд дошёл до стены по периметру карты. */
+export function shellOutOfMap(shell: ShellState): boolean {
+  const limit = MAP_HALF - SHELL_RADIUS;
+  return Math.abs(shell.x) >= limit || Math.abs(shell.z) >= limit;
 }
 
 /**

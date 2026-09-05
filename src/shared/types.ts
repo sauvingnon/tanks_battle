@@ -28,6 +28,36 @@ export interface Input {
   steer: number;
   /** Желаемый мировой угол башни (куда смотрит камера). */
   turret: number;
+  /** Нажат ли огонь в этот тик. Выстрел — не часть stepTank: он рождает сущность. */
+  fire?: boolean;
+}
+
+/** Снаряд в полёте. Живёт только на сервере, клиенту приходит уже в снапшоте. */
+export interface ShellState {
+  id: number;
+  /** id стрелявшего: в своего не попадаем. */
+  owner: number;
+  x: number;
+  z: number;
+  vx: number;
+  vz: number;
+  /** Остаток жизни в секундах. */
+  life: number;
+}
+
+/** Что показать в месте попадания. */
+export const BOOM_GROUND = 0; // снаряд разбился о препятствие, стену или землю
+export const BOOM_HIT = 1; // попадание в танк
+export const BOOM_KILL = 2; // танк уничтожен
+export type BoomKind = typeof BOOM_GROUND | typeof BOOM_HIT | typeof BOOM_KILL;
+
+/** Событие взрыва за тик (короткие ключи — трафик). */
+export interface Boom {
+  x: number;
+  z: number;
+  k: BoomKind;
+  /** id стрелявшего — по нему клиент рисует себе отметку о попадании. */
+  o: number;
 }
 
 export interface PlayerInfo {
@@ -45,6 +75,17 @@ export interface SnapshotEntry {
   a: number; // angle
   t: number; // turret
   s: number; // speed
+  h: number; // hp
+  d: 0 | 1; // уничтожен
+}
+
+/** Снаряд в снапшоте. Угол постоянный, но нужен клиенту для разворота меша. */
+export interface SnapshotShell {
+  i: number; // id
+  o: number; // owner
+  x: number;
+  z: number;
+  a: number; // направление полёта
 }
 
 export function createTankState(x = 0, z = 0, angle = 0): TankState {

@@ -27,19 +27,24 @@ function drive(name, throttle, steer) {
     let first = null;
     let last = null;
     let travelled = 0;
+    let shellsSeen = 0;
     let sender;
 
     const stop = setTimeout(() => {
       clearInterval(sender);
       ws.close();
-      resolve({ name, id, sent, snapshots, ack, first, last, travelled });
+      resolve({ name, id, sent, snapshots, ack, first, last, travelled, shellsSeen });
     }, DURATION_MS);
 
     ws.addEventListener('open', () => {
       ws.send(JSON.stringify({ t: 'join', name }));
       sender = setInterval(() => {
         sent++;
-        ws.send(JSON.stringify({ t: 'input', seq: sent, th: throttle, st: steer, tu: 0 }));
+        const msg = { t: 'input', seq: sent, th: throttle, st: steer, tu: 0 };
+        // Раз в 60 инпутов жмём на спуск: перезарядка на сервере длиннее,
+        // так что часть выстрелов законно не пройдёт — нам важен сам факт.
+        if (sent % 60 === 10) msg.f = 1;
+        ws.send(JSON.stringify(msg));
       }, SEND_INTERVAL_MS);
     });
 
@@ -49,11 +54,12 @@ function drive(name, throttle, steer) {
       if (msg.t !== 'snapshot') return;
       snapshots++;
       ack = msg.ack;
+      if (msg.shells?.length) shellsSeen += msg.shells.length;
       const me = msg.players.find((p) => p.i === id);
       if (!me) return;
       first ??= { x: me.x, z: me.z, a: me.a };
       if (last) travelled += Math.hypot(me.x - last.x, me.z - last.z);
-      last = { x: me.x, z: me.z, a: me.a, speed: me.s, visible: msg.players.length };
+      last = { x: me.x, z: me.z, a: me.a, speed: me.s, hp: me.h, visible: msg.players.length };
     });
 
     ws.addEventListener('error', () => {
@@ -75,7 +81,8 @@ for (const p of [straight, turning]) {
   console.log(
     `${p.name}: id=${p.id} послано=${p.sent} снапшотов=${p.snapshots} ack=${p.ack} ` +
       `путь=${p.travelled.toFixed(2)} м скорость=${p.last.speed.toFixed(2)} м/с ` +
-      `доворот=${(p.last.a - p.first.a).toFixed(2)} рад видит=${p.last.visible} танков`,
+      `доворот=${(p.last.a - p.first.a).toFixed(2)} рад hp=${p.last.hp} ` +
+      `видит=${p.last.visible} танков снарядов в кадрах=${p.shellsSeen}`,
   );
   checks.push([`${p.name}: сервер шлёт снапшоты`, p.snapshots > DURATION_MS / 100]);
   // Отставание ack от отправленного показывает, что сервер не успевает разгребать очередь.
@@ -83,6 +90,9 @@ for (const p of [straight, turning]) {
   checks.push([`${p.name}: видит обоих игроков`, p.last.visible === 2]);
   // Путь, а не смещение: танк с рулём едет по кругу и возвращается почти в точку старта.
   checks.push([`${p.name}: танк проехал дистанцию`, p.travelled > 5]);
+  checks.push([`${p.name}: сервер прислал полное здоровье`, p.last.hp === 100]);
+  // Единственная проверка, что флаг огня доживает до сервера через JSON и nginx.
+  checks.push([`${p.name}: выстрел долетел до сервера`, p.shellsSeen > 0]);
 }
 checks.push(['поворот корпуса работает', Math.abs(turning.last.a - turning.first.a) > 0.5]);
 checks.push(['id игроков различаются', straight.id !== turning.id]);

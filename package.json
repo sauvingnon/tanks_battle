@@ -16,6 +16,7 @@
     "typecheck": "tsc --noEmit",
     "check:map": "tsx scripts/check-map.ts",
     "check:smoothness": "tsx scripts/check-smoothness.ts",
+    "check:combat": "tsx scripts/check-combat.ts",
     "smoke": "node scripts/smoke.mjs"
   },
   "dependencies": {

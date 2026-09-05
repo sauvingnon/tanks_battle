@@ -64,6 +64,8 @@ export class Net {
       th: round(input.throttle),
       st: round(input.steer),
       tu: round(input.turret),
+      // Поле шлём только в тик выстрела: оно бывает раз в полторы секунды.
+      ...(input.fire ? { f: 1 as const } : {}),
     });
   }
 

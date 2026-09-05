@@ -12,24 +12,48 @@
       <canvas id="scene"></canvas>
       <div id="labels"></div>
 
-      <div id="hud" hidden>
-        <div class="hud-row">
-          <span class="hud-chip"><b id="hud-online">0</b> в бою</span>
-          <span class="hud-chip"><b id="hud-ping">—</b> мс</span>
+      <div id="damage-flash"></div>
+      <div id="crosshair" hidden><div id="hitmarker"></div></div>
+      <div id="kill-feed"></div>
+
+      <div id="death" hidden>
+        <div class="death-card">
+          <b>Танк уничтожен</b>
+          <span>В строю через <b id="death-timer">4</b></span>
         </div>
-        <div class="hud-speed"><b id="hud-speed">0</b> км/ч</div>
       </div>
 
-      <div id="hint" hidden>Кликни по экрану, чтобы захватить мышь · <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> — ход, мышь — башня, <kbd>Esc</kbd> — освободить курсор</div>
+      <div id="hud" hidden>
+        <div class="hud-left">
+          <div class="hud-row">
+            <span class="hud-chip"><b id="hud-online">0</b> в бою</span>
+            <span class="hud-chip"><b id="hud-ping">—</b> мс</span>
+          </div>
+          <div class="hud-bar hud-hp">
+            <i id="hud-hp-fill"></i>
+            <span><b id="hud-hp-value">100</b> HP</span>
+          </div>
+        </div>
+        <div class="hud-right">
+          <div id="hud-reload" class="hud-bar hud-reload is-ready">
+            <i id="hud-reload-fill"></i>
+            <span>заряд</span>
+          </div>
+          <div class="hud-speed"><b id="hud-speed">0</b> км/ч</div>
+        </div>
+      </div>
+
+      <div id="hint" hidden>Кликни по экрану, чтобы захватить мышь · <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> — ход, мышь — башня, <kbd>ЛКМ</kbd> — огонь, <kbd>Esc</kbd> — освободить курсор</div>
 
       <div id="touch" hidden>
         <div id="stick"><div id="stick-knob"></div></div>
+        <div id="fire-button">ОГОНЬ</div>
       </div>
 
       <div id="overlay">
         <form id="join-form" autocomplete="off">
           <h1>Танковый бой</h1>
-          <p class="sub">Одна карта, все против всех. Пока — просто катаемся.</p>
+          <p class="sub">Одна карта, все против всех. 100 HP, снаряд снимает 25.</p>
           <input id="name-input" name="name" maxlength="16" placeholder="Твой позывной" required />
           <button id="join-button" type="submit">В бой</button>
           <p id="status" class="status"></p>

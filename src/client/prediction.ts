@@ -25,6 +25,8 @@ export interface RenderState {
  */
 export class SelfPrediction {
   obstacles: Box[] = [];
+  /** Пока сервер не сказал обратного — живы. Мёртвый танк не управляется. */
+  alive = true;
 
   private predicted: TankState | null = null;
   private previous: TankState | null = null;
@@ -49,6 +51,7 @@ export class SelfPrediction {
     this.previous = null;
     this.pending.length = 0;
     this.seq = 0;
+    this.alive = true;
     this.error.x = 0;
     this.error.z = 0;
     this.error.angle = 0;
@@ -62,10 +65,19 @@ export class SelfPrediction {
   }
 
   /** Один шаг предсказания. Возвращает инпут, который надо отправить серверу. */
-  step(throttle: number, steer: number, turret: number): Input | null {
+  step(throttle: number, steer: number, turret: number, fire = false): Input | null {
     if (!this.predicted) return null;
 
-    const input: Input = { seq: ++this.seq, throttle, steer, turret };
+    // Подбитый танк не едет — точно так же, как его считает сервер, иначе
+    // предсказание разъедется на все секунды ожидания респавна.
+    if (!this.alive) {
+      throttle = 0;
+      steer = 0;
+      turret = this.predicted.turret;
+      fire = false;
+    }
+
+    const input: Input = { seq: ++this.seq, throttle, steer, turret, fire };
     this.pending.push(input);
     this.previous = { ...this.predicted };
     stepTank(this.predicted, input, DT, this.obstacles);

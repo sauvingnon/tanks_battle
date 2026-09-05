@@ -16,6 +16,8 @@ export class Controls {
 
   throttle = 0;
   steer = 0;
+  /** Огонь удерживается: перезарядку считает сервер, поэтому зажатая кнопка стреляет очередями. */
+  fire = false;
 
   readonly isTouch = matchMedia('(hover: none) and (pointer: coarse)').matches;
 
@@ -27,10 +29,14 @@ export class Controls {
   private lookTouchId: number | null = null;
   private lookPrev = { x: 0, y: 0 };
 
+  private fireTouchId: number | null = null;
+  private mouseFire = false;
+
   constructor(
     private readonly canvas: HTMLCanvasElement,
     private readonly stick: HTMLElement,
     private readonly knob: HTMLElement,
+    private readonly fireButton: HTMLElement,
   ) {}
 
   attach(): void {
@@ -40,6 +46,14 @@ export class Controls {
 
     this.canvas.addEventListener('click', this.onCanvasClick);
     window.addEventListener('mousemove', this.onMouseMove);
+    window.addEventListener('mousedown', this.onMouseDown);
+    window.addEventListener('mouseup', this.onMouseUp);
+    // Правая кнопка не должна открывать меню поверх игры.
+    this.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+    this.fireButton.addEventListener('touchstart', this.onFireStart, { passive: false });
+    this.fireButton.addEventListener('touchend', this.onFireEnd);
+    this.fireButton.addEventListener('touchcancel', this.onFireEnd);
 
     this.canvas.addEventListener('touchstart', this.onTouchStart, { passive: false });
     this.canvas.addEventListener('touchmove', this.onTouchMove, { passive: false });
@@ -49,6 +63,7 @@ export class Controls {
 
   /** Пересчитывает оси из состояния клавиш. Пока держат тач-стик — не трогаем. */
   update(): void {
+    this.fire = this.mouseFire || this.fireTouchId !== null || this.keys.has('Space');
     if (this.stickTouchId !== null) return;
 
     const forward = this.pressed('KeyW', 'ArrowUp');
@@ -80,12 +95,35 @@ export class Controls {
     this.keys.clear();
     this.throttle = 0;
     this.steer = 0;
+    this.mouseFire = false;
+    this.fire = false;
   };
 
   private onCanvasClick = () => {
     if (this.isTouch) return;
     if (document.pointerLockElement !== this.canvas) {
       void this.canvas.requestPointerLock();
+    }
+  };
+
+  private onMouseDown = (e: MouseEvent) => {
+    // Пока курсор не захвачен, клик — это просьба захватить его, а не выстрел.
+    if (document.pointerLockElement !== this.canvas) return;
+    if (e.button === 0) this.mouseFire = true;
+  };
+
+  private onMouseUp = (e: MouseEvent) => {
+    if (e.button === 0) this.mouseFire = false;
+  };
+
+  private onFireStart = (e: TouchEvent) => {
+    e.preventDefault();
+    if (this.fireTouchId === null) this.fireTouchId = e.changedTouches[0].identifier;
+  };
+
+  private onFireEnd = (e: TouchEvent) => {
+    for (const touch of Array.from(e.changedTouches)) {
+      if (touch.identifier === this.fireTouchId) this.fireTouchId = null;
     }
   };
 

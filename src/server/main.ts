@@ -129,6 +129,7 @@ wss.on('connection', (ws) => {
         throttle: msg.th,
         steer: msg.st,
         turret: msg.tu,
+        fire: msg.f === 1,
       });
       return;
     }
@@ -167,6 +168,11 @@ function send(ws: WebSocket, msg: ServerMessage): void {
   if (ws.readyState === ws.OPEN) ws.send(encode(msg));
 }
 
+function broadcast(msg: ServerMessage): void {
+  const data = encode(msg);
+  for (const player of room.players.values()) player.send(data);
+}
+
 function broadcastExcept(exceptId: number, msg: ServerMessage): void {
   const data = encode(msg);
   for (const player of room.players.values()) {
@@ -200,12 +206,30 @@ setInterval(() => {
   if (steps === 5) accumulator = 0;
   if (steps === 0) return;
 
+  // Фраги рассылаем всегда, даже если снапшот в этом тике пропускается.
+  for (const kill of room.drainKills()) {
+    broadcast({ t: 'kill', killer: kill.killer, victim: kill.victim });
+  }
+
   if (room.tickCount % SNAPSHOT_EVERY !== 0) return;
   if (room.players.size === 0) return;
 
   const entries = room.snapshotEntries();
+  // Пустые массивы не шлём: снаряды и взрывы бывают в считаных процентах тиков.
+  const shells = room.shellCount > 0 ? room.snapshotShells() : undefined;
+  const booms = room.boomEvents.length > 0 ? room.boomEvents : undefined;
+
   for (const player of room.players.values()) {
-    player.send(encode({ t: 'snapshot', tick: room.tickCount, ack: player.ack, players: entries }));
+    player.send(
+      encode({
+        t: 'snapshot',
+        tick: room.tickCount,
+        ack: player.ack,
+        players: entries,
+        shells,
+        booms,
+      }),
+    );
   }
 }, STEP_MS / 2);
 
