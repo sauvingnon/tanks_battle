@@ -12,6 +12,15 @@
   box-sizing: border-box;
 }
 
+/*
+ * Браузер прячет [hidden] через display: none, но это правило из его собственной
+ * таблицы стилей — любое наше display: flex/grid его перебивает. Без этой строки
+ * hidden молча перестаёт работать на всех блоках, которым задан display.
+ */
+[hidden] {
+  display: none !important;
+}
+
 html,
 body {
   margin: 0;
