@@ -163,24 +163,33 @@ push в `main` и по кнопке (`workflow_dispatch`). Два джоба:
 | `SSH_USER` | пользователь на VPS |
 | `SSH_PORT` | порт SSH; можно не задавать, тогда 22 |
 | `SSH_KEY` | приватный ключ, которым Actions заходит на VPS |
-| `GIT_DEPLOY_KEY` | приватный ключ, которым **VPS** тянет репозиторий с GitHub |
-
-Ключей два, потому что это два разных перехода: раннер → сервер и сервер → GitHub.
 
 ```bash
-# 1. Ключ раннера. Публичную половину — в ~/.ssh/authorized_keys на VPS.
+# Ключ раннера. Публичную половину — в ~/.ssh/authorized_keys на VPS,
+# приватную целиком (со строками BEGIN/END) — в секрет SSH_KEY.
 ssh-keygen -t ed25519 -f runner_key -N '' -C 'github-actions'
-
-# 2. Deploy key репозитория. Публичную половину — в Settings → Deploy keys
-#    (доступ на чтение достаточен), приватную — в секрет GIT_DEPLOY_KEY.
-ssh-keygen -t ed25519 -f deploy_key -N '' -C 'tanks_battle deploy'
 ```
 
-Приватные ключи копируются в секреты целиком, вместе со строками
-`-----BEGIN OPENSSH PRIVATE KEY-----` и `-----END ...-----`.
+Доступ **сервера** к самому GitHub-репозиторию (`git clone`/`git fetch`) через
+Actions не настраивается — это состояние сервера, а не репозитория. Ключ
+генерируется прямо на VPS и остаётся там навсегда:
+
+```bash
+ssh-keygen -t ed25519 -f ~/.ssh/tanks-battle-deploy -N '' -C 'tanks_battle deploy'
+cat >> ~/.ssh/config <<'EOF'
+Host github.com
+  IdentityFile ~/.ssh/tanks-battle-deploy
+  IdentitiesOnly yes
+EOF
+```
+
+Публичную половину (`tanks-battle-deploy.pub`) — в Settings → Deploy keys
+репозитория на GitHub, доступа на чтение достаточно. Приватная часть с сервера
+никогда никуда не уезжает, в секреты Actions её копировать не нужно.
 
 Первый запуск сам склонирует репозиторий в `/srv/tanks_battle`, каталог заранее
-готовить не нужно.
+готовить не нужно — только ключ и Deploy key должны быть на месте до первого
+деплоя.
 
 ### HTTPS
 

@@ -61,23 +61,11 @@ jobs:
 
       # Скрипты уходят на сервер через `bash -s` и heredoc в кавычках: раннер
       # ничего в них не подставляет, поэтому кавычки и $ пишутся как обычно.
-      - name: Setup Git deploy key on server
-        run: |
-          ssh target 'bash -s' <<'REMOTE'
-          set -e
-          mkdir -p ~/.ssh && chmod 700 ~/.ssh
-          cat > ~/.ssh/id_tanks <<'KEY'
-          ${{ secrets.GIT_DEPLOY_KEY }}
-          KEY
-          chmod 600 ~/.ssh/id_tanks
-          ssh-keyscan -H github.com >> ~/.ssh/known_hosts 2>/dev/null
-          # Запись в ~/.ssh/config добавляем один раз: шаг гоняется на каждый деплой.
-          if ! grep -q 'IdentityFile ~/.ssh/id_tanks' ~/.ssh/config 2>/dev/null; then
-            printf 'Host github.com\n  IdentityFile ~/.ssh/id_tanks\n  IdentitiesOnly yes\n' >> ~/.ssh/config
-            chmod 600 ~/.ssh/config
-          fi
-          REMOTE
-
+      #
+      # Ключ для github.com (git@github.com) на сервер не заводим: он там уже
+      # лежит — сгенерирован вручную, публичная часть добавлена в Settings →
+      # Deploy keys репозитория, а ~/.ssh/config уже указывает на него. Это
+      # состояние сервера, не репозитория — трогать его отсюда не нужно.
       - name: Prepare project dir
         run: |
           ssh target 'bash -s' <<'REMOTE'
