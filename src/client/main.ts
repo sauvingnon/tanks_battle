@@ -1,10 +1,11 @@
 import { DT, INTERP_DELAY_MS } from '../shared/constants.js';
-import { clamp, lerpAngle, stepTank, wrapAngle } from '../shared/sim.js';
+import { clamp, lerpAngle } from '../shared/sim.js';
 import type { ServerMessage } from '../shared/protocol.js';
-import type { Box, Input, PlayerInfo, SnapshotEntry, TankState } from '../shared/types.js';
+import type { PlayerInfo, SnapshotEntry } from '../shared/types.js';
 
 import { Controls } from './controls.js';
 import { Net } from './net.js';
+import { SelfPrediction } from './prediction.js';
 import { Scene3D } from './render.js';
 
 const el = <T extends HTMLElement>(id: string): T => {
@@ -31,28 +32,11 @@ controls.attach();
 
 let selfId = 0;
 let worldBuilt = false;
-let obstacles: Box[] = [];
 
 const players = new Map<number, PlayerInfo>();
 
-/** Предсказанное состояние своего танка: им управляем локально, без ожидания сервера. */
-let predicted: TankState | null = null;
-/**
- * Состояние перед последним шагом симуляции. Симуляция идёт 30 раз в секунду,
- * а экран рисует 60–144, поэтому кадр интерполируется между previous и predicted —
- * без этого на скорости картинка едет ступеньками и всё дрожит.
- */
-let previous: TankState | null = null;
-/** Инпуты, ещё не подтверждённые сервером, — их переигрываем после каждого снапшота. */
-const pending: Input[] = [];
-let seq = 0;
-
-/** Разница между предсказанием и поправкой сервера, гасится плавно, чтобы не было рывков. */
-const visualError = { x: 0, z: 0, angle: 0 };
-const MAX_VISUAL_ERROR = 4;
-
-/** Позиция, реально нарисованная в последнем кадре: от неё считаем расхождение. */
-const rendered = { x: 0, z: 0, angle: 0, valid: false };
+/** Свой танк: предсказание, реконсиляция и сглаживание живут в prediction.ts. */
+const self = new SelfPrediction();
 
 interface BufferedSnapshot {
   time: number;
@@ -77,9 +61,9 @@ function handleMessage(msg: ServerMessage): void {
   switch (msg.t) {
     case 'welcome': {
       selfId = msg.id;
-      obstacles = msg.map.obstacles;
+      self.obstacles = msg.map.obstacles;
       if (!worldBuilt) {
-        scene.buildWorld(msg.map.half, obstacles);
+        scene.buildWorld(msg.map.half, msg.map.obstacles);
         worldBuilt = true;
       }
       for (const info of msg.players) addPlayer(info);
@@ -117,44 +101,13 @@ function onSnapshot(entries: SnapshotEntry[], ack: number): void {
   const mine = map.get(selfId);
   if (!mine) return;
 
-  if (!predicted) {
-    // Первый снапшот: принимаем позицию сервера как есть и разворачиваем к ней камеру.
-    predicted = { x: mine.x, z: mine.z, angle: mine.a, speed: mine.s, turret: mine.t };
-    previous = { ...predicted };
-    controls.yaw = mine.t;
-    return;
-  }
-
-  const beforeX = rendered.valid ? rendered.x : predicted.x + visualError.x;
-  const beforeZ = rendered.valid ? rendered.z : predicted.z + visualError.z;
-  const beforeAngle = rendered.valid ? rendered.angle : wrapAngle(predicted.angle + visualError.angle);
-
-  // Сервер — источник истины: берём его состояние и переигрываем неподтверждённое.
-  predicted.x = mine.x;
-  predicted.z = mine.z;
-  predicted.angle = mine.a;
-  predicted.speed = mine.s;
-  predicted.turret = mine.t;
-
-  while (pending.length > 0 && pending[0].seq <= ack) pending.shift();
-  for (const input of pending) stepTank(predicted, input, DT, obstacles);
-
-  // После переигрывания старое previous относится к докоррекционной траектории —
-  // интерполяция от него дала бы рывок. Разрыв гасит visualError ниже.
-  previous = { ...predicted };
-
-  // Расхождение не выправляем мгновенно — гасим за пару кадров.
-  const dx = beforeX - predicted.x;
-  const dz = beforeZ - predicted.z;
-  if (Math.hypot(dx, dz) > MAX_VISUAL_ERROR) {
-    visualError.x = 0;
-    visualError.z = 0;
-    visualError.angle = 0;
-  } else {
-    visualError.x = dx;
-    visualError.z = dz;
-    visualError.angle = wrapAngle(beforeAngle - predicted.angle);
-  }
+  const wasReady = self.ready;
+  self.reconcile(
+    { x: mine.x, z: mine.z, angle: mine.a, speed: mine.s, turret: mine.t },
+    ack,
+  );
+  // При первом появлении разворачиваем камеру туда же, куда смотрит башня.
+  if (!wasReady) controls.yaw = mine.t;
 }
 
 // --- Игровой цикл ---
@@ -169,7 +122,7 @@ function frame(now: number): void {
 
   controls.update();
 
-  if (predicted) {
+  if (self.ready) {
     stepAccumulator += dt;
     let steps = 0;
     // Фиксированный шаг: тот же DT, что и на сервере, иначе предсказание разъедется.
@@ -177,26 +130,13 @@ function frame(now: number): void {
       stepAccumulator -= DT;
       steps++;
 
-      const input: Input = {
-        seq: ++seq,
-        throttle: controls.throttle,
-        steer: controls.steer,
-        turret: controls.yaw,
-      };
-      pending.push(input);
-      previous = { ...predicted };
-      stepTank(predicted, input, DT, obstacles);
-      net.sendInput(input);
+      const input = self.step(controls.throttle, controls.steer, controls.yaw);
+      if (input) net.sendInput(input);
     }
     if (steps === 5) stepAccumulator = 0;
-    // Страховка от бесконечного роста, если ack почему-то не приходит.
-    if (pending.length > 180) pending.splice(0, pending.length - 180);
   }
 
-  const decay = Math.exp(-dt * 9);
-  visualError.x *= decay;
-  visualError.z *= decay;
-  visualError.angle *= decay;
+  self.decay(dt);
 
   drawSelf(dt);
   drawOthers(now - INTERP_DELAY_MS);
@@ -205,25 +145,13 @@ function frame(now: number): void {
 }
 
 function drawSelf(dt: number): void {
-  if (!predicted) return;
+  // alpha — доля времени до следующего шага симуляции: кадр рисуется между шагами,
+  // иначе на скорости картинка идёт ступеньками по 30 Гц.
+  const state = self.sample(stepAccumulator / DT);
+  if (!state) return;
 
-  // Доля прошедшего времени до следующего шага симуляции: 0 — только что шагнули,
-  // 1 — вот-вот шагнём снова.
-  const from = previous ?? predicted;
-  const alpha = clamp(stepAccumulator / DT, 0, 1);
-
-  const x = from.x + (predicted.x - from.x) * alpha + visualError.x;
-  const z = from.z + (predicted.z - from.z) * alpha + visualError.z;
-  const angle = wrapAngle(lerpAngle(from.angle, predicted.angle, alpha) + visualError.angle);
-  const turret = lerpAngle(from.turret, predicted.turret, alpha);
-
-  rendered.x = x;
-  rendered.z = z;
-  rendered.angle = angle;
-  rendered.valid = true;
-
-  scene.updateTank(selfId, x, z, angle, turret);
-  scene.updateCamera(x, z, controls.yaw, controls.pitch, dt);
+  scene.updateTank(selfId, state.x, state.z, state.angle, state.turret);
+  scene.updateCamera(state.x, state.z, controls.yaw, controls.pitch, dt);
 }
 
 function drawOthers(renderTime: number): void {
@@ -269,7 +197,7 @@ function updateSpeed(): void {
   const now = performance.now();
   if (now - speedTimer < 100) return;
   speedTimer = now;
-  hudSpeed.textContent = predicted ? String(Math.round(Math.abs(predicted.speed) * 3.6)) : '0';
+  hudSpeed.textContent = String(Math.round(Math.abs(self.speed) * 3.6));
   hudPing.textContent = net.latency > 0 ? String(net.latency) : '—';
 }
 
@@ -307,15 +235,8 @@ function resetWorld(): void {
   for (const id of players.keys()) scene.removeTank(id);
   players.clear();
   snapshots.length = 0;
-  pending.length = 0;
-  predicted = null;
-  previous = null;
-  seq = 0;
   selfId = 0;
-  visualError.x = 0;
-  visualError.z = 0;
-  visualError.angle = 0;
-  rendered.valid = false;
+  self.reset();
 }
 
 form.addEventListener('submit', (event) => {

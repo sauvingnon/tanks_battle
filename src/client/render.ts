@@ -235,11 +235,14 @@ export class Scene3D {
       this.camera.position.set(desiredX, height, desiredZ);
       this.cameraReady = true;
     } else {
-      // Экспоненциальное сглаживание — не зависит от частоты кадров.
+      // По горизонтали камера жёстко привязана к танку: позиция танка уже
+      // интерполирована и сглажена, а второй слой догонялки поверх первого давал
+      // качание влево-вправо на скорости.
+      this.camera.position.x = desiredX;
+      this.camera.position.z = desiredZ;
+      // Высоту сглаживаем: её меняет только колесо обзора, рывков от движения нет.
       const k = 1 - Math.exp(-dt * 14);
-      this.camera.position.x += (desiredX - this.camera.position.x) * k;
       this.camera.position.y += (height - this.camera.position.y) * k;
-      this.camera.position.z += (desiredZ - this.camera.position.z) * k;
     }
 
     this.cameraTarget.set(x, 2.2, z);

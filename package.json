@@ -15,6 +15,7 @@
     "start": "tsx src/server/main.ts",
     "typecheck": "tsc --noEmit",
     "check:map": "tsx scripts/check-map.ts",
+    "check:smoothness": "tsx scripts/check-smoothness.ts",
     "smoke": "node scripts/smoke.mjs"
   },
   "dependencies": {

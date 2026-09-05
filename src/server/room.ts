@@ -79,14 +79,22 @@ export class Room {
     this.tick++;
 
     for (const player of this.players.values()) {
-      const input = player.queue.shift();
-      if (input) {
-        player.last = input;
-        player.ack = input.seq;
+      // Часы клиента и сервера идут независимо, поэтому очередь то пустеет, то копится.
+      // Если накопилось — разгребаем по два инпута за тик: каждый всё равно применяется
+      // ровно один раз, зато отставание не растёт до срабатывания MAX_INPUT_QUEUE,
+      // после которого сервер начал бы терять инпуты, уже применённые клиентом.
+      const drain = player.queue.length >= 3 ? 2 : 1;
+
+      for (let i = 0; i < drain; i++) {
+        const input = player.queue.shift();
+        if (input) {
+          player.last = input;
+          player.ack = input.seq;
+        }
+        // Если новых инпутов нет — продолжаем с последним известным: танк не замирает
+        // при потере пакета, а клиент предсказывает ровно то же самое.
+        stepTank(player.state, player.last, DT, this.obstacles);
       }
-      // Если новых инпутов нет — продолжаем с последним известным: танк не замирает
-      // при потере пакета, а клиент предсказывает ровно то же самое.
-      stepTank(player.state, player.last, DT, this.obstacles);
     }
 
     resolveTankCollisions([...this.players.values()].map((p) => p.state));
