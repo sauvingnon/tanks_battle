@@ -1,5 +1,4 @@
 import * as THREE from 'three';
-import { CSS2DObject, CSS2DRenderer } from 'three/addons/renderers/CSS2DRenderer.js';
 
 import type { Box } from '../shared/types.js';
 
@@ -9,10 +8,19 @@ const PALETTE = [0x4f7d5a, 0x7a5f9c, 0xa8632f, 0x3f6f96, 0x8a8f3a, 0x9c4a52, 0x3
 const CAMERA_DISTANCE = 15;
 const CAMERA_BASE_HEIGHT = 3.4;
 
+/** Высота, на которой висит ник над центром танка. */
+const LABEL_HEIGHT = 3.7;
+/** Дальше этого ники не рисуем — всё равно нечитаемо, а DOM грузится. */
+const LABEL_MAX_DISTANCE = 160;
+
 export interface TankHandle {
   root: THREE.Group;
   turret: THREE.Group;
-  label: CSS2DObject;
+  label: HTMLElement;
+  /** Размеры подписи в пикселях, замеряются один раз — текст не меняется. */
+  labelHalfWidth: number;
+  labelHeight: number;
+  labelVisible: boolean;
 }
 
 export class Scene3D {
@@ -20,8 +28,12 @@ export class Scene3D {
   readonly camera: THREE.PerspectiveCamera;
 
   private readonly renderer: THREE.WebGLRenderer;
-  private readonly labelRenderer: CSS2DRenderer;
   private readonly tanks = new Map<number, TankHandle>();
+
+  /** Переиспользуемые буферы — чтобы не мусорить в куче каждый кадр. */
+  private readonly projected = new THREE.Vector3();
+  private viewWidth = 1;
+  private viewHeight = 1;
 
   /** Геометрии переиспользуются всеми танками — их много, а форма одна. */
   private readonly geo = {
@@ -47,20 +59,13 @@ export class Scene3D {
 
   constructor(
     private readonly canvas: HTMLCanvasElement,
-    labelContainer: HTMLElement,
+    private readonly labelContainer: HTMLElement,
   ) {
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
     this.renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-
-    this.labelRenderer = new CSS2DRenderer();
-    this.labelRenderer.domElement.style.position = 'absolute';
-    this.labelRenderer.domElement.style.top = '0';
-    this.labelRenderer.domElement.style.left = '0';
-    this.labelRenderer.domElement.style.pointerEvents = 'none';
-    labelContainer.appendChild(this.labelRenderer.domElement);
 
     this.camera = new THREE.PerspectiveCamera(62, 1, 0.5, 600);
     this.camera.position.set(0, 20, -30);
@@ -180,15 +185,23 @@ export class Scene3D {
 
     root.add(turret);
 
-    const plate = document.createElement('div');
-    plate.className = isSelf ? 'nameplate is-self' : 'nameplate';
-    plate.textContent = name;
-    const label = new CSS2DObject(plate);
-    label.position.set(0, 3.7, 0);
-    root.add(label);
-
     this.scene.add(root);
-    const handle: TankHandle = { root, turret, label };
+
+    const label = document.createElement('div');
+    label.className = isSelf ? 'nameplate is-self' : 'nameplate';
+    label.textContent = name;
+    this.labelContainer.appendChild(label);
+
+    const handle: TankHandle = {
+      root,
+      turret,
+      label,
+      // Читаем размеры один раз: offsetWidth каждый кадр заставлял бы браузер
+      // пересчитывать раскладку на все подписи сразу.
+      labelHalfWidth: Math.round(label.offsetWidth / 2),
+      labelHeight: label.offsetHeight,
+      labelVisible: true,
+    };
     this.tanks.set(id, handle);
     return handle;
   }
@@ -196,7 +209,7 @@ export class Scene3D {
   removeTank(id: number): void {
     const handle = this.tanks.get(id);
     if (!handle) return;
-    handle.label.element.remove();
+    handle.label.remove();
     this.scene.remove(handle.root);
     this.tanks.delete(id);
   }
@@ -235,15 +248,49 @@ export class Scene3D {
 
   render(): void {
     this.renderer.render(this.scene, this.camera);
-    this.labelRenderer.render(this.scene, this.camera);
+    this.updateLabels();
+  }
+
+  /**
+   * Ники позиционируем сами, а не через CSS2DRenderer: тот ставит дробные
+   * пиксели, из-за чего текст на ходу становится мыльным и дрожит.
+   */
+  private updateLabels(): void {
+    this.camera.updateMatrixWorld();
+
+    for (const handle of this.tanks.values()) {
+      this.projected.set(
+        handle.root.position.x,
+        LABEL_HEIGHT,
+        handle.root.position.z,
+      );
+      const distance = this.projected.distanceTo(this.camera.position);
+      this.projected.project(this.camera);
+
+      // z вне [-1, 1] значит «за камерой или за дальней плоскостью».
+      const visible =
+        distance < LABEL_MAX_DISTANCE && this.projected.z > -1 && this.projected.z < 1;
+
+      if (visible !== handle.labelVisible) {
+        handle.label.style.display = visible ? '' : 'none';
+        handle.labelVisible = visible;
+      }
+      if (!visible) continue;
+
+      const x = Math.round((this.projected.x * 0.5 + 0.5) * this.viewWidth) - handle.labelHalfWidth;
+      const y =
+        Math.round((-this.projected.y * 0.5 + 0.5) * this.viewHeight) - handle.labelHeight;
+      handle.label.style.transform = `translate(${x}px, ${y}px)`;
+    }
   }
 
   private resize = () => {
     const width = this.canvas.clientWidth || window.innerWidth;
     const height = this.canvas.clientHeight || window.innerHeight;
+    this.viewWidth = width;
+    this.viewHeight = height;
     this.camera.aspect = width / height;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(width, height, false);
-    this.labelRenderer.setSize(width, height);
   };
 }

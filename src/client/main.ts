@@ -37,6 +37,12 @@ const players = new Map<number, PlayerInfo>();
 
 /** Предсказанное состояние своего танка: им управляем локально, без ожидания сервера. */
 let predicted: TankState | null = null;
+/**
+ * Состояние перед последним шагом симуляции. Симуляция идёт 30 раз в секунду,
+ * а экран рисует 60–144, поэтому кадр интерполируется между previous и predicted —
+ * без этого на скорости картинка едет ступеньками и всё дрожит.
+ */
+let previous: TankState | null = null;
 /** Инпуты, ещё не подтверждённые сервером, — их переигрываем после каждого снапшота. */
 const pending: Input[] = [];
 let seq = 0;
@@ -44,6 +50,9 @@ let seq = 0;
 /** Разница между предсказанием и поправкой сервера, гасится плавно, чтобы не было рывков. */
 const visualError = { x: 0, z: 0, angle: 0 };
 const MAX_VISUAL_ERROR = 4;
+
+/** Позиция, реально нарисованная в последнем кадре: от неё считаем расхождение. */
+const rendered = { x: 0, z: 0, angle: 0, valid: false };
 
 interface BufferedSnapshot {
   time: number;
@@ -111,13 +120,14 @@ function onSnapshot(entries: SnapshotEntry[], ack: number): void {
   if (!predicted) {
     // Первый снапшот: принимаем позицию сервера как есть и разворачиваем к ней камеру.
     predicted = { x: mine.x, z: mine.z, angle: mine.a, speed: mine.s, turret: mine.t };
+    previous = { ...predicted };
     controls.yaw = mine.t;
     return;
   }
 
-  const beforeX = predicted.x + visualError.x;
-  const beforeZ = predicted.z + visualError.z;
-  const beforeAngle = wrapAngle(predicted.angle + visualError.angle);
+  const beforeX = rendered.valid ? rendered.x : predicted.x + visualError.x;
+  const beforeZ = rendered.valid ? rendered.z : predicted.z + visualError.z;
+  const beforeAngle = rendered.valid ? rendered.angle : wrapAngle(predicted.angle + visualError.angle);
 
   // Сервер — источник истины: берём его состояние и переигрываем неподтверждённое.
   predicted.x = mine.x;
@@ -128,6 +138,10 @@ function onSnapshot(entries: SnapshotEntry[], ack: number): void {
 
   while (pending.length > 0 && pending[0].seq <= ack) pending.shift();
   for (const input of pending) stepTank(predicted, input, DT, obstacles);
+
+  // После переигрывания старое previous относится к докоррекционной траектории —
+  // интерполяция от него дала бы рывок. Разрыв гасит visualError ниже.
+  previous = { ...predicted };
 
   // Расхождение не выправляем мгновенно — гасим за пару кадров.
   const dx = beforeX - predicted.x;
@@ -170,6 +184,7 @@ function frame(now: number): void {
         turret: controls.yaw,
       };
       pending.push(input);
+      previous = { ...predicted };
       stepTank(predicted, input, DT, obstacles);
       net.sendInput(input);
     }
@@ -191,10 +206,23 @@ function frame(now: number): void {
 
 function drawSelf(dt: number): void {
   if (!predicted) return;
-  const x = predicted.x + visualError.x;
-  const z = predicted.z + visualError.z;
-  const angle = wrapAngle(predicted.angle + visualError.angle);
-  scene.updateTank(selfId, x, z, angle, predicted.turret);
+
+  // Доля прошедшего времени до следующего шага симуляции: 0 — только что шагнули,
+  // 1 — вот-вот шагнём снова.
+  const from = previous ?? predicted;
+  const alpha = clamp(stepAccumulator / DT, 0, 1);
+
+  const x = from.x + (predicted.x - from.x) * alpha + visualError.x;
+  const z = from.z + (predicted.z - from.z) * alpha + visualError.z;
+  const angle = wrapAngle(lerpAngle(from.angle, predicted.angle, alpha) + visualError.angle);
+  const turret = lerpAngle(from.turret, predicted.turret, alpha);
+
+  rendered.x = x;
+  rendered.z = z;
+  rendered.angle = angle;
+  rendered.valid = true;
+
+  scene.updateTank(selfId, x, z, angle, turret);
   scene.updateCamera(x, z, controls.yaw, controls.pitch, dt);
 }
 
@@ -281,11 +309,13 @@ function resetWorld(): void {
   snapshots.length = 0;
   pending.length = 0;
   predicted = null;
+  previous = null;
   seq = 0;
   selfId = 0;
   visualError.x = 0;
   visualError.z = 0;
   visualError.angle = 0;
+  rendered.valid = false;
 }
 
 form.addEventListener('submit', (event) => {

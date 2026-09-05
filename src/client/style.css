@@ -47,6 +47,11 @@ body {
 }
 
 .nameplate {
+  position: absolute;
+  top: 0;
+  left: 0;
+  /* Позицию задаёт render.ts целыми пикселями — иначе текст мылится на ходу. */
+  will-change: transform;
   padding: 2px 8px;
   border-radius: 999px;
   background: rgba(10, 13, 18, 0.66);
