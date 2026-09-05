@@ -8,6 +8,15 @@ const PALETTE = [0x4f7d5a, 0x7a5f9c, 0xa8632f, 0x3f6f96, 0x8a8f3a, 0x9c4a52, 0x3
 const CAMERA_DISTANCE = 15;
 const CAMERA_BASE_HEIGHT = 3.4;
 
+/**
+ * Яркость сцены. Крутить эти четыре числа, если картинка кажется тёмной или
+ * пересвеченной; оттенки света задаются отдельно и их менять не нужно.
+ */
+const EXPOSURE = 1.18; // общая экспозиция поверх тонмаппинга
+const SUN_INTENSITY = 2.7; // прямой свет: даёт блики и тени
+const AMBIENT_INTENSITY = 2.0; // заполняющий свет: определяет, насколько черны тени
+const FILL_INTENSITY = 0.5; // подсветка с теневой стороны, чтобы корпуса не проваливались
+
 /** Высота, на которой висит ник над центром танка. */
 const LABEL_HEIGHT = 3.7;
 /** Дальше этого ники не рисуем — всё равно нечитаемо, а DOM грузится. */
@@ -66,12 +75,15 @@ export class Scene3D {
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    this.renderer.toneMappingExposure = EXPOSURE;
 
     this.camera = new THREE.PerspectiveCamera(62, 1, 0.5, 600);
     this.camera.position.set(0, 20, -30);
 
     this.scene.background = new THREE.Color(0x121822);
-    this.scene.fog = new THREE.Fog(0x121822, 90, 320);
+    // Ближняя граница вынесена за игровую зону (карта 140 м в поперечнике), чтобы туман
+    // не съедал поле, но дальняя стена через всю карту уже заметно подёрнута дымкой.
+    this.scene.fog = new THREE.Fog(0x121822, 110, 300);
 
     this.setupLights();
     this.resize();
@@ -79,9 +91,16 @@ export class Scene3D {
   }
 
   private setupLights(): void {
-    this.scene.add(new THREE.HemisphereLight(0x9fb8d8, 0x2b2f26, 1.1));
+    // Небо сверху, отражённый от земли свет снизу: именно он вытягивает тени из черноты.
+    this.scene.add(new THREE.HemisphereLight(0x9fb8d8, 0x4a4f3e, AMBIENT_INTENSITY));
 
-    const sun = new THREE.DirectionalLight(0xffe6bd, 2.1);
+    // Слабый контровой свет с противоположной стороны — без него теневой борт танка
+    // сливается в один тёмный силуэт.
+    const fill = new THREE.DirectionalLight(0xbfd4ea, FILL_INTENSITY);
+    fill.position.set(-70, 45, -55);
+    this.scene.add(fill);
+
+    const sun = new THREE.DirectionalLight(0xffe6bd, SUN_INTENSITY);
     sun.position.set(60, 95, 40);
     sun.castShadow = true;
     sun.shadow.mapSize.set(2048, 2048);
