@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+    <title>Танковый бой</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🛡️</text></svg>" />
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <canvas id="scene"></canvas>
+      <div id="labels"></div>
+
+      <div id="hud" hidden>
+        <div class="hud-row">
+          <span class="hud-chip"><b id="hud-online">0</b> в бою</span>
+          <span class="hud-chip"><b id="hud-ping">—</b> мс</span>
+        </div>
+        <div class="hud-speed"><b id="hud-speed">0</b> км/ч</div>
+      </div>
+
+      <div id="hint" hidden>Кликни по экрану, чтобы захватить мышь · <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> — ход, мышь — башня, <kbd>Esc</kbd> — освободить курсор</div>
+
+      <div id="touch" hidden>
+        <div id="stick"><div id="stick-knob"></div></div>
+      </div>
+
+      <div id="overlay">
+        <form id="join-form" autocomplete="off">
+          <h1>Танковый бой</h1>
+          <p class="sub">Одна карта, все против всех. Пока — просто катаемся.</p>
+          <input id="name-input" name="name" maxlength="16" placeholder="Твой позывной" required />
+          <button id="join-button" type="submit">В бой</button>
+          <p id="status" class="status"></p>
+        </form>
+      </div>
+    </div>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,215 @@
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createReadStream, existsSync, statSync } from 'node:fs';
+import { extname, join, normalize, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { WebSocketServer, type WebSocket } from 'ws';
+
+import { DT, SNAPSHOT_EVERY, TICK_HZ, MAP_HALF } from '../shared/constants.js';
+import { decode, encode, type ClientMessage, type ServerMessage } from '../shared/protocol.js';
+import { Room, type Player } from './room.js';
+
+const PORT = Number(process.env.PORT ?? 8080);
+const HOST = process.env.HOST ?? '0.0.0.0';
+const MAX_PLAYERS = Number(process.env.MAX_PLAYERS ?? 32);
+
+/** Статика отдаётся только при локальном запуске; в проде этим занимается nginx. */
+const STATIC_DIR = resolve(fileURLToPath(new URL('../../dist', import.meta.url)));
+const SERVE_STATIC = existsSync(STATIC_DIR);
+
+const room = new Room();
+
+// --- HTTP ---
+
+const http = createServer((req, res) => {
+  if (req.url === '/health') {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, players: room.players.size, tick: room.tickCount }));
+    return;
+  }
+  if (SERVE_STATIC) {
+    serveStatic(req, res);
+    return;
+  }
+  res.writeHead(404).end('not found');
+});
+
+const MIME: Record<string, string> = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.ico': 'image/x-icon',
+};
+
+function serveStatic(req: IncomingMessage, res: ServerResponse): void {
+  const urlPath = decodeURIComponent((req.url ?? '/').split('?')[0]);
+  // normalize + проверка префикса — чтобы ../.. не вывел за пределы dist.
+  let filePath = join(STATIC_DIR, normalize(urlPath));
+  if (!filePath.startsWith(STATIC_DIR)) {
+    res.writeHead(403).end('forbidden');
+    return;
+  }
+  if (!existsSync(filePath) || statSync(filePath).isDirectory()) {
+    filePath = join(STATIC_DIR, 'index.html');
+  }
+  if (!existsSync(filePath)) {
+    res.writeHead(404).end('not found');
+    return;
+  }
+  res.writeHead(200, { 'content-type': MIME[extname(filePath)] ?? 'application/octet-stream' });
+  createReadStream(filePath).pipe(res);
+}
+
+// --- WebSocket ---
+
+const wss = new WebSocketServer({ noServer: true });
+
+http.on('upgrade', (req, socket, head) => {
+  const path = (req.url ?? '').split('?')[0];
+  if (path !== '/ws') {
+    socket.destroy();
+    return;
+  }
+  wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+});
+
+interface Session {
+  player: Player | null;
+  alive: boolean;
+}
+
+const sessions = new WeakMap<WebSocket, Session>();
+
+wss.on('connection', (ws) => {
+  const session: Session = { player: null, alive: true };
+  sessions.set(ws, session);
+
+  ws.on('pong', () => {
+    session.alive = true;
+  });
+
+  ws.on('message', (raw) => {
+    const msg = decode<ClientMessage>(raw.toString());
+    if (!msg || typeof msg.t !== 'string') return;
+
+    if (msg.t === 'join') {
+      if (session.player) return; // повторный join игнорируем
+      if (room.players.size >= MAX_PLAYERS) {
+        send(ws, { t: 'error', message: 'Комната заполнена, попробуй позже' });
+        ws.close();
+        return;
+      }
+      const player = room.add(msg.name, (data) => {
+        if (ws.readyState === ws.OPEN) ws.send(data);
+      });
+      session.player = player;
+
+      send(ws, {
+        t: 'welcome',
+        id: player.id,
+        you: room.info(player),
+        tickHz: TICK_HZ,
+        map: { half: MAP_HALF, obstacles: room.obstacles },
+        players: room.allInfo(),
+      });
+      broadcastExcept(player.id, { t: 'joined', player: room.info(player) });
+      console.log(`[+] ${player.name} (#${player.id}), онлайн: ${room.players.size}`);
+      return;
+    }
+
+    if (msg.t === 'input') {
+      const player = session.player;
+      if (!player) return;
+      if (!isFiniteNumber(msg.seq) || !isFiniteNumber(msg.th) || !isFiniteNumber(msg.st) || !isFiniteNumber(msg.tu)) return;
+      room.pushInput(player, {
+        seq: msg.seq | 0,
+        throttle: msg.th,
+        steer: msg.st,
+        turret: msg.tu,
+      });
+      return;
+    }
+
+    if (msg.t === 'ping') {
+      send(ws, { t: 'pong', id: msg.id });
+    }
+  });
+
+  ws.on('close', () => {
+    const player = session.player;
+    if (!player) return;
+    room.remove(player.id);
+    broadcastExcept(player.id, { t: 'left', id: player.id });
+    console.log(`[-] ${player.name} (#${player.id}), онлайн: ${room.players.size}`);
+  });
+
+  ws.on('error', () => ws.terminate());
+});
+
+/** Отсекаем «мёртвые» соединения, которые не закрылись штатно. */
+setInterval(() => {
+  for (const ws of wss.clients) {
+    const session = sessions.get(ws);
+    if (!session) continue;
+    if (!session.alive) {
+      ws.terminate();
+      continue;
+    }
+    session.alive = false;
+    ws.ping();
+  }
+}, 20_000);
+
+function send(ws: WebSocket, msg: ServerMessage): void {
+  if (ws.readyState === ws.OPEN) ws.send(encode(msg));
+}
+
+function broadcastExcept(exceptId: number, msg: ServerMessage): void {
+  const data = encode(msg);
+  for (const player of room.players.values()) {
+    if (player.id !== exceptId) player.send(data);
+  }
+}
+
+function isFiniteNumber(v: unknown): v is number {
+  return typeof v === 'number' && Number.isFinite(v);
+}
+
+// --- Игровой цикл ---
+
+const STEP_MS = DT * 1000;
+let previous = performance.now();
+let accumulator = 0;
+
+setInterval(() => {
+  const now = performance.now();
+  accumulator += now - previous;
+  previous = now;
+
+  // Догоняем пропущенные тики, но не больше 5 за раз: если сервер надолго завис,
+  // лучше «потерять» время, чем выдать игрокам рывок на полсекунды вперёд.
+  let steps = 0;
+  while (accumulator >= STEP_MS && steps < 5) {
+    room.update();
+    accumulator -= STEP_MS;
+    steps++;
+  }
+  if (steps === 5) accumulator = 0;
+  if (steps === 0) return;
+
+  if (room.tickCount % SNAPSHOT_EVERY !== 0) return;
+  if (room.players.size === 0) return;
+
+  const entries = room.snapshotEntries();
+  for (const player of room.players.values()) {
+    player.send(encode({ t: 'snapshot', tick: room.tickCount, ack: player.ack, players: entries }));
+  }
+}, STEP_MS / 2);
+
+http.listen(PORT, HOST, () => {
+  console.log(`Сервер танков слушает http://${HOST}:${PORT} (тик ${TICK_HZ} Гц)`);
+  console.log(SERVE_STATIC ? `Статика: ${STATIC_DIR}` : 'Статика не собрана — отдаёт vite/nginx');
+});
