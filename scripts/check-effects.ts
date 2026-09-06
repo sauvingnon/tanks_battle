@@ -1,22 +1,32 @@
 /**
- * Проверка наземных эффектов гусениц без браузера.
+ * Проверка эффектов ходовой части и гибели без браузера.
  * Запуск: npm run check:effects
  *
- * Смотреть на них глазами приходится в игре, но всё, что здесь можно наврать
- * молча, — это знаки и геометрия: крен не в ту сторону, отпечаток поперёк хода,
- * кольцевой буфер, который затирает не то. Три.js для этого хватает и в Node:
- * буферы и материалы — обычные объекты, контекст WebGL нужен только рисованию.
+ * Смотреть на них приходится глазами, но всё, что здесь можно наврать молча, —
+ * это знаки и геометрия: крен не в ту сторону, отпечаток поперёк хода,
+ * кольцевой буфер, который затирает не то, всплывающий остов. Три.js для этого
+ * хватает и в Node: буферы и материалы — обычные объекты, контекст WebGL нужен
+ * только рисованию.
+ *
+ * Чего здесь нет и быть не может: компиляции шейдеров. Их тела проверяются
+ * глазами в игре, а автоматически — только то, что каждый атрибут геометрии
+ * объявлен. Незаявленный атрибут молча не доедет до видеокарты, и эффект
+ * просто не появится, без единой ошибки в консоли.
  */
 import {
   bodyLean,
-  DustField,
+  DEBRIS_FIELD,
+  DUST_FIELD,
   LEAN_MAX,
+  ParticleField,
   TRACK_LENGTH,
   TRACK_SIDE,
   TRACK_WIDTH,
   TRACK_Y,
   trackAnchor,
   TrackMarks,
+  WRECK_S,
+  wreckSink,
 } from '../src/client/ground.js';
 
 const checks: Array<[string, boolean]> = [];
@@ -166,7 +176,7 @@ const near = (a: number, b: number, eps = 1e-6) => Math.abs(a - b) < eps;
   marks.clear();
   check('очистка требует полной заливки', position.updateRanges.length === 0);
 
-  const dust = new DustField();
+  const dust = new ParticleField(DUST_FIELD);
   const dustBirth = dust.points.geometry.getAttribute('birth') as {
     updateRanges: Array<{ start: number; count: number }>;
   };
@@ -179,7 +189,7 @@ const near = (a: number, b: number, eps = 1e-6) => Math.abs(a - b) < eps;
 // --- 5. Пыль ---
 
 {
-  const dust = new DustField();
+  const dust = new ParticleField(DUST_FIELD);
   const geometry = dust.points.geometry;
   const birth = geometry.getAttribute('birth');
   const position = geometry.getAttribute('position');
@@ -210,6 +220,54 @@ const near = (a: number, b: number, eps = 1e-6) => Math.abs(a - b) < eps;
   check('смена карты гасит пыль', alive === 0);
 }
 
+// --- 5б. Обломки — тот же рой с другими числами ---
+
+{
+  const debris = new ParticleField(DEBRIS_FIELD);
+  const birth = debris.points.geometry.getAttribute('birth');
+  check('у обломков свой запас частиц', birth.count === DEBRIS_FIELD.max);
+  check('обломки падают, а пыль висит', DEBRIS_FIELD.gravity < 0 && DUST_FIELD.gravity === 0);
+  check('обломок не разрастается', DEBRIS_FIELD.growth === 0);
+  check('обломки не проваливаются под землю', DEBRIS_FIELD.floor > 0);
+
+  // Гравитация и потолок падения должны доехать до шейдера: без uniform'а
+  // обломки полетели бы по прямой в небо и там растаяли.
+  const shader = (debris.points.material as { vertexShader: string }).vertexShader;
+  check('шейдер применяет гравитацию', /uGravity/.test(shader));
+  check('шейдер держит частицу над землёй', /uFloor/.test(shader));
+}
+
+// --- 5в. Уход остова ---
+
+{
+  // Оставлять остов до возрождения нельзя: на сервере подбитый танк выброшен
+  // и из столкновений, и из поиска цели снарядом. Он обязан исчезнуть сам.
+  check('остов живёт заметно меньше возрождения', WRECK_S > 1 && WRECK_S < 2.5);
+
+  check('в первый миг остов стоит на месте', near(wreckSink(0), 0));
+  check('сразу после гибели он ещё не проседает', near(wreckSink(0.2), 0));
+
+  const middle = wreckSink(WRECK_S / 2);
+  const end = wreckSink(WRECK_S);
+  check('к середине остов уже осел', middle < 0);
+  check('оседание только вниз и только ускоряется', end < middle);
+  check('к концу корпус целиком под землёй', end <= -2.5);
+
+  // Кривая монотонна: подпрыгнувший на середине остов выглядел бы живым.
+  let previous = 0;
+  let monotonic = true;
+  for (let t = 0; t <= WRECK_S; t += WRECK_S / 40) {
+    const y = wreckSink(t);
+    if (y > previous + 1e-9) monotonic = false;
+    previous = y;
+  }
+  check('остов не всплывает по дороге', monotonic);
+
+  // За концом кривая не должна уводить остов в бесконечность: кадр может
+  // прийти и позже срока, а мы по этой же функции ставим корпус.
+  check('после срока оседание не растёт', near(wreckSink(WRECK_S * 3), end));
+}
+
 // --- 6. Шейдеры собраны без опечаток в объявлениях ---
 
 {
@@ -223,7 +281,7 @@ const near = (a: number, b: number, eps = 1e-6) => Math.abs(a - b) < eps;
   const trackShader = (marks.mesh.material as { vertexShader: string }).vertexShader;
   check('след объявляет birth', declared(trackShader, 'birth'));
 
-  const dust = new DustField();
+  const dust = new ParticleField(DUST_FIELD);
   const dustShader = (dust.points.material as { vertexShader: string }).vertexShader;
   for (const name of ['velocity', 'birth', 'size']) {
     check(`пыль объявляет ${name}`, declared(dustShader, name));

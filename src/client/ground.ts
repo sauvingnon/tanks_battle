@@ -1,7 +1,8 @@
 /**
- * Наземные эффекты гусениц: следы на земле и пыль из-под траков.
+ * Эффекты ходовой части и гибели: крен корпуса, следы на земле, пыль из-под
+ * траков, обломки подбитого танка и уход остова.
  *
- * Обе штуки устроены одинаково и намеренно: буфер фиксированного размера по
+ * Рои устроены одинаково и намеренно: буфер фиксированного размера по
  * кругу, в который пишут только в момент рождения частицы. Всё остальное —
  * затухание, рост, полёт — считает вершинный шейдер по возрасту, а возраст он
  * берёт из времени рождения и одного общего uniform'а. Поэтому цена кадра не
@@ -74,6 +75,33 @@ export function trackAnchor(
     x: x + rightX * side * TRACK_SIDE - forwardX * TRACK_BACK,
     z: z + rightZ * side * TRACK_SIDE - forwardZ * TRACK_BACK,
   };
+}
+
+// --- Гибель танка ---
+
+/**
+ * Сколько живёт остов. Оставлять его до возрождения нельзя: на сервере подбитый
+ * танк выброшен и из столкновений, и из поиска цели снарядом — сквозь него ездят
+ * и стреляют. В режиме волн возрождения ждут до конца волны, то есть остов
+ * простоял бы там минуту ложной мишенью, съедая по 1.6 с перезарядки за выстрел.
+ * Поэтому гибель показываем и убираем.
+ */
+export const WRECK_S = 1.7;
+/** Пауза перед уходом: столько остов просто горит на месте. */
+const WRECK_HOLD_S = 0.4;
+/** На сколько метров остов уходит под землю. Корпус с башней — около 2.5 м. */
+const WRECK_DEPTH = 2.8;
+
+/**
+ * Насколько остов просел к моменту elapsed. Уход под землю, а не растворение:
+ * материалы корпуса общие на все танки, и гасить их прозрачностью значило бы
+ * гасить заодно живых. Земля непрозрачна и прячет остов сама, бесплатно.
+ */
+export function wreckSink(elapsed: number): number {
+  if (elapsed <= WRECK_HOLD_S) return 0;
+  const t = Math.min(1, (elapsed - WRECK_HOLD_S) / (WRECK_S - WRECK_HOLD_S));
+  // Квадрат: сначала оседает медленно, будто подламывается, потом проваливается.
+  return -WRECK_DEPTH * t * t;
 }
 
 // --- Следы гусениц ---
@@ -216,15 +244,58 @@ export class TrackMarks {
   }
 }
 
-// --- Пыль из-под гусениц ---
+// --- Летящие частицы: пыль из-под гусениц и обломки подбитого танка ---
 
-const DUST_MAX = 512;
-/** Сколько секунд живёт пылинка. */
-const DUST_LIFE = 0.95;
+/**
+ * Настройки одного роя. Пыль из-под гусениц и обломки подбитого танка — это
+ * одна и та же система с разными числами: летящая частица, которая стареет,
+ * растёт и гаснет. Разводить их в два класса значило бы дважды написать
+ * кольцевой буфер и дважды — один и тот же шейдер.
+ */
+export interface FieldOptions {
+  /** Сколько частиц живёт одновременно; дальше кольцо затирает старые. */
+  max: number;
+  /** Сколько секунд живёт частица. */
+  life: number;
+  color: number;
+  /** Ускорение вниз, м/с². 0 — частица летит по прямой. */
+  gravity: number;
+  /** Во сколько раз частица разрастается к концу жизни. */
+  growth: number;
+  /** Плотность в центре частицы. */
+  alpha: number;
+  /** Ниже этой высоты частица ложится и дальше не падает, м. */
+  floor: number;
+}
 
-export class DustField {
+/** Пыль из-под траков: висит, разрастается, не падает. */
+export const DUST_FIELD: FieldOptions = {
+  max: 512,
+  life: 0.95,
+  color: 0x9b9078,
+  gravity: 0,
+  growth: 1.3,
+  // Пылинок за танком висит с десяток, и они накладываются друг на друга:
+  // на трети плотности стая читается как облако, на половине — как стена.
+  alpha: 0.32,
+  floor: 0.1,
+};
+
+/** Обломки подбитого танка: тяжёлые, тёмные, летят по дуге и остаются лежать. */
+export const DEBRIS_FIELD: FieldOptions = {
+  max: 256,
+  life: 1.6,
+  color: 0x2a2521,
+  gravity: -16,
+  growth: 0, // осколок не разрастается, в отличие от клуба пыли
+  alpha: 0.95,
+  floor: 0.15,
+};
+
+export class ParticleField {
   readonly points: THREE.Points;
 
+  private readonly max: number;
   private readonly position: THREE.BufferAttribute;
   private readonly velocity: THREE.BufferAttribute;
   private readonly birth: THREE.BufferAttribute;
@@ -233,13 +304,14 @@ export class DustField {
   private head = 0;
   private dirty = false;
 
-  constructor() {
+  constructor(options: FieldOptions) {
     const geometry = new THREE.BufferGeometry();
+    this.max = options.max;
 
-    this.position = new THREE.BufferAttribute(new Float32Array(DUST_MAX * 3), 3);
-    this.velocity = new THREE.BufferAttribute(new Float32Array(DUST_MAX * 3), 3);
-    this.birth = new THREE.BufferAttribute(new Float32Array(DUST_MAX), 1);
-    this.size = new THREE.BufferAttribute(new Float32Array(DUST_MAX), 1);
+    this.position = new THREE.BufferAttribute(new Float32Array(options.max * 3), 3);
+    this.velocity = new THREE.BufferAttribute(new Float32Array(options.max * 3), 3);
+    this.birth = new THREE.BufferAttribute(new Float32Array(options.max), 1);
+    this.size = new THREE.BufferAttribute(new Float32Array(options.max), 1);
     for (const attribute of [this.position, this.velocity, this.birth, this.size]) {
       attribute.setUsage(THREE.DynamicDrawUsage);
     }
@@ -253,11 +325,15 @@ export class DustField {
     this.material = new THREE.ShaderMaterial({
       uniforms: {
         uTime: { value: 0 },
-        uLife: { value: DUST_LIFE },
+        uLife: { value: options.life },
         // Пересчитывается при изменении размера окна: gl_PointSize задаётся
         // в пикселях устройства, а размер частицы задан в метрах.
         uScale: { value: 300 },
-        uColor: { value: new THREE.Color(0x9b9078) },
+        uColor: { value: new THREE.Color(options.color) },
+        uGravity: { value: options.gravity },
+        uGrowth: { value: options.growth },
+        uAlpha: { value: options.alpha },
+        uFloor: { value: options.floor },
       },
       vertexShader: `
         attribute vec3 velocity;
@@ -266,28 +342,35 @@ export class DustField {
         uniform float uTime;
         uniform float uLife;
         uniform float uScale;
+        uniform float uGravity;
+        uniform float uGrowth;
+        uniform float uFloor;
         varying float vAlpha;
         void main() {
           float age = clamp((uTime - birth) / uLife, 0.0, 1.0);
-          // Квадрат: пыль держится плотной, пока клуб поднимается, и тает в конце.
+          // Квадрат: частица держится плотной, пока летит, и тает в конце.
           vAlpha = (1.0 - age) * (1.0 - age);
-          vec3 drift = position + velocity * (age * uLife);
+
+          float t = age * uLife;
+          vec3 drift = position + velocity * t;
+          // Обломки падают по дуге и остаются лежать на земле, пыль просто висит.
+          drift.y = max(drift.y + 0.5 * uGravity * t * t, uFloor);
+
           vec4 view = modelViewMatrix * vec4(drift, 1.0);
-          gl_PointSize = size * (0.55 + age * 1.3) * uScale / max(-view.z, 1.0);
+          gl_PointSize = size * (0.55 + age * uGrowth) * uScale / max(-view.z, 1.0);
           gl_Position = projectionMatrix * view;
         }
       `,
       fragmentShader: `
         uniform vec3 uColor;
+        uniform float uAlpha;
         varying float vAlpha;
         void main() {
           if (vAlpha <= 0.004) discard;
           // Мягкий круг считаем прямо здесь: текстура ради градиента не нужна.
           float d = length(gl_PointCoord - vec2(0.5));
           if (d > 0.5) discard;
-          // Пылинок за танком висит с десяток, и они накладываются друг на друга:
-          // на трети плотности стая читается как облако, на половине — как стена.
-          gl_FragColor = vec4(uColor, vAlpha * (1.0 - d * 2.0) * 0.32);
+          gl_FragColor = vec4(uColor, vAlpha * (1.0 - d * 2.0) * uAlpha);
         }
       `,
       transparent: true,
@@ -309,7 +392,7 @@ export class DustField {
     time: number,
   ): void {
     const i = this.head;
-    this.head = (this.head + 1) % DUST_MAX;
+    this.head = (this.head + 1) % this.max;
 
     const points = this.position.array as Float32Array;
     points[i * 3] = x;

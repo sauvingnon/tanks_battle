@@ -2,7 +2,17 @@ import * as THREE from 'three';
 
 import { MAX_HP, SHELL_HEIGHT } from '../shared/constants.js';
 import { wrapAngle } from '../shared/sim.js';
-import { bodyLean, DustField, TRACK_SIDE, trackAnchor, TrackMarks } from './ground.js';
+import {
+  bodyLean,
+  DEBRIS_FIELD,
+  DUST_FIELD,
+  ParticleField,
+  TRACK_SIDE,
+  trackAnchor,
+  TrackMarks,
+  WRECK_S,
+  wreckSink,
+} from './ground.js';
 import {
   BOOM_GROUND,
   BOOM_HIT,
@@ -134,6 +144,28 @@ const DUST_MIN_SPEED = 5;
  */
 const TELEPORT_STEP = 4;
 
+// --- Гибель танка ---
+
+/** Дым горящего остова: тёмный, крупный, медленно всплывает. */
+const WRECK_SMOKE: EffectPreset = {
+  radius: 1.9,
+  life: 1.5,
+  color: 0x36322c,
+  rise: 2.1,
+  grow: 2.4,
+  alpha: 0.5,
+};
+
+/** Как часто остов выбрасывает клуб дыма, с. */
+const WRECK_SMOKE_EVERY = 0.26;
+/** Сколько обломков разлетается в момент гибели. */
+const WRECK_DEBRIS = 16;
+/** Во сколько раз темнеет краска корпуса на подбитом танке. */
+const WRECK_DARKEN = 0.22;
+/** Крен и клевок, в которых остов замирает: подбитый танк стоит криво. */
+const WRECK_ROLL = 0.13;
+const WRECK_PITCH = -0.07;
+
 export interface TankHandle {
   root: THREE.Group;
   /**
@@ -157,6 +189,20 @@ export interface TankHandle {
   /** Пройденный путь с прошлого отпечатка и с прошлой пылинки, м. */
   trackDistance: number;
   dustDistance: number;
+  /** Краска корпуса этого танка: на время гибели темнеет до копоти. */
+  paint: THREE.MeshStandardMaterial;
+  /** Исходный цвет краски, чтобы вернуть его при возрождении. */
+  paintColor: number;
+  /** Сколько секунд идёт гибель; -1 — танк не подбит. */
+  dying: number;
+  /**
+   * Рисовали ли мы этот танк хоть раз. В режиме волн павшие ждут конца волны,
+   * поэтому зашедший в середине волны получает их первым же снапшотом уже
+   * подбитыми — без этой отметки на него разом посыпались бы чужие взрывы.
+   */
+  everSeen: boolean;
+  /** Когда остов выбросит следующий клуб дыма, в секундах от начала гибели. */
+  smokeAt: number;
   label: HTMLElement;
   hpFill: HTMLElement;
   /** Размеры подписи в пикселях, замеряются один раз — текст не меняется. */
@@ -198,9 +244,10 @@ export class Scene3D {
   /** Земля, стены и блоки текущей карты: при смене карты группа собирается заново. */
   private readonly world = new THREE.Group();
 
-  /** Следы гусениц и пыль: живут отдельно от карты, но чистятся вместе с ней. */
+  /** Следы гусениц, пыль и обломки: живут отдельно от карты, но чистятся с ней. */
   private readonly tracks = new TrackMarks();
-  private readonly dust = new DustField();
+  private readonly dust = new ParticleField(DUST_FIELD);
+  private readonly debris = new ParticleField(DEBRIS_FIELD);
   /** Часы сцены в секундах: по ним шейдеры считают возраст следов и пылинок. */
   private clock = 0;
 
@@ -310,6 +357,7 @@ export class Scene3D {
     this.scene.add(this.world);
     this.scene.add(this.tracks.mesh);
     this.scene.add(this.dust.points);
+    this.scene.add(this.debris.points);
     this.setupLights();
     this.resize();
     window.addEventListener('resize', this.resize);
@@ -347,9 +395,10 @@ export class Scene3D {
    */
   buildWorld(half: number, obstacles: Box[]): void {
     this.clearWorld();
-    // Следы и пыль от прошлой карты к новой геометрии отношения не имеют.
+    // Следы, пыль и обломки от прошлой карты к новой отношения не имеют.
     this.tracks.clear();
     this.dust.clear();
+    this.debris.clear();
 
     const ground = new THREE.Mesh(
       new THREE.PlaneGeometry(half * 6, half * 6),
@@ -423,8 +472,9 @@ export class Scene3D {
     const body = new THREE.Group();
     root.add(body);
 
+    const paintColor = PALETTE[colorIndex % PALETTE.length];
     const bodyMaterial = new THREE.MeshStandardMaterial({
-      color: PALETTE[colorIndex % PALETTE.length],
+      color: paintColor,
       roughness: 0.72,
       metalness: 0.15,
     });
@@ -497,6 +547,11 @@ export class Scene3D {
       pitch: 0,
       trackDistance: 0,
       dustDistance: 0,
+      paint: bodyMaterial,
+      paintColor,
+      dying: -1,
+      smokeAt: 0,
+      everSeen: false,
       label,
       hpFill,
       // Читаем размеры один раз: offsetWidth каждый кадр заставлял бы браузер
@@ -531,8 +586,90 @@ export class Scene3D {
 
     if (alive !== handle.alive) {
       handle.alive = alive;
-      handle.root.visible = alive && !handle.cloaked;
+      if (alive) this.reviveTank(handle);
+      else this.killTank(handle);
       // Подпись погасит updateLabels(): она и так каждый кадр решает, видно ли её.
+    }
+  }
+
+  /** Танк подбит: копоть, перекос, разлёт обломков и горящий остов на WRECK_S. */
+  private killTank(handle: TankHandle): void {
+    // Танк, которого мы живым не застали, просто не рисуем: взрыв ему устроили
+    // до нашего появления, и показывать его сейчас — врать о том, что случилось.
+    if (!handle.everSeen) {
+      handle.dying = -1;
+      handle.root.visible = false;
+      return;
+    }
+
+    handle.dying = 0;
+    handle.smokeAt = 0;
+    handle.root.visible = !handle.cloaked;
+
+    handle.paint.color.setHex(handle.paintColor).multiplyScalar(WRECK_DARKEN);
+    handle.body.rotation.set(WRECK_PITCH, 0, WRECK_ROLL);
+    handle.roll = WRECK_ROLL;
+    handle.pitch = WRECK_PITCH;
+
+    // Остов уходит под землю, а тень рисуется отдельным проходом сверху: земля
+    // в карту теней не пишет, поэтому провалившийся танк продолжал бы бросать
+    // на неё тень — на пустом месте лежало бы тёмное пятно.
+    handle.body.traverse((node) => {
+      node.castShadow = false;
+    });
+
+    const { x, z } = handle.root.position;
+    for (let i = 0; i < WRECK_DEBRIS; i++) {
+      const course = Math.random() * Math.PI * 2;
+      const outward = 3 + Math.random() * 7;
+      this.debris.emit(
+        x + (Math.random() - 0.5) * 2,
+        1.4,
+        z + (Math.random() - 0.5) * 2,
+        Math.sin(course) * outward,
+        5 + Math.random() * 6,
+        Math.cos(course) * outward,
+        0.7 + Math.random() * 0.6,
+        this.clock,
+      );
+    }
+  }
+
+  /** Возрождение: краска, тени и осанка возвращаются к исходным. */
+  private reviveTank(handle: TankHandle): void {
+    handle.dying = -1;
+    handle.paint.color.setHex(handle.paintColor);
+    handle.body.position.y = 0;
+    handle.body.rotation.set(0, 0, 0);
+    handle.roll = 0;
+    handle.pitch = 0;
+    handle.body.traverse((node) => {
+      node.castShadow = true;
+    });
+    handle.root.visible = !handle.cloaked;
+  }
+
+  /** Горящий остов: оседает, дымит и в конце убирается со сцены. */
+  private updateWrecks(dt: number): void {
+    for (const handle of this.tanks.values()) {
+      if (handle.dying < 0) continue;
+      handle.dying += dt;
+
+      if (handle.dying >= WRECK_S) {
+        handle.dying = -1;
+        handle.root.visible = false;
+        continue;
+      }
+
+      handle.body.position.y = wreckSink(handle.dying);
+      if (handle.dying < handle.smokeAt) continue;
+      handle.smokeAt += WRECK_SMOKE_EVERY;
+      this.spawnEffect(
+        handle.root.position.x + (Math.random() - 0.5) * 1.6,
+        1.5,
+        handle.root.position.z + (Math.random() - 0.5) * 1.6,
+        WRECK_SMOKE,
+      );
     }
   }
 
@@ -545,7 +682,9 @@ export class Scene3D {
     const handle = this.tanks.get(id);
     if (!handle || handle.cloaked === cloaked) return;
     handle.cloaked = cloaked;
-    handle.root.visible = handle.alive && !cloaked;
+    // Горящий остов ещё не «жив», но виден: без этой оговорки любое обновление
+    // маскировки в кадре гибели гасило бы его на полуслове.
+    handle.root.visible = (handle.alive || handle.dying >= 0) && !cloaked;
   }
 
   removeTank(id: number): void {
@@ -559,6 +698,7 @@ export class Scene3D {
   updateTank(id: number, x: number, z: number, angle: number, turret: number): void {
     const handle = this.tanks.get(id);
     if (!handle) return;
+    if (handle.alive) handle.everSeen = true;
     handle.root.position.set(x, 0, z);
     handle.root.rotation.y = angle;
     // Башня хранится в мировых углах, а её узел — потомок корпуса.
@@ -904,6 +1044,13 @@ export class Scene3D {
         continue;
       }
 
+      // Подбитый танк не кренится и не месит землю: осанку ему задала гибель,
+      // и пересчёт крена тут же выпрямил бы остов обратно.
+      if (!handle.alive) {
+        handle.speed = 0;
+        continue;
+      }
+
       const forwardX = Math.sin(yaw);
       const forwardZ = Math.cos(yaw);
       // Знаковая скорость: проекция шага на курс. Задний ход выходит отрицательным,
@@ -918,9 +1065,8 @@ export class Scene3D {
       handle.body.rotation.z = handle.roll;
       handle.body.rotation.x = handle.pitch;
 
-      // Подбитый не месит землю, а замаскированный не должен выдавать себя
-      // ни следом, ни облаком пыли за спиной.
-      if (!handle.alive || handle.cloaked || step === 0) continue;
+      // Замаскированный не должен выдавать себя ни следом, ни облаком пыли.
+      if (handle.cloaked || step === 0) continue;
 
       handle.trackDistance += step;
       handle.dustDistance += step;
@@ -965,9 +1111,11 @@ export class Scene3D {
     this.updateEffects(dt);
     this.updateRecoil(dt);
     this.updateChassis(dt);
+    this.updateWrecks(dt);
     this.updateBonuses(dt);
     this.tracks.update(this.clock);
     this.dust.update(this.clock);
+    this.debris.update(this.clock);
     this.renderer.render(this.scene, this.camera);
     this.updateLabels();
   }
@@ -1017,7 +1165,9 @@ export class Scene3D {
     this.camera.aspect = width / height;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(width, height, false);
-    // Размер пылинки задан в метрах, а шейдер выдаёт пиксели устройства.
-    this.dust.setViewport(height * this.renderer.getPixelRatio(), this.camera.fov);
+    // Размер частицы задан в метрах, а шейдер выдаёт пиксели устройства.
+    const heightPx = height * this.renderer.getPixelRatio();
+    this.dust.setViewport(heightPx, this.camera.fov);
+    this.debris.setViewport(heightPx, this.camera.fov);
   };
 }
