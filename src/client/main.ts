@@ -26,13 +26,14 @@ import {
   SHELL_HEIGHT,
   type GameMode,
 } from '../shared/constants.js';
-import { MAP_NAMES } from '../shared/map.js';
+import { coverBoxes, MAP_NAMES } from '../shared/map.js';
 import { clamp, lerpAngle, sweepShell } from '../shared/sim.js';
 import type { RoomConfig, ServerMessage, WaveState } from '../shared/protocol.js';
 import {
   BOOM_HIT,
   BOOM_KILL,
   type Boom,
+  type Box,
   type PlayerInfo,
   type ShellState,
   type SnapshotBonus,
@@ -75,6 +76,8 @@ const players = new Map<number, PlayerInfo>();
 
 /** Свой танк: предсказание, реконсиляция и сглаживание живут в prediction.ts. */
 const self = new SelfPrediction();
+/** Блоки, которые держат снаряд: нужны метке прицела. Пересобираются со сменой карты. */
+let cover: Box[] = [];
 
 interface BufferedSnapshot {
   time: number;
@@ -122,6 +125,9 @@ const MAP_HINTS = [
   'Срабатывает сразу: бой начинается заново. Стены с четырьмя воротами — есть что держать.',
   'Срабатывает сразу: бой начинается заново. Кварталы и улицы: близко, тесно, много рикошетов.',
   'Срабатывает сразу: бой начинается заново. Стена делит карту надвое, три прохода.',
+  'Срабатывает сразу: бой начинается заново. Брустверы простреливаются насквозь — ехать зигзагом, а видно тебя всегда.',
+  'Срабатывает сразу: бой начинается заново. Контейнеры не укрывают: весь парк простреливается поверху.',
+  'Срабатывает сразу: бой начинается заново. Открыто и далеко. Барханы держат колёса, но не снаряды.',
 ];
 
 /** Что делает манера боя — подпись под выбором. Порядок как в STANCE_NAMES. */
@@ -166,6 +172,7 @@ function handleMessage(msg: ServerMessage): void {
     case 'welcome': {
       selfId = msg.id;
       self.obstacles = msg.map.obstacles;
+      cover = coverBoxes(msg.map.obstacles);
       if (!worldBuilt) {
         scene.buildWorld(msg.map.half, msg.map.obstacles);
         worldBuilt = true;
@@ -180,6 +187,7 @@ function handleMessage(msg: ServerMessage): void {
       // Карту строит сервер, клиент только пересобирает по ней сцену и свои
       // препятствия для предсказания.
       self.obstacles = msg.obstacles;
+      cover = coverBoxes(msg.obstacles);
       scene.buildWorld(msg.half, msg.obstacles);
       worldBuilt = true;
       break;
@@ -442,7 +450,8 @@ function drawAim(x: number, z: number, turret: number): void {
     bounces: 0,
   };
   // dt = 1, поэтому свип разбирает ровно отрезок длиной AIM_RANGE.
-  const wall = sweepShell(probe, 1, self.obstacles);
+  // Метка прицела упирается в укрытия, а не во всё подряд: низкий блок она проходит.
+  const wall = sweepShell(probe, 1, cover);
   const travel = wall ? wall.t : 1;
 
   const point = scene.project(

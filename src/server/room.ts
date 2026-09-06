@@ -42,7 +42,7 @@
   waveTier,
   type GameMode,
 } from '../shared/constants.js';
-import { buildMap, isMapId, spawnPoint } from '../shared/map.js';
+import { buildMap, coverBoxes, isMapId, spawnPoint } from '../shared/map.js';
 import type { RoomConfig, ServerMessage, WavePhase, WaveState } from '../shared/protocol.js';
 import {
   bounceShell,
@@ -137,6 +137,8 @@ const NO_SEND = (): void => {};
 export class Room {
   /** Геометрия текущей карты. Меняется целиком при смене карты. */
   obstacles: Box[] = buildMap(0);
+  /** Из них — только те, что останавливают снаряд. Пересобирается со сменой карты. */
+  cover: Box[] = coverBoxes(this.obstacles);
   readonly players = new Map<number, Player>();
 
   /** Индекс карты в MAPS. */
@@ -356,7 +358,13 @@ export class Room {
         hp: bot.hp,
         brain: bot.brain!,
       },
-      { tick: this.tick, obstacles: this.obstacles, tanks: this.tanks, stance: this.stance },
+      {
+        tick: this.tick,
+        obstacles: this.obstacles,
+        cover: this.cover,
+        tanks: this.tanks,
+        stance: this.stance,
+      },
     );
     stepTank(bot.state, bot.last, DT, this.obstacles);
     if (bot.last.fire) {
@@ -406,7 +414,8 @@ export class Room {
    */
   private flyShell(shell: ShellState, dt: number): boolean {
     for (let segment = 0; segment < MAX_SEGMENTS; segment++) {
-      const wall = sweepShell(shell, dt, this.obstacles);
+      // Именно cover: низкое укрытие снаряд проходит насквозь.
+      const wall = sweepShell(shell, dt, this.cover);
 
       // Танк на отрезке важнее стены за ним, поэтому ищем его только до касания.
       const victim = this.firstVictim(shell, dt, wall ? wall.t : 1);
@@ -638,6 +647,7 @@ export class Room {
     if (newMap) {
       this.mapId = map;
       this.obstacles = buildMap(this.mapId);
+      this.cover = coverBoxes(this.obstacles);
       // Геометрию клиент не строит сам — шлём её раньше рестарта, чтобы к первому
       // же снапшоту нового мира у него была правильная карта.
       this.emit({ t: 'map', id: this.mapId, half: MAP_HALF, obstacles: this.obstacles });

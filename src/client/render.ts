@@ -246,8 +246,12 @@ export class Scene3D {
     }
 
     const boxMaterial = new THREE.MeshStandardMaterial({ color: 0x6d6357, roughness: 0.85 });
+    // Низкое укрытие простреливается насквозь, поэтому его надо отличать с одного
+    // взгляда: другой цвет и заметно теплее — «за этим не спрячешься».
+    const lowMaterial = new THREE.MeshStandardMaterial({ color: 0x8a6a3f, roughness: 1 });
     for (const box of obstacles) {
-      const mesh = new THREE.Mesh(new THREE.BoxGeometry(box.w, box.h, box.d), boxMaterial);
+      const material = box.h >= SHELL_HEIGHT ? boxMaterial : lowMaterial;
+      const mesh = new THREE.Mesh(new THREE.BoxGeometry(box.w, box.h, box.d), material);
       mesh.position.set(box.x, box.h / 2, box.z);
       mesh.castShadow = true;
       mesh.receiveShadow = true;

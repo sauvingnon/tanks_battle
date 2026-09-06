@@ -1,4 +1,4 @@
-import { MAP_HALF } from './constants.js';
+import { MAP_HALF, SHELL_HEIGHT } from './constants.js';
 import type { Box } from './types.js';
 
 /**
@@ -8,7 +8,8 @@ import type { Box } from './types.js';
  *
  * Общие правила для любой карты:
  *  - всё выровнено по осям, иначе перестанут работать свипы снарядов и рикошеты;
- *  - высота блока выше SHELL_HEIGHT (2.15), иначе укрытие не укрывает;
+ *  - блок выше SHELL_HEIGHT (2.15) укрывает от огня, ниже — только мешает ехать:
+ *    через него видно, простреливается насквозь, но проехать нельзя;
  *  - проезд между блоками не уже 8 м: танк — круг радиусом 2.4, и в щель
  *    впритык он заезжает, но выбраться уже не может;
  *  - точки спавна перечислены руками и проверяются npm run check:map.
@@ -191,11 +192,118 @@ for (const x of [-62, 62]) {
   for (const z of [-55, -33, -11, 11, 33, 55]) RAVINE_SPAWNS.push([x, z]);
 }
 
+/** Высота низкого укрытия: ниже SHELL_HEIGHT, значит простреливается насквозь. */
+const LOW = 1.5;
+
+/**
+ * «Окопы»: поперечные брустверы с разбежкой в проходах. Стрелять можно через всю
+ * карту, а ехать — только зигзагом от прохода к проходу, и на этом пути ты весь
+ * бой на виду. Карта про то, что «вижу» и «достану» перестали быть одним и тем же.
+ */
+function buildTrenches(): Box[] {
+  const boxes: Box[] = [];
+
+  // Ряд брустверов вдоль X с проходами в перечисленных точках.
+  const line = (z: number, gaps: number[]) => {
+    const half = 7; // половина прохода: 14 м, танку хватает с запасом
+    const edges = [-MAP_HALF, ...gaps.flatMap((g) => [g - half, g + half]), MAP_HALF];
+    for (let i = 0; i < edges.length; i += 2) {
+      const from = edges[i];
+      const to = edges[i + 1];
+      if (to - from < 1) continue;
+      boxes.push({ x: (from + to) / 2, z, w: to - from, d: 2.5, h: LOW });
+    }
+  };
+
+  // Проходы соседних рядов не совпадают: иначе через карту шёл бы прямой коридор.
+  line(-50, [-35, 35]);
+  line(-25, [0]);
+  line(0, [-35, 35]);
+  line(25, [0]);
+  line(50, [-35, 35]);
+
+  // Настоящие укрытия: без них поле простреливается насквозь и прятаться негде.
+  for (const [x, z] of [
+    [-40, -37],
+    [40, -37],
+    [0, -12],
+    [0, 12],
+    [-40, 37],
+    [40, 37],
+  ]) {
+    boxes.push({ x, z, w: 6, d: 6, h: 4.5 });
+  }
+
+  return boxes;
+}
+
+/** Спавны «Окопов»: в полосах между брустверами, у боковых стен и за крайними рядами. */
+const TRENCH_SPAWNS: Array<[number, number]> = [
+  [-62, -37], [-62, -12], [-62, 12], [-62, 37],
+  [62, -37], [62, -12], [62, 12], [62, 37],
+  [-30, -63], [30, -63], [-30, 63], [30, 63],
+];
+
+/**
+ * «Автопарк»: ряды контейнеров и один высокий ангар посередине. Контейнеры ниже
+ * высоты полёта, поэтому весь парк простреливается поверху, а ехать приходится
+ * по проездам. Дуэль тут выигрывает тот, кто раньше понял, что его видно.
+ */
+function buildDepot(): Box[] {
+  const boxes: Box[] = [];
+
+  // Ангар — единственное настоящее укрытие, поэтому он в центре и за него дерутся.
+  boxes.push({ x: 0, z: 0, w: 20, d: 14, h: 5 });
+
+  // Контейнеры 4x12: шаг 15 по X даёт проезд 11 м, шаг 22 по Z — 10 м.
+  for (const x of [-52.5, -37.5, -22.5, -7.5, 7.5, 22.5, 37.5, 52.5]) {
+    for (const z of [-54, -32, -10, 10, 32, 54]) {
+      // Два ряда у ангара пришлось бы ставить внахлёст с ним.
+      if (Math.abs(x) < 10 && Math.abs(z) < 20) continue;
+      boxes.push({ x, z, w: 4, d: 12, h: LOW });
+    }
+  }
+
+  // Пара сторожевых будок по углам: чтобы укрытие было не только в центре.
+  for (const [sx, sz] of CORNERS) boxes.push({ x: sx * 45, z: sz * 45, w: 7, d: 7, h: 4 });
+
+  return boxes;
+}
+
+/**
+ * «Дюны»: открытая карта с длинными линиями огня и низкими барханами. Спрятаться
+ * почти негде — только три скальных выхода, — зато проехать напрямик тоже нельзя.
+ * Самая «снайперская» из карт: важнее позиция, чем укрытие.
+ */
+function buildDunes(): Box[] {
+  const boxes: Box[] = [];
+  const low = (x: number, z: number, w: number, d: number) => {
+    boxes.push({ x, z, w, d, h: LOW });
+  };
+
+  for (const [sx, sz] of CORNERS) {
+    low(sx * 22, sz * 20, 16, 10);
+    low(sx * 48, sz * 16, 10, 18);
+    low(sx * 16, sz * 48, 18, 10);
+    low(sx * 56, sz * 52, 14, 14);
+  }
+
+  // Три скальных выхода — единственное, что держит снаряд.
+  boxes.push({ x: 0, z: 0, w: 12, d: 12, h: 4.5 });
+  boxes.push({ x: -38, z: 38, w: 9, d: 9, h: 4 });
+  boxes.push({ x: 38, z: -38, w: 9, d: 9, h: 4 });
+
+  return boxes;
+}
+
 export const MAPS: MapDef[] = [
   { name: 'Кремль', build: buildKremlin, spawns: ring(MAP_HALF - 10) },
   { name: 'Форт', build: buildFort, spawns: perimeter(60) },
   { name: 'Город', build: buildCity, spawns: perimeter(62) },
   { name: 'Овраг', build: buildRavine, spawns: RAVINE_SPAWNS },
+  { name: 'Окопы', build: buildTrenches, spawns: TRENCH_SPAWNS },
+  { name: 'Автопарк', build: buildDepot, spawns: perimeter(63) },
+  { name: 'Дюны', build: buildDunes, spawns: ring(MAP_HALF - 8) },
 ];
 
 export const MAP_NAMES = MAPS.map((m) => m.name);
@@ -216,6 +324,16 @@ export function spawnPoint(index: number, id = 0): { x: number; z: number; angle
   const [x, z] = spawns[((index % spawns.length) + spawns.length) % spawns.length];
   // Разворачиваем к центру: направление (0,0) - (x,z).
   return { x, z, angle: Math.atan2(-x, -z) };
+}
+
+/**
+ * Блоки, которые останавливают снаряд. Всё, что ниже высоты полёта, снаряд
+ * проходит насквозь: низкое укрытие мешает ехать, но не стрелять. Список
+ * считается один раз на смену карты — фильтровать его в каждом свипе было бы
+ * самой дорогой строчкой сервера.
+ */
+export function coverBoxes(obstacles: Box[]): Box[] {
+  return obstacles.filter((box) => box.h >= SHELL_HEIGHT);
 }
 
 export function spawnCount(id = 0): number {

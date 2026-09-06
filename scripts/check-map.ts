@@ -4,8 +4,8 @@
  * то есть до любого закутка можно доехать.
  * Запуск: npm run check:map
  */
-import { MAP_HALF, TANK_RADIUS } from '../src/shared/constants.js';
-import { MAPS, spawnCount, spawnPoint } from '../src/shared/map.js';
+import { MAP_HALF, SHELL_HEIGHT, TANK_RADIUS } from '../src/shared/constants.js';
+import { coverBoxes, MAPS, spawnCount, spawnPoint } from '../src/shared/map.js';
 import type { Box } from '../src/shared/types.js';
 
 /** Запас поверх радиуса танка: впритык он заезжает, но выехать уже не может. */
@@ -85,7 +85,18 @@ function reachability(boxes: Box[], from: { x: number; z: number }): {
 for (let id = 0; id < MAPS.length; id++) {
   const boxes = MAPS[id].build();
   const count = spawnCount(id);
-  console.log(`\n=== ${MAPS[id].name} (${boxes.length} блоков, ${count} спавнов) ===`);
+  const low = boxes.length - coverBoxes(boxes).length;
+  console.log(
+    `\n=== ${MAPS[id].name} (${boxes.length} блоков, из них низких ${low}, ${count} спавнов) ===`,
+  );
+
+  // Блок ровно на высоте полёта — это не низкое укрытие и не стена, а лотерея
+  // из погрешности: снаряд то проходит, то нет. Требуем внятного зазора.
+  const ambiguous = boxes.filter((b) => Math.abs(b.h - SHELL_HEIGHT) < 0.3);
+  if (ambiguous.length > 0) {
+    bad++;
+    console.log(`  ${ambiguous.length} блоков стоят на самой высоте полёта — ДВУСМЫСЛЕННО`);
+  }
 
   let worst = Infinity;
   for (let i = 0; i < count; i++) {

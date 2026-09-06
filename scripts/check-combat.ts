@@ -18,6 +18,7 @@ import {
   TICK_HZ,
 } from '../src/shared/constants.js';
 import { bounceShell, canRicochet, sweepShell } from '../src/shared/sim.js';
+import { coverBoxes } from '../src/shared/map.js';
 import {
   BOOM_GROUND,
   BOOM_HIT,
@@ -155,6 +156,37 @@ const noop = () => {};
   const booms = [...run(room, 1, [shooter]), ...run(room, 15)];
   check('препятствие остановило снаряд', target.hp === MAX_HP);
   check('взрыв произошёл о препятствие', booms.includes(BOOM_GROUND));
+}
+
+// --- 4б. Низкое укрытие держит танк, но не снаряд ---
+{
+  const room = new Room();
+  const shooter = room.add('Стрелок', noop);
+  const target = room.add('Мишень', noop);
+
+  // Своя геометрия вместо карты: один низкий блок ровно между стволом и целью.
+  room.obstacles = [{ x: 0, z: 49, w: 20, d: 6, h: 1.5 }];
+  room.cover = coverBoxes(room.obstacles);
+  check('низкий блок не попал в список укрытий', room.cover.length === 0);
+
+  place(shooter, 0, 40, 0);
+  place(target, 0, 58, Math.PI);
+  run(room, 1, [shooter]);
+  run(room, 15);
+  check('снаряд прошёл над низким укрытием', target.hp === MAX_HP - SHELL_DAMAGE);
+
+  // А проехать сквозь него по-прежнему нельзя: столкновения считаются по всем блокам.
+  place(shooter, 0, 40, 0);
+  for (let i = 0; i < 60; i++) {
+    room.pushInput(shooter, {
+      seq: room.tickCount + 1,
+      throttle: 1,
+      steer: 0,
+      turret: 0,
+    });
+    room.update();
+  }
+  check('через низкое укрытие не проехать', shooter.state.z < 49);
 }
 
 // --- 5. Свип находит препятствие и не даёт проскочить сквозь него ---

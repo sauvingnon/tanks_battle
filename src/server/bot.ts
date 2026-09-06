@@ -185,7 +185,10 @@ export interface BotSelf extends BotTarget {
 
 export interface BotWorld {
   tick: number;
+  /** Всё, обо что можно удариться: по нему бот прокладывает объезд. */
   obstacles: Box[];
+  /** Только то, что держит снаряд. Низкое укрытие бот простреливает насквозь. */
+  cover: Box[];
   tanks: Iterable<BotTarget>;
   /** Манера боя комнаты; не задана — нейтральная. */
   stance?: number;
@@ -246,7 +249,7 @@ export function think(self: BotSelf, world: BotWorld): Input {
   const aim = brain.bank ?? leadAngle(me, target.state, dist, tier.lead);
   const turret = aim + brain.aimBias;
 
-  const shot = hasShot(me, target.state, world.obstacles);
+  const shot = hasShot(me, target.state, world.cover);
   const clear = shot || brain.bank !== null;
   // Порог наводки — угловой размер танка на этой дистанции, растянутый терпением тира.
   const gate = Math.atan2(TANK_RADIUS, Math.max(dist, TANK_RADIUS)) * tier.fireGate;
@@ -280,7 +283,7 @@ function retarget(self: BotSelf, world: BotWorld, tier: BotTier): void {
     // Замаскированного издали бот не видит вовсе; вплотную — уже да.
     if (tank.stealth && d > BONUS_STEALTH_RANGE) continue;
     // Видимую цель предпочитаем даже если она вдвое дальше укрытой.
-    const score = hasShot(me, tank.state, world.obstacles) ? d : d * 2.5 + 40;
+    const score = hasShot(me, tank.state, world.cover) ? d : d * 2.5 + 40;
     if (score < bestScore) {
       bestScore = score;
       best = tank;
@@ -315,8 +318,8 @@ function retarget(self: BotSelf, world: BotWorld, tier: BotTier): void {
 
   // Рикошет ищем только когда прямого выстрела нет — иначе он и не нужен.
   brain.bank =
-    tier.ricochet && !hasShot(me, best.state, world.obstacles)
-      ? findBankShot(me, best.state, world.obstacles)
+    tier.ricochet && !hasShot(me, best.state, world.cover)
+      ? findBankShot(me, best.state, world.cover)
       : null;
 
   if (world.tick > brain.orbitUntil) {
@@ -457,8 +460,8 @@ function free(x: number, z: number, angle: number, dist: number, obstacles: Box[
   return worst;
 }
 
-/** Свободна ли линия огня до цели. */
-function hasShot(me: TankState, target: TankState, obstacles: Box[]): boolean {
+/** Свободна ли линия огня до цели. Считается по укрытиям, а не по всем блокам. */
+function hasShot(me: TankState, target: TankState, cover: Box[]): boolean {
   const dx = target.x - me.x;
   const dz = target.z - me.z;
   const dist = Math.hypot(dx, dz);
@@ -467,7 +470,7 @@ function hasShot(me: TankState, target: TankState, obstacles: Box[]): boolean {
 
   // Останавливаемся у борта цели, а не в её центре, иначе сама цель считается стеной.
   const shorten = Math.max(0, dist - TANK_RADIUS) / dist;
-  const hit = sweepShell(ray(me.x, me.z, dx * shorten, dz * shorten), 1, obstacles);
+  const hit = sweepShell(ray(me.x, me.z, dx * shorten, dz * shorten), 1, cover);
   return hit === null;
 }
 

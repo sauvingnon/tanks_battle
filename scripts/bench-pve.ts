@@ -63,7 +63,13 @@ function runGame(mapId: number, difficulty: number, stance: number): Result {
       hp: hero.hp,
       brain,
     };
-    const input = think(self, { tick: room.tickCount, obstacles: room.obstacles, tanks, stance });
+    const input = think(self, {
+      tick: room.tickCount,
+      obstacles: room.obstacles,
+      cover: room.cover,
+      tanks,
+      stance,
+    });
     room.pushInput(hero, { ...input, seq: room.tickCount + 1 });
     room.update();
 
