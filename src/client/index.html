@@ -52,7 +52,12 @@
         </label>
         <p class="setup-hint" id="hint-bonuses"></p>
 
-        <div class="setup-label setup-local">Графика — только у тебя</div>
+        <div class="setup-label setup-local">Вид и графика — только у тебя</div>
+        <label class="setup-check">
+          <input type="checkbox" id="setup-top" />
+          <span>Вид сверху (V)</span>
+        </label>
+        <p class="setup-hint" id="hint-view"></p>
         <label class="setup-check">
           <input type="checkbox" id="setup-bloom" />
           <span>Свечение</span>
@@ -86,10 +91,14 @@
         </div>
       </div>
 
-      <div id="hint" hidden>Кликни по экрану, чтобы захватить мышь · <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> — ход, мышь — башня, <kbd>ЛКМ</kbd> — огонь, колесо — приблизить, <kbd>M</kbd> — настройки, <kbd>Esc</kbd> — освободить курсор</div>
+      <div id="hint" hidden>
+        <span id="hint-chase">Кликни по экрану, чтобы захватить мышь · <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> — ход, мышь — башня, <kbd>ЛКМ</kbd> — огонь, колесо — приблизить, <kbd>M</kbd> — настройки, <kbd>V</kbd> — вид сверху</span>
+        <span id="hint-top" hidden>Вид сверху · <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> — ход, курсор — башня, <kbd>ЛКМ</kbd> — огонь, колесо — приблизить, <kbd>M</kbd> — настройки, <kbd>V</kbd> — вернуть вид сзади</span>
+      </div>
 
       <div id="touch" hidden>
         <div id="stick"><div id="stick-knob"></div></div>
+        <div id="aim" hidden><div id="aim-knob"></div></div>
         <div id="fire-button">ОГОНЬ</div>
       </div>
 

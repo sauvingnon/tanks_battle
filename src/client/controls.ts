@@ -1,9 +1,25 @@
 import { clamp } from '../shared/sim.js';
+import { aimAngle } from './topview.js';
 
 const LOOK_SENSITIVITY = 0.0026;
 const PITCH_MIN = -0.15;
 const PITCH_MAX = 1.05;
 const STICK_RADIUS = 56;
+
+/**
+ * Мёртвая зона стика наводки, px. Без неё касание правой половины экрана
+ * швыряло бы башню в случайную сторону: направление от точки к ней же самой
+ * не определено, и первые пиксели движения пальца дают чистый шум.
+ */
+const AIM_DEADZONE = 14;
+
+/**
+ * Насколько далеко надо увести стик наводки, чтобы он ещё и стрелял, в долях
+ * радиуса. Лёгкое касание только доворачивает башню, уверенный вынос пальца —
+ * бьёт: иначе большой палец не успевал бы уходить с наводки на кнопку огня и
+ * обратно, а каждая правка прицела означала бы выстрел не туда.
+ */
+const AIM_FIRE_PUSH = 0.72;
 
 /** Отдаление камеры: метры от танка, пределы и цена одного «щелчка» колеса. */
 const ZOOM_DEFAULT = 15;
@@ -29,13 +45,29 @@ export class Controls {
 
   readonly isTouch = matchMedia('(hover: none) and (pointer: coarse)').matches;
 
+  /**
+   * Вид сверху. Обзора как такового в нём нет: yaw — это не «куда смотрит
+   * камера», а прямое направление наводки, и правая половина экрана вместе с
+   * мышью работают на него, а не на камеру.
+   */
+  private top = false;
+
   private readonly keys = new Set<string>();
 
   private stickTouchId: number | null = null;
   private stickOrigin = { x: 0, y: 0 };
 
+  /**
+   * Палец на правой половине. В виде от третьего лица он крутит камеру, в виде
+   * сверху — наводит башню; в обоих случаях это один и тот же палец, поэтому и
+   * щипок зума вторым пальцем считается одинаково.
+   */
   private lookTouchId: number | null = null;
   private lookPrev = { x: 0, y: 0 };
+  /** Откуда стик наводки считает направление: точка первого касания. */
+  private aimOrigin = { x: 0, y: 0 };
+  /** Стик наводки уведён достаточно далеко, чтобы стрелять. */
+  private aimFire = false;
 
   /** Второй палец на правой половине: вместе с lookTouchId даёт щипок зума. */
   private pinchTouchId: number | null = null;
@@ -50,7 +82,22 @@ export class Controls {
     private readonly stick: HTMLElement,
     private readonly knob: HTMLElement,
     private readonly fireButton: HTMLElement,
+    private readonly aimStick: HTMLElement,
+    private readonly aimKnob: HTMLElement,
   ) {}
+
+  /** Смена вида. Курсор и недоведённые касания с прошлого вида не переносим. */
+  setTopView(on: boolean): void {
+    if (this.top === on) return;
+    this.top = on;
+    this.lookTouchId = null;
+    this.pinchTouchId = null;
+    this.aimFire = false;
+    this.mouseFire = false;
+    this.hideAim();
+    // Вид сверху целится курсором — держать его захваченным незачем.
+    if (on && document.pointerLockElement === this.canvas) document.exitPointerLock();
+  }
 
   attach(): void {
     window.addEventListener('keydown', this.onKeyDown);
@@ -78,7 +125,8 @@ export class Controls {
 
   /** Пересчитывает оси из состояния клавиш. Пока держат тач-стик — не трогаем. */
   update(): void {
-    this.fire = this.mouseFire || this.fireTouchId !== null || this.keys.has('Space');
+    this.fire =
+      this.mouseFire || this.fireTouchId !== null || this.aimFire || this.keys.has('Space');
     if (this.stickTouchId !== null) return;
 
     const forward = this.pressed('KeyW', 'ArrowUp');
@@ -111,20 +159,30 @@ export class Controls {
     this.throttle = 0;
     this.steer = 0;
     this.mouseFire = false;
+    this.aimFire = false;
     this.fire = false;
   };
 
   private onCanvasClick = () => {
-    if (this.isTouch) return;
+    // В виде сверху курсор — это прицел: захватывать его нельзя, иначе целиться
+    // станет нечем.
+    if (this.isTouch || this.top) return;
     if (document.pointerLockElement !== this.canvas) {
       void this.canvas.requestPointerLock();
     }
   };
 
   private onMouseDown = (e: MouseEvent) => {
+    if (e.button !== 0) return;
+    if (this.top) {
+      // Курсор в виде сверху не захвачен, и по экрану разложены кнопки. Стреляет
+      // только клик по самой карте, иначе выбор карты в настройках был бы залпом.
+      if (e.target === this.canvas) this.mouseFire = true;
+      return;
+    }
     // Пока курсор не захвачен, клик — это просьба захватить его, а не выстрел.
     if (document.pointerLockElement !== this.canvas) return;
-    if (e.button === 0) this.mouseFire = true;
+    this.mouseFire = true;
   };
 
   private onMouseUp = (e: MouseEvent) => {
@@ -163,6 +221,15 @@ export class Controls {
   }
 
   private onMouseMove = (e: MouseEvent) => {
+    if (this.top) {
+      // В виде сверху танк всегда в центре кадра, так что направление наводки —
+      // это направление от центра экрана к курсору.
+      this.aimAt(
+        e.clientX - this.canvas.clientWidth / 2,
+        e.clientY - this.canvas.clientHeight / 2,
+      );
+      return;
+    }
     if (document.pointerLockElement !== this.canvas) return;
     this.applyLook(e.movementX, e.movementY);
   };
@@ -173,7 +240,39 @@ export class Controls {
     this.pitch = clamp(this.pitch + dy * LOOK_SENSITIVITY, PITCH_MIN, PITCH_MAX);
   }
 
-  // --- Тач: левая половина экрана — джойстик, правая — обзор ---
+  /** Направление наводки по смещению от танка на экране, в пикселях. */
+  private aimAt(dx: number, dy: number): void {
+    if (Math.hypot(dx, dy) < AIM_DEADZONE) return;
+    this.yaw = aimAngle(dx, dy);
+  }
+
+  // --- Тач: левая половина экрана — джойстик, правая — обзор или наводка ---
+
+  /** Стик наводки встаёт туда, где палец лёг на экран. */
+  private showAim(x: number, y: number): void {
+    this.aimOrigin = { x, y };
+    this.aimStick.style.left = `${x - STICK_RADIUS - 10}px`;
+    this.aimStick.style.top = `${y - STICK_RADIUS - 10}px`;
+    this.aimStick.style.opacity = '1';
+    this.aimKnob.style.transform = '';
+  }
+
+  private hideAim(): void {
+    this.aimStick.style.opacity = '0';
+    this.aimKnob.style.transform = '';
+  }
+
+  /** Палец на стике наводки: направление башни и, если увели далеко, огонь. */
+  private applyAim(x: number, y: number): void {
+    const dx = x - this.aimOrigin.x;
+    const dy = y - this.aimOrigin.y;
+    this.aimAt(dx, dy);
+    this.aimFire = Math.hypot(dx, dy) >= STICK_RADIUS * AIM_FIRE_PUSH;
+    const kx = clamp(dx, -STICK_RADIUS, STICK_RADIUS);
+    const ky = clamp(dy, -STICK_RADIUS, STICK_RADIUS);
+    this.aimKnob.style.transform = `translate(${kx}px, ${ky}px)`;
+    this.aimStick.classList.toggle('is-firing', this.aimFire);
+  }
 
   private onTouchStart = (e: TouchEvent) => {
     e.preventDefault();
@@ -190,6 +289,7 @@ export class Controls {
       } else if (!isLeftHalf && this.lookTouchId === null) {
         this.lookTouchId = touch.identifier;
         this.lookPrev = { x: touch.clientX, y: touch.clientY };
+        if (this.top) this.showAim(touch.clientX, touch.clientY);
       } else if (!isLeftHalf && this.pinchTouchId === null) {
         // Второй палец на правой половине — щипок зума вместо обзора.
         this.pinchTouchId = touch.identifier;
@@ -214,9 +314,11 @@ export class Controls {
         const ky = clamp(dy, -STICK_RADIUS, STICK_RADIUS);
         this.knob.style.transform = `translate(${kx}px, ${ky}px)`;
       } else if (touch.identifier === this.lookTouchId) {
-        // Пока идёт щипок, тот же палец камеру не крутит — иначе обзор дёргается.
+        // Пока идёт щипок, тот же палец не крутит камеру и не наводит — иначе
+        // при каждом зуме башня уезжала бы вслед за разъезжающимися пальцами.
         if (this.pinchTouchId === null) {
-          this.applyLook(touch.clientX - this.lookPrev.x, touch.clientY - this.lookPrev.y);
+          if (this.top) this.applyAim(touch.clientX, touch.clientY);
+          else this.applyLook(touch.clientX - this.lookPrev.x, touch.clientY - this.lookPrev.y);
         }
         this.lookPrev = { x: touch.clientX, y: touch.clientY };
         this.applyPinch();
@@ -237,6 +339,11 @@ export class Controls {
         this.stick.style.opacity = '0.35';
       } else if (touch.identifier === this.lookTouchId) {
         this.lookTouchId = null;
+        // Башня остаётся там, куда её довели: направление держится само, и
+        // палец нужен только чтобы его сменить.
+        this.aimFire = false;
+        this.aimStick.classList.remove('is-firing');
+        this.hideAim();
       } else if (touch.identifier === this.pinchTouchId) {
         this.pinchTouchId = null;
       }

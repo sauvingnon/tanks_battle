@@ -67,7 +67,14 @@ const touchLayer = el('touch');
 const crosshair = el('crosshair');
 
 const scene = new Scene3D(canvas, el('labels'));
-const controls = new Controls(canvas, el('stick'), el('stick-knob'), el('fire-button'));
+const controls = new Controls(
+  canvas,
+  el('stick'),
+  el('stick-knob'),
+  el('fire-button'),
+  el('aim'),
+  el('aim-knob'),
+);
 controls.attach();
 
 // --- Состояние мира на клиенте ---
@@ -455,7 +462,8 @@ function drawSelf(dt: number): void {
   selfX = state.x;
   selfZ = state.z;
   scene.updateTank(selfId, state.x, state.z, state.angle, state.turret);
-  scene.updateCamera(state.x, state.z, controls.yaw, controls.pitch, dt, controls.distance);
+  if (topView) scene.updateTopCamera(state.x, state.z, controls.distance, dt);
+  else scene.updateCamera(state.x, state.z, controls.yaw, controls.pitch, dt, controls.distance);
   drawAim(state.x, state.z, state.turret);
 }
 
@@ -621,12 +629,17 @@ const setupDiffs = el('setup-diffs');
 const setupStances = el('setup-stances');
 const setupBonuses = el<HTMLInputElement>('setup-bonuses');
 const setupBloom = el<HTMLInputElement>('setup-bloom');
+const setupTop = el<HTMLInputElement>('setup-top');
+const hintChase = el('hint-chase');
+const hintTopView = el('hint-top');
+const aimStick = el('aim');
 const hintMap = el('hint-map');
 const hintMode = el('hint-mode');
 const hintDiff = el('hint-diff');
 const hintStance = el('hint-stance');
 const hintBonuses = el('hint-bonuses');
 const hintBloom = el('hint-bloom');
+const hintView = el('hint-view');
 
 function updateHud(): void {
   // Ботов в «в бою» не считаем: это счётчик живых людей.
@@ -746,6 +759,36 @@ setupBloom.addEventListener('change', () => {
   renderSetup();
 });
 
+/**
+ * Вид сверху — тоже личная настройка, и в сеть она не уходит: сервер шлёт всем
+ * одни и те же снапшоты, а во что их превращать, каждый решает сам. Поэтому в
+ * одной комнате спокойно уживаются телефон с видом сверху и ПК с видом сзади.
+ *
+ * На тач-устройстве он стоит по умолчанию: обзор пальцем в трёх измерениях на
+ * телефоне — это отдельная работа, за которую платят снятой рукой с руля.
+ */
+let topView =
+  (localStorage.getItem('tanks:view') ?? (controls.isTouch ? 'top' : 'chase')) === 'top';
+applyView();
+
+function applyView(): void {
+  controls.setTopView(topView);
+  scene.setTopView(topView);
+  aimStick.hidden = !topView;
+  hintChase.hidden = topView;
+  hintTopView.hidden = !topView;
+}
+
+function setTopView(on: boolean): void {
+  if (on === topView) return;
+  topView = on;
+  localStorage.setItem('tanks:view', on ? 'top' : 'chase');
+  applyView();
+  renderSetup();
+}
+
+setupTop.addEventListener('change', () => setTopView(setupTop.checked));
+
 function renderSetup(): void {
   const isHost = selfId !== 0 && selfId === hostId;
   const host = players.get(hostId);
@@ -754,7 +797,14 @@ function renderSetup(): void {
   setupBonuses.checked = bonusesOn;
   setupBonuses.disabled = !isHost;
 
-  // Единственная галка в панели, которая работает у всех: она не про бой.
+  // Две галки в панели, которые работают у всех: они не про бой.
+  setupTop.checked = topView;
+  hintView.textContent = topView
+    ? controls.isTouch
+      ? 'Карта под тобой, север сверху. Левый палец — ход, правый — башня; уведи его дальше от центра, и танк стреляет.'
+      : 'Карта под тобой, север сверху. Курсор наводит башню, мышь не захватывается.'
+    : 'Выключено: камера за танком. На телефоне обзор придётся крутить пальцем — тем же, которым стреляешь.';
+
   setupBloom.checked = bloomOn;
   hintBloom.textContent = bloomOn
     ? 'Трассеры, вспышки и взрывы разгораются. Если кадры проседают — сними.'
@@ -814,9 +864,10 @@ function toggleSetup(open = setupPanel.hidden): void {
 setupToggle.addEventListener('click', () => toggleSetup());
 
 window.addEventListener('keydown', (event) => {
-  if (event.code !== 'KeyM' || event.target instanceof HTMLInputElement) return;
+  if (event.target instanceof HTMLInputElement) return;
   if (hud.hidden) return; // до входа в бой настраивать нечего
-  toggleSetup();
+  if (event.code === 'KeyM') toggleSetup();
+  else if (event.code === 'KeyV') setTopView(!topView);
 });
 
 function updateHealthHud(): void {
