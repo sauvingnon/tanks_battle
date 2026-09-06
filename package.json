@@ -17,6 +17,7 @@
     "check:map": "tsx scripts/check-map.ts",
     "check:smoothness": "tsx scripts/check-smoothness.ts",
     "check:combat": "tsx scripts/check-combat.ts",
+    "check:bots": "tsx scripts/check-bots.ts",
     "smoke": "node scripts/smoke.mjs"
   },
   "dependencies": {

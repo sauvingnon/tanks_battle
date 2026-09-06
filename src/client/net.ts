@@ -1,3 +1,4 @@
+import type { GameMode } from '../shared/constants.js';
 import { decode, encode, type ClientMessage, type ServerMessage } from '../shared/protocol.js';
 import type { Input } from '../shared/types.js';
 
@@ -55,6 +56,11 @@ export class Net {
       // Подробности недоступны из соображений безопасности браузера;
       // onclose всё равно сработает следом и сообщит игроку.
     };
+  }
+
+  /** Настройка комнаты. Сервер примет её только от хоста. */
+  sendSetup(setup: { mode?: GameMode; diff?: number; bonuses?: boolean; map?: number }): void {
+    this.send({ t: 'setup', ...setup });
   }
 
   sendInput(input: Input): void {

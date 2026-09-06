@@ -27,6 +27,12 @@ export class SelfPrediction {
   obstacles: Box[] = [];
   /** Пока сервер не сказал обратного — живы. Мёртвый танк не управляется. */
   alive = true;
+  /**
+   * Множитель хода от бонуса «Ход»; ставится по маске эффектов из снапшота.
+   * Переигровка идёт с текущим значением, а не с тем, что было на каждом тике:
+   * разъезд возможен только на тике включения бонуса и гасится реконсиляцией.
+   */
+  boost = 1;
 
   private predicted: TankState | null = null;
   private previous: TankState | null = null;
@@ -52,6 +58,7 @@ export class SelfPrediction {
     this.pending.length = 0;
     this.seq = 0;
     this.alive = true;
+    this.boost = 1;
     this.error.x = 0;
     this.error.z = 0;
     this.error.angle = 0;
@@ -80,7 +87,7 @@ export class SelfPrediction {
     const input: Input = { seq: ++this.seq, throttle, steer, turret, fire };
     this.pending.push(input);
     this.previous = { ...this.predicted };
-    stepTank(this.predicted, input, DT, this.obstacles);
+    stepTank(this.predicted, input, DT, this.obstacles, this.boost);
 
     // Страховка от бесконечного роста, если ack почему-то перестал приходить.
     if (this.pending.length > 180) this.pending.splice(0, this.pending.length - 180);
@@ -105,7 +112,9 @@ export class SelfPrediction {
     this.predicted.turret = server.turret;
 
     while (this.pending.length > 0 && this.pending[0].seq <= ack) this.pending.shift();
-    for (const input of this.pending) stepTank(this.predicted, input, DT, this.obstacles);
+    for (const input of this.pending) {
+      stepTank(this.predicted, input, DT, this.obstacles, this.boost);
+    }
 
     const deltaX = this.predicted.x - before.x;
     const deltaZ = this.predicted.z - before.z;

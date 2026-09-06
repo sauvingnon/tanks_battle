@@ -1,19 +1,50 @@
 ﻿import {
+  BONUS_DAMAGE,
+  BONUS_DAMAGE_MUL,
+  BONUS_HEAL,
+  BONUS_HEAL_HP,
+  BONUS_KINDS,
+  BONUS_LIFETIME_S,
+  BONUS_MAX,
+  BONUS_RADIUS,
+  BONUS_RELOAD,
+  BONUS_RELOAD_MUL,
+  BONUS_SPAWN_S,
+  BONUS_SPEED,
+  BONUS_SPEED_MUL,
+  BONUS_STEALTH,
+  BONUS_DURATION_S,
   DT,
+  MAP_HALF,
   MAX_BOUNCES,
   MAX_HP,
   MAX_INPUT_QUEUE,
   MAX_NAME_LEN,
   MAX_SHELLS,
+  MAX_TIER,
+  MODE_DM,
+  MODE_PVE,
   RELOAD_S,
   RESPAWN_S,
   SHELL_DAMAGE,
+  TANK_RADIUS,
   TICK_HZ,
+  WAVE_BREAK_S,
+  WAVE_OPENING_BOTS,
+  WAVE_OVER_S,
+  WAVE_SPAWN_DELAY_S,
+  waveConcurrent,
+  waveElite,
+  waveQuota,
+  waveTier,
+  type GameMode,
 } from '../shared/constants.js';
-import { buildMap, spawnPoint } from '../shared/map.js';
+import { buildMap, isMapId, spawnPoint } from '../shared/map.js';
+import type { RoomConfig, ServerMessage, WavePhase, WaveState } from '../shared/protocol.js';
 import {
   bounceShell,
   canRicochet,
+  clamp,
   resolveTankCollisions,
   spawnShell,
   stepShell,
@@ -26,16 +57,21 @@ import {
   BOOM_HIT,
   BOOM_KILL,
   BOOM_RICOCHET,
+  TEAM_BOTS,
+  TEAM_PLAYERS,
   createTankState,
+  type BonusState,
   type Boom,
   type Box,
   type Input,
   type PlayerInfo,
   type ShellState,
+  type SnapshotBonus,
   type SnapshotEntry,
   type SnapshotShell,
   type TankState,
 } from '../shared/types.js';
+import { botName, botSpawn, createBrain, think, type BotBrain } from './bot.js';
 
 /** Перезарядка и респавн считаются в тиках, чтобы жить в тех же часах, что и симуляция. */
 const RELOAD_TICKS = Math.round(RELOAD_S * TICK_HZ);
@@ -52,6 +88,15 @@ export interface Player {
   id: number;
   name: string;
   color: number;
+  team: number;
+  /** У ботов — состояние ИИ, у людей null. Всё остальное у них общее. */
+  brain: BotBrain | null;
+  /** Выбыл до конца волны: в PvE жизнь одна, возрождает только зачистка волны. */
+  waiting: boolean;
+  /** Тик окончания каждого бонусного эффекта; 0 — эффекта нет. Индекс — вид бонуса. */
+  fx: number[];
+  /** Кэш эффекта «Маскировка» на этот тик: его читает ИИ каждого бота. */
+  stealth: boolean;
   state: TankState;
   hp: number;
   dead: boolean;
@@ -75,30 +120,113 @@ export interface KillEvent {
   victim: string;
 }
 
+/** Цвета людей и ботов не пересекаются: врага видно по корпусу, а не только по нику. */
+const HUMAN_COLORS = [0, 3, 1, 4, 6, 7, 2];
+const BOT_COLOR = 5;
+
+/** Никуда не отправляем: у бота нет сокета, но интерфейс Player общий. */
+const NO_SEND = (): void => {};
+
 /**
- * Одна комната. Пока она в единственном экземпляре — карта общая, все видят всех.
+ * Одна комната на весь сервер. Карта общая, все видят всех; режим и сложность
+ * переключает хост — первый вошедший игрок.
  */
 export class Room {
-  readonly obstacles: Box[] = buildMap();
+  /** Геометрия текущей карты. Меняется целиком при смене карты. */
+  obstacles: Box[] = buildMap(0);
   readonly players = new Map<number, Player>();
+
+  /** Индекс карты в MAPS. */
+  mapId = 0;
+  mode: GameMode = MODE_DM;
+  /** Выбор хоста: стартовый тир ботов, 0..MAX_TIER. Дальше волны поднимают его сами. */
+  difficulty = 1;
+  /**
+   * Сложность, по которой идёт текущая волна. Снимок делается на старте волны:
+   * иначе переключение посреди боя меняло бы выучку следующих же ботов этой волны,
+   * и подпись «со следующей волны» врала бы.
+   */
+  runDifficulty = 1;
+  /** Ящики с усилениями на карте. Работают в обоих режимах. */
+  bonusesOn = false;
+  hostId = 0;
 
   private nextId = 1;
   private nextShellId = 1;
   private spawnCounter = 0;
   private tick = 0;
 
+  // --- Состояние забега по волнам (только в MODE_PVE) ---
+  private wave = 0;
+  private phase: WavePhase = 'break';
+  /** Тик, на котором кончится пауза между волнами или экран проигрыша. */
+  private phaseUntil = 0;
+  /** Сколько ботов волны ещё не выпущено. */
+  private quotaLeft = 0;
+  /** Тик, раньше которого следующий бот не выйдет. */
+  private spawnAt = 0;
+  /** Сколько ботов волны выходят ускоренно, чтобы бой начался сразу. */
+  private opening = 0;
+  private best = 0;
+  private botCounter = 0;
+
+  /**
+   * Живой список танков для ИИ. Именно объект, а не players.values(): итератор
+   * одноразовый, а think() проходит по танкам несколько раз за тик.
+   */
+  private readonly tanks: Iterable<Player> = {
+    [Symbol.iterator]: () => this.players.values(),
+  };
+
   private readonly shells: ShellState[] = [];
+  /** Имена ушедших стрелков, чьи снаряды ещё в воздухе. Чистится в updateShells. */
+  private readonly ghosts = new Map<number, string>();
+  /** Ящики на карте. Публичны по той же причине, что и players: их гоняют проверки. */
+  readonly bonuses: BonusState[] = [];
+  private nextBonusId = 1;
+  /** Тик, на котором на карте появится следующий ящик. */
+  private bonusAt = 0;
+
   /** События одного тика: очищаются в начале update(), забираются после. */
   private booms: Boom[] = [];
   private kills: KillEvent[] = [];
 
+  /** emit рассылает сообщение всем людям в комнате; в тестах его можно не давать. */
+  constructor(private readonly emit: (msg: ServerMessage) => void = () => {}) {}
+
   add(name: string, send: (data: string) => void): Player {
-    const id = this.nextId++;
-    const spawn = spawnPoint(this.spawnCounter++);
-    const player: Player = {
-      id,
-      name: sanitizeName(name),
-      color: id % 8,
+    const spawn = spawnPoint(this.spawnCounter++, this.mapId);
+    const player = this.create(sanitizeName(name), TEAM_PLAYERS, spawn, send);
+    player.color = HUMAN_COLORS[this.humanCount % HUMAN_COLORS.length];
+    this.players.set(player.id, player);
+
+    // Хост — первый вошедший: он и настраивает комнату.
+    if (this.hostId === 0) {
+      this.hostId = player.id;
+      this.emitConfig();
+    }
+    // Волна уже идёт — новичок ждёт её конца, иначе он выпал бы в гущу боя.
+    if (this.mode === MODE_PVE && this.phase === 'fight') player.waiting = true;
+    if (player.waiting) player.dead = true;
+
+    return player;
+  }
+
+  private create(
+    name: string,
+    team: number,
+    spawn: { x: number; z: number; angle: number },
+    send: (data: string) => void,
+  ): Player {
+    return {
+      id: this.nextId++,
+      name,
+      color: BOT_COLOR,
+      team,
+      brain: null,
+      waiting: false,
+      fx: new Array<number>(BONUS_KINDS).fill(0),
+      stealth: false,
       state: createTankState(spawn.x, spawn.z, spawn.angle),
       hp: MAX_HP,
       dead: false,
@@ -111,17 +239,32 @@ export class Room {
       last: { seq: 0, throttle: 0, steer: 0, turret: spawn.angle },
       send,
     };
-    this.players.set(id, player);
-    return player;
   }
 
   remove(id: number): void {
+    const player = this.players.get(id);
+    if (player) this.forget(player);
     this.players.delete(id);
-    // Снаряды ушедшего долетают сами: владельца уже нет, попадание просто никому не засчитается.
+    if (id !== this.hostId) return;
+
+    // Хост ушёл — передаём следующему по времени входа.
+    this.hostId = 0;
+    for (const player of this.players.values()) {
+      if (player.brain) continue;
+      this.hostId = player.id;
+      break;
+    }
+    this.emitConfig();
   }
 
   info(player: Player): PlayerInfo {
-    return { id: player.id, name: player.name, color: player.color };
+    return {
+      id: player.id,
+      name: player.name,
+      color: player.color,
+      team: player.team,
+      ...(player.brain ? { bot: 1 as const } : {}),
+    };
   }
 
   allInfo(): PlayerInfo[] {
@@ -143,8 +286,16 @@ export class Room {
     this.tick++;
     this.booms = [];
 
+    if (this.mode === MODE_PVE) this.updateWave();
+    if (this.bonusesOn) this.updateBonuses();
+
     for (const player of this.players.values()) {
-      if (player.dead && this.tick >= player.respawnAt) this.respawn(player);
+      if (player.brain) {
+        this.stepBot(player);
+        continue;
+      }
+      // Ждущий конца волны не возрождается по таймеру — его поднимет сама волна.
+      if (player.dead && !player.waiting && this.tick >= player.respawnAt) this.respawn(player);
 
       // Часы клиента и сервера идут независимо, поэтому очередь то пустеет, то копится.
       // Если накопилось — разгребаем по два инпута за тик: каждый всё равно применяется
@@ -161,7 +312,13 @@ export class Room {
         // Если новых инпутов нет — продолжаем с последним известным: танк не замирает
         // при потере пакета, а клиент предсказывает ровно то же самое.
         // Подбитый танк не едет и не стреляет, что бы ни прислал клиент.
-        stepTank(player.state, player.dead ? frozen(player) : player.last, DT, this.obstacles);
+        stepTank(
+          player.state,
+          player.dead ? frozen(player) : player.last,
+          DT,
+          this.obstacles,
+          this.boost(player),
+        );
         if (player.last.fire) {
           // Флаг срабатывает ровно один раз на инпут. Иначе last повторялся бы
           // каждый тик, и замолчавший клиент стрелял бы сам по себе.
@@ -178,10 +335,37 @@ export class Room {
     this.updateShells();
   }
 
+  /** Шаг бота: думает сам, дальше едет и стреляет по общим правилам. */
+  private stepBot(bot: Player): void {
+    bot.last = think(
+      {
+        id: bot.id,
+        team: bot.team,
+        dead: bot.dead,
+        stealth: bot.stealth,
+        state: bot.state,
+        hp: bot.hp,
+        brain: bot.brain!,
+      },
+      { tick: this.tick, obstacles: this.obstacles, tanks: this.tanks },
+    );
+    stepTank(bot.state, bot.last, DT, this.obstacles);
+    if (bot.last.fire) {
+      bot.last.fire = false;
+      this.tryFire(bot);
+    }
+  }
+
   private tryFire(player: Player): void {
     if (this.tick < player.readyAt) return;
-    player.readyAt = this.tick + RELOAD_TICKS;
-    this.shells.push(spawnShell(this.nextShellId++, player.id, player.state));
+    const rush = player.fx[BONUS_RELOAD] > this.tick ? BONUS_RELOAD_MUL : 1;
+    player.readyAt = this.tick + Math.max(1, Math.round(RELOAD_TICKS * rush));
+
+    const shell = spawnShell(this.nextShellId++, player.id, player.state);
+    // Урон считаем здесь, а не при попадании: снаряд после выстрела живёт сам по себе.
+    const power = player.fx[BONUS_DAMAGE] > this.tick ? BONUS_DAMAGE_MUL : 1;
+    shell.dmg = Math.round(SHELL_DAMAGE * power);
+    this.shells.push(shell);
     // Переполнение возможно только при явном флуде — жертвуем самым старым снарядом.
     if (this.shells.length > MAX_SHELLS) this.shells.shift();
   }
@@ -189,6 +373,21 @@ export class Room {
   private updateShells(): void {
     for (let i = this.shells.length - 1; i >= 0; i--) {
       if (this.flyShell(this.shells[i], DT)) this.shells.splice(i, 1);
+    }
+    // Имя ушедшего держим ровно до тех пор, пока в воздухе есть его снаряд.
+    for (const id of this.ghosts.keys()) {
+      if (!this.shells.some((shell) => shell.owner === id)) this.ghosts.delete(id);
+    }
+  }
+
+  /**
+   * Танк покидает комнату (бот погиб, человек отключился), а его снаряды ещё летят.
+   * Запоминаем имя, чтобы попадание не досталось «Неизвестному»: выстрел был сделан
+   * по правилам, и то, что стрелка уже нет, к его снаряду отношения не имеет.
+   */
+  private forget(player: Player): void {
+    if (this.shells.some((shell) => shell.owner === player.id)) {
+      this.ghosts.set(player.id, player.name);
     }
   }
 
@@ -251,7 +450,12 @@ export class Room {
   }
 
   private damage(victim: Player, shell: ShellState): void {
-    victim.hp -= SHELL_DAMAGE;
+    // Стрелявший мог погибнуть или выйти, пока снаряд летел. На попадание это не
+    // влияет: урон снаряд принёс с собой, а имя для ленты найдётся среди ушедших.
+    const killer = this.players.get(shell.owner);
+    const killerName = killer?.name ?? this.ghosts.get(shell.owner) ?? 'Неизвестный';
+
+    victim.hp -= shell.dmg ?? SHELL_DAMAGE;
     if (victim.hp > 0) {
       this.booms.push({ x: shell.x, z: shell.z, k: BOOM_HIT, o: shell.owner });
       return;
@@ -262,17 +466,28 @@ export class Room {
     victim.deaths++;
     victim.respawnAt = this.tick + RESPAWN_TICKS;
     victim.queue.length = 0;
+    // Бонусы сгорают вместе с танком: копить усиления через смерть нельзя.
+    victim.fx.fill(0);
+    victim.stealth = false;
     this.booms.push({ x: victim.state.x, z: victim.state.z, k: BOOM_KILL, o: shell.owner });
 
-    // Стрелявший мог выйти, пока снаряд летел.
-    const killer = this.players.get(shell.owner);
     // За смерть от собственного рикошета фраг не полагается — только запись в ленту.
     if (killer && killer !== victim) killer.kills++;
-    this.kills.push({ killer: killer?.name ?? 'Неизвестный', victim: victim.name });
+    this.kills.push({ killer: killerName, victim: victim.name });
+
+    if (victim.brain) {
+      // Бот выбывает насовсем: волна кончится, когда карта опустеет.
+      this.forget(victim);
+      this.players.delete(victim.id);
+      this.emit({ t: 'left', id: victim.id });
+    } else if (this.mode === MODE_PVE) {
+      // Жизнь одна на волну — в строй вернёт только её зачистка.
+      victim.waiting = true;
+    }
   }
 
   private respawn(player: Player): void {
-    const spawn = spawnPoint(this.spawnCounter++);
+    const spawn = spawnPoint(this.spawnCounter++, this.mapId);
     player.state = createTankState(spawn.x, spawn.z, spawn.angle);
     player.hp = MAX_HP;
     player.dead = false;
@@ -282,10 +497,341 @@ export class Room {
     player.queue.length = 0;
   }
 
+  // --- Бонусы ---
+
+  /** Множитель хода от бонуса «Ход»; клиент подставляет в предсказание то же число. */
+  private boost(player: Player): number {
+    return player.fx[BONUS_SPEED] > this.tick ? BONUS_SPEED_MUL : 1;
+  }
+
+  private updateBonuses(): void {
+    // Маскировку кэшируем один раз за тик: её читает ИИ каждого бота по всем целям.
+    for (const player of this.players.values()) {
+      player.stealth = player.fx[BONUS_STEALTH] > this.tick;
+    }
+
+    // Неподобранные ящики исчезают, иначе карта постепенно зарастает.
+    for (let i = this.bonuses.length - 1; i >= 0; i--) {
+      if (this.tick >= this.bonuses[i].until) this.bonuses.splice(i, 1);
+    }
+
+    if (this.bonuses.length < BONUS_MAX && this.tick >= this.bonusAt) {
+      this.spawnBonus();
+      this.bonusAt = this.tick + Math.round(BONUS_SPAWN_S * TICK_HZ);
+    }
+
+    // Подбирают только люди: дюжина ботов вымела бы карту раньше игрока.
+    const reach = TANK_RADIUS + BONUS_RADIUS;
+    for (const player of this.players.values()) {
+      if (player.brain || player.dead) continue;
+      for (let i = this.bonuses.length - 1; i >= 0; i--) {
+        const bonus = this.bonuses[i];
+        if (Math.hypot(bonus.x - player.state.x, bonus.z - player.state.z) > reach) continue;
+        this.bonuses.splice(i, 1);
+        this.applyBonus(player, bonus.kind);
+      }
+    }
+  }
+
+  private applyBonus(player: Player, kind: number): void {
+    if (kind === BONUS_HEAL) {
+      player.hp = Math.min(MAX_HP, player.hp + BONUS_HEAL_HP);
+    } else {
+      // Второй ящик того же вида не складывается, а отсчитывает срок заново.
+      player.fx[kind] = this.tick + Math.round(BONUS_DURATION_S[kind] * TICK_HZ);
+    }
+    this.emit({ t: 'pickup', id: player.id, kind });
+  }
+
+  private spawnBonus(): void {
+    const spot = this.freeSpot();
+    if (!spot) return;
+    this.bonuses.push({
+      id: this.nextBonusId++,
+      kind: Math.floor(Math.random() * BONUS_KINDS),
+      x: spot.x,
+      z: spot.z,
+      until: this.tick + Math.round(BONUS_LIFETIME_S * TICK_HZ),
+    });
+  }
+
+  /** Свободная точка под ящик: не в блоке, не у стены и не вплотную к другому ящику. */
+  private freeSpot(): { x: number; z: number } | null {
+    const limit = MAP_HALF - 8;
+    const pad = BONUS_RADIUS + TANK_RADIUS;
+
+    for (let attempt = 0; attempt < 24; attempt++) {
+      const x = (Math.random() * 2 - 1) * limit;
+      const z = (Math.random() * 2 - 1) * limit;
+
+      let taken = false;
+      for (const box of this.obstacles) {
+        if (Math.abs(x - box.x) < box.w / 2 + pad && Math.abs(z - box.z) < box.d / 2 + pad) {
+          taken = true;
+          break;
+        }
+      }
+      if (taken) continue;
+      // Ящики не должны лежать кучкой: иначе один заезд собирает сразу три.
+      if (this.bonuses.some((b) => Math.hypot(b.x - x, b.z - z) < 16)) continue;
+      return { x, z };
+    }
+    return null;
+  }
+
+  /** Убирает ящики и все действующие эффекты: при смене режима и при выключении бонусов. */
+  private clearBonuses(): void {
+    this.bonuses.length = 0;
+    this.bonusAt = this.tick;
+    for (const player of this.players.values()) {
+      player.fx.fill(0);
+      player.stealth = false;
+    }
+  }
+
+  private effectMask(player: Player): number {
+    let mask = 0;
+    for (let kind = 0; kind < BONUS_KINDS; kind++) {
+      if (player.fx[kind] > this.tick) mask |= 1 << kind;
+    }
+    return mask;
+  }
+
+  snapshotBonuses(): SnapshotBonus[] {
+    return this.bonuses.map((b) => ({ i: b.id, k: b.kind, x: round(b.x), z: round(b.z) }));
+  }
+
+  get bonusCount(): number {
+    return this.bonuses.length;
+  }
+
+  // --- Режим и волны ---
+
+  /** Настройка комнаты хостом. Смена режима или карты перезапускает мир. */
+  setup(
+    mode: GameMode | undefined,
+    difficulty: number | undefined,
+    bonuses: boolean | undefined,
+    map?: number,
+  ): void {
+    if (typeof difficulty === 'number' && Number.isFinite(difficulty)) {
+      this.difficulty = clamp(Math.round(difficulty), 0, MAX_TIER);
+    }
+    if (typeof bonuses === 'boolean' && bonuses !== this.bonusesOn) {
+      this.bonusesOn = bonuses;
+      // Выключили — карта и все действующие усиления чистятся сразу.
+      if (!bonuses) this.clearBonuses();
+    }
+
+    const newMap = isMapId(map) && map !== this.mapId;
+    if (newMap) {
+      this.mapId = map;
+      this.obstacles = buildMap(this.mapId);
+      // Геометрию клиент не строит сам — шлём её раньше рестарта, чтобы к первому
+      // же снапшоту нового мира у него была правильная карта.
+      this.emit({ t: 'map', id: this.mapId, half: MAP_HALF, obstacles: this.obstacles });
+    }
+
+    const newMode = mode !== undefined && mode !== this.mode;
+    if (newMode) this.mode = mode;
+    if (newMap || newMode) this.restart();
+
+    this.emitConfig();
+  }
+
+  /** Мир начинается заново: боты убраны, счёт обнулён, волны с первой. */
+  private restart(): void {
+    this.clearBots();
+    this.clearBonuses();
+    this.shells.length = 0;
+    this.resetScores();
+    this.wave = 0;
+    this.runDifficulty = this.difficulty;
+    this.phase = 'break';
+    this.phaseUntil = this.tick;
+    // Возрождаем всех, а не только павших: на новой карте старые координаты могут
+    // оказаться внутри блока, и танк вытолкнет неизвестно куда.
+    for (const player of this.players.values()) {
+      player.waiting = false;
+      this.respawn(player);
+    }
+    this.emitWave();
+  }
+
+  /**
+   * Машина волн. Крутится только в MODE_PVE и только пока в комнате есть люди:
+   * на пустом сервере забег не должен идти сам по себе.
+   */
+  private updateWave(): void {
+    if (this.humanCount === 0) {
+      if (this.wave !== 0) {
+        this.clearBots();
+        this.wave = 0;
+        this.phase = 'break';
+      }
+      this.phaseUntil = this.tick;
+      return;
+    }
+
+    if (this.phase !== 'fight') {
+      if (this.tick < this.phaseUntil) return;
+      this.startWave(this.phase === 'over' ? 1 : this.wave + 1);
+      return;
+    }
+
+    if (this.everyoneDown()) {
+      this.gameOver();
+      return;
+    }
+
+    const alive = this.botCount;
+    const room = waveConcurrent(this.wave, this.humanCount);
+    if (this.quotaLeft > 0 && alive < room && this.tick >= this.spawnAt) {
+      this.spawnBot();
+    } else if (this.quotaLeft === 0 && alive === 0) {
+      this.endWave();
+    }
+  }
+
+  private startWave(wave: number): void {
+    if (wave === 1) this.resetScores();
+    // Выбор хоста вступает в силу здесь — ровно на границе волн.
+    const tookEffect = this.runDifficulty !== this.difficulty;
+    this.runDifficulty = this.difficulty;
+    this.wave = wave;
+    this.phase = 'fight';
+    this.quotaLeft = waveQuota(wave);
+    this.opening = WAVE_OPENING_BOTS;
+    this.spawnAt = this.tick;
+
+    // Волна начинается полным составом и с полным здоровьем: павшие встают в строй,
+    // а дотянувшие на последних HP не идут в следующую волну калеками.
+    for (const player of this.players.values()) {
+      if (player.brain) continue;
+      player.waiting = false;
+      if (player.dead) this.respawn(player);
+      player.hp = MAX_HP;
+    }
+    this.emitWave();
+    // Панель настроек должна погасить пометку «ждёт следующей волны».
+    if (tookEffect) this.emitConfig();
+  }
+
+  private endWave(): void {
+    this.best = Math.max(this.best, this.wave);
+    this.phase = 'break';
+    this.phaseUntil = this.tick + Math.round(WAVE_BREAK_S * TICK_HZ);
+    this.emitWave();
+  }
+
+  private gameOver(): void {
+    this.best = Math.max(this.best, this.wave);
+    this.clearBots();
+    this.phase = 'over';
+    this.phaseUntil = this.tick + Math.round(WAVE_OVER_S * TICK_HZ);
+    this.emitWave();
+  }
+
+  /** Волна выпускается по одному: сразу всей толпой она задавила бы числом. */
+  private spawnBot(): void {
+    const base = waveTier(this.wave, this.runDifficulty);
+    // «Элита» — бот на ступень выше остальных; её доля растёт с номером волны.
+    const tier = Math.random() < waveElite(this.wave) ? Math.min(MAX_TIER, base + 1) : base;
+
+    const index = this.botCounter++;
+    const bot = this.create(
+      botName(index),
+      TEAM_BOTS,
+      botSpawn(this.tanks, TEAM_BOTS, index, this.mapId),
+      NO_SEND,
+    );
+    bot.brain = createBrain(tier, this.tick, index);
+    this.players.set(bot.id, bot);
+    this.emit({ t: 'joined', player: this.info(bot) });
+
+    this.quotaLeft--;
+    const fast = this.opening > 0;
+    if (fast) this.opening--;
+    this.spawnAt = this.tick + Math.round((fast ? 0.7 : WAVE_SPAWN_DELAY_S) * TICK_HZ);
+    this.emitWave();
+  }
+
+  private clearBots(): void {
+    for (const [id, player] of this.players) {
+      if (!player.brain) continue;
+      this.players.delete(id);
+      this.emit({ t: 'left', id });
+    }
+    this.quotaLeft = 0;
+  }
+
+  /** Все люди выбыли до конца волны — забег окончен. */
+  private everyoneDown(): boolean {
+    let any = false;
+    for (const player of this.players.values()) {
+      if (player.brain) continue;
+      if (!player.waiting) return false;
+      any = true;
+    }
+    return any;
+  }
+
+  private resetScores(): void {
+    for (const player of this.players.values()) {
+      player.kills = 0;
+      player.deaths = 0;
+    }
+  }
+
+  waveState(): WaveState {
+    return {
+      wave: this.wave,
+      phase: this.phase,
+      left: this.quotaLeft + this.botCount,
+      until: this.phase === 'fight' ? 0 : Math.max(0, (this.phaseUntil - this.tick) / TICK_HZ),
+      best: this.best,
+    };
+  }
+
+  private emitWave(): void {
+    this.emit({ t: 'wave', ...this.waveState() });
+  }
+
+  private emitConfig(): void {
+    this.emit({ t: 'config', ...this.config() });
+  }
+
+  /** Настройки комнаты одним куском: их шлют и welcome, и config. */
+  config(): RoomConfig {
+    return {
+      mapId: this.mapId,
+      mode: this.mode,
+      difficulty: this.difficulty,
+      // Что реально в силе прямо сейчас: в бою это может отставать от выбора хоста.
+      active: this.mode === MODE_PVE && this.phase === 'fight' ? this.runDifficulty : this.difficulty,
+      bonuses: this.bonusesOn,
+      hostId: this.hostId,
+    };
+  }
+
+  /** Живых игроков-людей в комнате (боты не в счёт). */
+  get humanCount(): number {
+    let n = 0;
+    for (const player of this.players.values()) if (!player.brain) n++;
+    return n;
+  }
+
+  get botCount(): number {
+    let n = 0;
+    for (const player of this.players.values()) if (player.brain) n++;
+    return n;
+  }
+
   /** Снапшот общий для всех, кроме поля ack — оно у каждого своё. */
   snapshotEntries(): SnapshotEntry[] {
     const entries: SnapshotEntry[] = [];
     for (const p of this.players.values()) {
+      const mask = this.bonusesOn ? this.effectMask(p) : 0;
       entries.push({
         i: p.id,
         x: round(p.state.x),
@@ -295,6 +841,8 @@ export class Room {
         s: round(p.state.speed),
         h: p.hp,
         d: p.dead ? 1 : 0,
+        // Поле есть только у тех, у кого эффект реально висит — экономия трафика.
+        ...(mask === 0 ? {} : { f: mask }),
       });
     }
     return entries;
@@ -326,6 +874,11 @@ export class Room {
 
   get shellCount(): number {
     return this.shells.length;
+  }
+
+  /** Сколько имён ушедших стрелков держим ради их снарядов. Для проверок. */
+  get ghostCount(): number {
+    return this.ghosts.size;
   }
 
   get tickCount(): number {

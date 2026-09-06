@@ -47,22 +47,30 @@ export function lerpAngle(from: number, to: number, t: number): number {
  * истины, клиент — для предсказания собственного танка. Функция детерминирована,
  * поэтому при одинаковых input/dt результат совпадает.
  */
-export function stepTank(state: TankState, input: Input, dt: number, obstacles: Box[]): void {
+export function stepTank(
+  state: TankState,
+  input: Input,
+  dt: number,
+  obstacles: Box[],
+  /** Множитель хода от бонуса «Ход». Клиент обязан подставлять то же, что и сервер. */
+  boost = 1,
+): void {
   const throttle = clamp(input.throttle, -1, 1);
   const steer = clamp(input.steer, -1, 1);
+  const maxSpeed = MAX_SPEED * boost;
 
   // Продольная динамика: газ против движения тормозит сильнее, чем разгоняет.
   if (throttle !== 0) {
     const braking = state.speed !== 0 && Math.sign(throttle) !== Math.sign(state.speed);
-    state.speed += throttle * (braking ? BRAKE : ACCEL) * dt;
+    state.speed += throttle * (braking ? BRAKE : ACCEL * boost) * dt;
   } else {
     const drop = FRICTION * dt;
     state.speed = Math.abs(state.speed) <= drop ? 0 : state.speed - Math.sign(state.speed) * drop;
   }
-  state.speed = clamp(state.speed, -MAX_REVERSE, MAX_SPEED);
+  state.speed = clamp(state.speed, -MAX_REVERSE * boost, maxSpeed);
 
   // Поворот корпуса: на месте вертится бодро, на скорости — вяло.
-  const speedFrac = Math.min(Math.abs(state.speed) / MAX_SPEED, 1);
+  const speedFrac = Math.min(Math.abs(state.speed) / maxSpeed, 1);
   const turnRate = TURN_RATE_STILL + (TURN_RATE_FULL - TURN_RATE_STILL) * speedFrac;
   state.angle = wrapAngle(state.angle + steer * turnRate * dt);
 
