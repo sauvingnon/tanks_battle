@@ -6,14 +6,26 @@
  * укрытия и респавн, а не то, куда игрока закинул спавн.
  */
 import {
+  DT,
+  MAX_BOUNCES,
   MAX_HP,
   RELOAD_S,
   RESPAWN_S,
+  RICOCHET_SPEED_KEEP,
   SHELL_DAMAGE,
+  SHELL_LIFETIME,
   SHELL_SPEED,
   TICK_HZ,
 } from '../src/shared/constants.js';
-import { BOOM_GROUND, BOOM_HIT, BOOM_KILL, type BoomKind } from '../src/shared/types.js';
+import { bounceShell, canRicochet, sweepShell } from '../src/shared/sim.js';
+import {
+  BOOM_GROUND,
+  BOOM_HIT,
+  BOOM_KILL,
+  BOOM_RICOCHET,
+  type BoomKind,
+  type ShellState,
+} from '../src/shared/types.js';
 import { Room, type Player } from '../src/server/room.js';
 
 const checks: Array<[string, boolean]> = [];
@@ -145,15 +157,99 @@ const noop = () => {};
   check('взрыв произошёл о препятствие', booms.includes(BOOM_GROUND));
 }
 
-// --- 5. Снаряд не проскакивает сквозь тонкий блок ---
+// --- 5. Свип находит препятствие и не даёт проскочить сквозь него ---
 {
-  // За тик снаряд пролетает SHELL_SPEED / TICK_HZ метров: это должно быть заметно
-  // меньше самого тонкого препятствия, иначе подшагов не хватит.
-  const perTick = SHELL_SPEED / TICK_HZ;
-  check(`шаг снаряда ${perTick.toFixed(1)} м меньше тонкого блока (4 м)`, perTick < 4);
+  const obstacles = new Room().obstacles;
+  // Блок add(0, 22, 20, 4, 3) занимает z от 20 до 24; с радиусом снаряда — от 19.7.
+  const ahead = (): ShellState => ({
+    id: 1,
+    owner: 1,
+    x: 0,
+    z: 19,
+    vx: 0,
+    vz: SHELL_SPEED,
+    life: SHELL_LIFETIME,
+    bounces: 0,
+  });
+
+  const hit = sweepShell(ahead(), DT, obstacles);
+  check('свип видит блок впереди', hit !== null);
+  check('свип нашёл переднюю грань', hit !== null && hit.nz === -1 && hit.nx === 0);
+  // 0.7 м до грани при шаге SHELL_SPEED * DT метров.
+  const expected = 0.7 / (SHELL_SPEED * DT);
+  check('доля шага до касания посчитана точно', hit !== null && Math.abs(hit.t - expected) < 0.01);
+
+  // Тройной шаг перелетает блок насквозь — свип обязан всё равно найти вход.
+  check('свип не проскакивает сквозь тонкий блок', sweepShell(ahead(), DT * 3, obstacles) !== null);
 }
 
-// --- 6. Уничтожение видно как отдельное событие ---
+// --- 6. Правила рикошета на чистой геометрии ---
+{
+  // Угол 0 смотрит в +Z, то есть в лоб северной стене; π/2 — вдоль неё.
+  const shell = (angle: number, bounces = 0): ShellState => ({
+    id: 1,
+    owner: 1,
+    x: 0,
+    z: 0,
+    vx: Math.sin(angle) * SHELL_SPEED,
+    vz: Math.cos(angle) * SHELL_SPEED,
+    life: SHELL_LIFETIME,
+    bounces,
+  });
+  const grazing = Math.PI / 2 - 0.05;
+  const northFace = { t: 0, nx: 0, nz: -1, stuck: false };
+
+  check('в лоб рикошета нет', !canRicochet(shell(0), northFace));
+  check('под 45° рикошета нет', !canRicochet(shell(Math.PI / 4), northFace));
+  check('вдоль стены рикошет есть', canRicochet(shell(grazing), northFace));
+  check(
+    'исчерпанные отскоки запрещают рикошет',
+    !canRicochet(shell(grazing, MAX_BOUNCES), northFace),
+  );
+  check(
+    'изнутри препятствия рикошета нет',
+    !canRicochet(shell(grazing), { ...northFace, stuck: true }),
+  );
+
+  const s = shell(grazing);
+  const speedBefore = Math.hypot(s.vx, s.vz);
+  const alongBefore = s.vx;
+  bounceShell(s, northFace);
+  check('отскок разворачивает только нормальную составляющую', s.vz < 0 && s.vx === alongBefore * RICOCHET_SPEED_KEEP);
+  check(
+    'отскок гасит скорость',
+    Math.abs(Math.hypot(s.vx, s.vz) - speedBefore * RICOCHET_SPEED_KEEP) < 1e-9,
+  );
+  check('отскок посчитан', s.bounces === 1);
+}
+
+// --- 7. Рикошет в бою: пологий выстрел вдоль северной стены ---
+{
+  const room = new Room();
+  const shooter = room.add('Стрелок', noop);
+  // Танк прижат к северной стене и стреляет почти вдоль неё: полоса z ≈ 68 пуста.
+  place(shooter, -30, 68, Math.PI / 2 - 0.05);
+
+  const booms = [...run(room, 1, [shooter]), ...run(room, 25)];
+  check('пологий удар в стену даёт рикошет', booms.includes(BOOM_RICOCHET));
+  check('рикошет не взрывает снаряд', !booms.includes(BOOM_GROUND));
+  check('после рикошета снаряд летит дальше', room.shellCount === 1);
+}
+
+// --- 8. Выстрел в стену в лоб взрывается ---
+{
+  const room = new Room();
+  const shooter = room.add('Стрелок', noop);
+  // Колонна x = -30 к северу от z = 60 свободна до самой стены.
+  place(shooter, -30, 60, 0);
+
+  const booms = [...run(room, 1, [shooter]), ...run(room, 8)];
+  check('удар в лоб взрывает снаряд', booms.includes(BOOM_GROUND));
+  check('в лоб рикошета нет и в бою', !booms.includes(BOOM_RICOCHET));
+  check('снаряд снят после взрыва', room.shellCount === 0);
+}
+
+// --- 9. Уничтожение видно как отдельное событие ---
 {
   const room = new Room();
   const shooter = room.add('Стрелок', noop);

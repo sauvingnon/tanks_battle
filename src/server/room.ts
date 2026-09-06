@@ -1,5 +1,6 @@
 ﻿import {
   DT,
+  MAX_BOUNCES,
   MAX_HP,
   MAX_INPUT_QUEUE,
   MAX_NAME_LEN,
@@ -11,18 +12,20 @@
 } from '../shared/constants.js';
 import { buildMap, spawnPoint } from '../shared/map.js';
 import {
+  bounceShell,
+  canRicochet,
   resolveTankCollisions,
-  shellHitsBox,
-  shellHitsTank,
-  shellOutOfMap,
   spawnShell,
   stepShell,
   stepTank,
+  sweepShell,
+  sweepTank,
 } from '../shared/sim.js';
 import {
   BOOM_GROUND,
   BOOM_HIT,
   BOOM_KILL,
+  BOOM_RICOCHET,
   createTankState,
   type Boom,
   type Box,
@@ -39,10 +42,11 @@ const RELOAD_TICKS = Math.round(RELOAD_S * TICK_HZ);
 const RESPAWN_TICKS = Math.round(RESPAWN_S * TICK_HZ);
 
 /**
- * Снаряд за тик пролетает ~2 м, а самый тонкий блок на карте — 4 м. Два подшага
- * дают запас, чтобы снаряд не проскочил сквозь препятствие или танк.
+ * На сколько отрезков максимум режется путь снаряда за тик. Каждый отскок начинает
+ * новый отрезок, плюс один на остаток пути; предел страхует от вечного цикла,
+ * если снаряд зажмёт между гранями.
  */
-const SHELL_SUBSTEPS = 2;
+const MAX_SEGMENTS = MAX_BOUNCES + 2;
 
 export interface Player {
   id: number;
@@ -183,38 +187,67 @@ export class Room {
   }
 
   private updateShells(): void {
-    const dt = DT / SHELL_SUBSTEPS;
     for (let i = this.shells.length - 1; i >= 0; i--) {
-      const shell = this.shells[i];
-      let done = false;
-      for (let s = 0; s < SHELL_SUBSTEPS && !done; s++) {
-        stepShell(shell, dt);
-        done = this.resolveShell(shell);
-      }
-      if (done || shell.life <= 0) this.shells.splice(i, 1);
+      if (this.flyShell(this.shells[i], DT)) this.shells.splice(i, 1);
     }
   }
 
-  /** Возвращает true, если снаряд во что-то попал и должен исчезнуть. */
-  private resolveShell(shell: ShellState): boolean {
+  /**
+   * Проводит снаряд через тик. Путь режется на отрезки: до ближайшего касания,
+   * а после отскока — остаток тика заново. Возвращает true, если снаряд отжил своё.
+   */
+  private flyShell(shell: ShellState, dt: number): boolean {
+    for (let segment = 0; segment < MAX_SEGMENTS; segment++) {
+      const wall = sweepShell(shell, dt, this.obstacles);
+
+      // Танк на отрезке важнее стены за ним, поэтому ищем его только до касания.
+      const victim = this.firstVictim(shell, dt, wall ? wall.t : 1);
+      if (victim) {
+        stepShell(shell, dt * victim.t);
+        this.damage(victim.player, shell);
+        return true;
+      }
+
+      if (!wall) {
+        stepShell(shell, dt);
+        return shell.life <= 0;
+      }
+
+      const travel = dt * wall.t;
+      stepShell(shell, travel);
+      dt -= travel;
+
+      if (!canRicochet(shell, wall)) {
+        this.booms.push({ x: shell.x, z: shell.z, k: BOOM_GROUND, o: shell.owner });
+        return true;
+      }
+
+      bounceShell(shell, wall);
+      this.booms.push({ x: shell.x, z: shell.z, k: BOOM_RICOCHET, o: shell.owner });
+      if (shell.life <= 0) return true;
+    }
+
+    // Отрезки кончились — снаряд застрял между гранями, убираем его молча.
+    return true;
+  }
+
+  /** Ближайший по ходу отрезка танк, в который попадёт снаряд; limit — доля шага до стены. */
+  private firstVictim(
+    shell: ShellState,
+    dt: number,
+    limit: number,
+  ): { player: Player; t: number } | null {
+    let best: { player: Player; t: number } | null = null;
     for (const target of this.players.values()) {
-      if (target.id === shell.owner || target.dead) continue;
-      if (!shellHitsTank(shell, target.state)) continue;
-      this.damage(target, shell);
-      return true;
-    }
+      if (target.dead) continue;
+      // В себя можно попасть только рикошетом: иначе снаряд убивал бы стрелка на вылете.
+      if (target.id === shell.owner && shell.bounces === 0) continue;
 
-    for (const box of this.obstacles) {
-      if (!shellHitsBox(shell, box)) continue;
-      this.booms.push({ x: shell.x, z: shell.z, k: BOOM_GROUND, o: shell.owner });
-      return true;
+      const t = sweepTank(shell, dt, target.state);
+      if (t === null || t > limit) continue;
+      if (best === null || t < best.t) best = { player: target, t };
     }
-
-    if (shellOutOfMap(shell)) {
-      this.booms.push({ x: shell.x, z: shell.z, k: BOOM_GROUND, o: shell.owner });
-      return true;
-    }
-    return false;
+    return best;
   }
 
   private damage(victim: Player, shell: ShellState): void {
@@ -233,7 +266,8 @@ export class Room {
 
     // Стрелявший мог выйти, пока снаряд летел.
     const killer = this.players.get(shell.owner);
-    if (killer) killer.kills++;
+    // За смерть от собственного рикошета фраг не полагается — только запись в ленту.
+    if (killer && killer !== victim) killer.kills++;
     this.kills.push({ killer: killer?.name ?? 'Неизвестный', victim: victim.name });
   }
 
@@ -273,6 +307,7 @@ export class Room {
       x: round(s.x),
       z: round(s.z),
       a: round(Math.atan2(s.vx, s.vz)),
+      b: s.bounces,
     }));
   }
 

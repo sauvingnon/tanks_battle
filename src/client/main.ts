@@ -283,6 +283,11 @@ function drawShells(from: BufferedSnapshot, to: BufferedSnapshot, t: number): vo
       }
       return { id: shell.i, x: shell.x, z: shell.z, angle: shell.a };
     }
+    // Между снапшотами был отскок: прямая от старой точки к новой срезала бы угол,
+    // и снаряд на кадр-другой ушёл бы в стену. Показываем сразу новое положение.
+    if (start.b !== shell.b) {
+      return { id: shell.i, x: shell.x, z: shell.z, angle: shell.a };
+    }
     return {
       id: shell.i,
       x: start.x + (shell.x - start.x) * t,

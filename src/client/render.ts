@@ -1,7 +1,14 @@
 import * as THREE from 'three';
 
 import { MAX_HP, SHELL_HEIGHT } from '../shared/constants.js';
-import { BOOM_GROUND, BOOM_HIT, BOOM_KILL, type Box, type BoomKind } from '../shared/types.js';
+import {
+  BOOM_GROUND,
+  BOOM_HIT,
+  BOOM_KILL,
+  BOOM_RICOCHET,
+  type Box,
+  type BoomKind,
+} from '../shared/types.js';
 
 /** Цвета корпусов; сервер присылает индекс в этой палитре. */
 const PALETTE = [0x4f7d5a, 0x7a5f9c, 0xa8632f, 0x3f6f96, 0x8a8f3a, 0x9c4a52, 0x3f8f88, 0x8a6a44];
@@ -31,7 +38,17 @@ const BOOM_PRESETS: Record<BoomKind, { radius: number; life: number; color: numb
     [BOOM_GROUND]: { radius: 1.6, life: 0.34, color: 0xffb257, ring: false },
     [BOOM_HIT]: { radius: 2.2, life: 0.4, color: 0xffd27a, ring: false },
     [BOOM_KILL]: { radius: 4.2, life: 0.75, color: 0xff8a3c, ring: true },
+    // Рикошет — короткая белая искра: снаряд жив и полетел дальше, взрыва не было.
+    [BOOM_RICOCHET]: { radius: 0.9, life: 0.16, color: 0xfff4c8, ring: false },
   };
+
+/** На какой высоте рвануло: у земли, по корпусу танка или на высоте полёта снаряда. */
+const BOOM_HEIGHT: Record<BoomKind, number> = {
+  [BOOM_GROUND]: 0.6,
+  [BOOM_HIT]: 1.4,
+  [BOOM_KILL]: 1.4,
+  [BOOM_RICOCHET]: SHELL_HEIGHT,
+};
 
 /** Вспышка у дульного среза, когда стреляет чужой танк. */
 const MUZZLE_PRESET = { radius: 1.1, life: 0.12, color: 0xfff0c0, ring: false };
@@ -386,7 +403,7 @@ export class Scene3D {
   // --- Взрывы ---
 
   boom(x: number, z: number, kind: BoomKind): void {
-    this.spawnEffect(x, z, BOOM_PRESETS[kind], kind === BOOM_GROUND ? 0.6 : 1.4);
+    this.spawnEffect(x, z, BOOM_PRESETS[kind], BOOM_HEIGHT[kind]);
   }
 
   /** Вспышка выстрела: рисуем её у дульного среза чужого танка. */

@@ -35,7 +35,7 @@ export interface Input {
 /** Снаряд в полёте. Живёт только на сервере, клиенту приходит уже в снапшоте. */
 export interface ShellState {
   id: number;
-  /** id стрелявшего: в своего не попадаем. */
+  /** id стрелявшего: пока снаряд не срикошетил, в своего не попадаем. */
   owner: number;
   x: number;
   z: number;
@@ -43,13 +43,20 @@ export interface ShellState {
   vz: number;
   /** Остаток жизни в секундах. */
   life: number;
+  /** Сколько раз уже отскочил. */
+  bounces: number;
 }
 
 /** Что показать в месте попадания. */
 export const BOOM_GROUND = 0; // снаряд разбился о препятствие, стену или землю
 export const BOOM_HIT = 1; // попадание в танк
 export const BOOM_KILL = 2; // танк уничтожен
-export type BoomKind = typeof BOOM_GROUND | typeof BOOM_HIT | typeof BOOM_KILL;
+export const BOOM_RICOCHET = 3; // снаряд чиркнул по стене и полетел дальше
+export type BoomKind =
+  | typeof BOOM_GROUND
+  | typeof BOOM_HIT
+  | typeof BOOM_KILL
+  | typeof BOOM_RICOCHET;
 
 /** Событие взрыва за тик (короткие ключи — трафик). */
 export interface Boom {
@@ -79,13 +86,15 @@ export interface SnapshotEntry {
   d: 0 | 1; // уничтожен
 }
 
-/** Снаряд в снапшоте. Угол постоянный, но нужен клиенту для разворота меша. */
+/** Снаряд в снапшоте. Угол нужен клиенту для разворота меша и меняется на отскоках. */
 export interface SnapshotShell {
   i: number; // id
   o: number; // owner
   x: number;
   z: number;
   a: number; // направление полёта
+  /** Счётчик отскоков: по его изменению клиент понимает, что интерполировать нельзя. */
+  b: number;
 }
 
 export function createTankState(x = 0, z = 0, angle = 0): TankState {
