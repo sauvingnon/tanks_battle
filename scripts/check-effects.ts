@@ -13,6 +13,8 @@
  * объявлен. Незаявленный атрибут молча не доедет до видеокарты, и эффект
  * просто не появится, без единой ошибки в консоли.
  */
+import * as THREE from 'three';
+
 import {
   bodyLean,
   DEBRIS_FIELD,
@@ -40,6 +42,7 @@ import {
   litLuminance,
   PAINTED_COLORS,
 } from '../src/client/look.js';
+import { scaleBoxUv } from '../src/client/textures.js';
 
 const checks: Array<[string, boolean]> = [];
 const check = (label: string, ok: boolean) => checks.push([label, ok]);
@@ -317,6 +320,54 @@ const near = (a: number, b: number, eps = 1e-6) => Math.abs(a - b) < eps;
   // Половина порога — не придирка: блик добавляет к диффузной части сверху,
   // и без запаса светиться начали бы края освещённых граней.
   check('и запас при этом двукратный', brightest < BLOOM_THRESHOLD * 0.5);
+}
+
+// --- 5д. Развёртка коробок под текстуру ---
+
+{
+  /**
+   * Проверяем не «правильно ли переставлены грани», а само свойство, ради
+   * которого всё затевалось: на каждой грани клетка текстуры должна занимать
+   * ровно tile метров по обеим осям. Так проверка не зависит от того, в каком
+   * порядке BoxGeometry раскладывает грани, и переживёт смену версии three.
+   */
+  const facesTiled = (w: number, h: number, d: number, tile: number): boolean => {
+    const geometry = new THREE.BoxGeometry(w, h, d);
+    scaleBoxUv(geometry, w, h, d, tile);
+    const position = geometry.getAttribute('position');
+    const uv = geometry.getAttribute('uv');
+
+    for (let face = 0; face < 6; face++) {
+      const span = (get: (i: number) => number) => {
+        let lo = Infinity;
+        let hi = -Infinity;
+        for (let i = 0; i < 4; i++) {
+          const v = get(face * 4 + i);
+          lo = Math.min(lo, v);
+          hi = Math.max(hi, v);
+        }
+        return hi - lo;
+      };
+
+      // Две ненулевые стороны грани в метрах и две стороны её развёртки в клетках.
+      const metres = [span((i) => position.getX(i)), span((i) => position.getY(i)), span((i) => position.getZ(i))]
+        .filter((v) => v > 1e-6)
+        .sort((a, b) => a - b);
+      const cells = [span((i) => uv.getX(i)), span((i) => uv.getY(i))]
+        .map((v) => v * tile)
+        .sort((a, b) => a - b);
+
+      if (metres.length !== 2) return false;
+      if (Math.abs(metres[0] - cells[0]) > 1e-6) return false;
+      if (Math.abs(metres[1] - cells[1]) > 1e-6) return false;
+    }
+    return true;
+  };
+
+  check('на кубе клетка везде одного размера', facesTiled(4, 4, 4, 4));
+  check('на вытянутом блоке грани не растягиваются', facesTiled(20, 3, 6, 4));
+  check('на стене во всю карту тоже', facesTiled(144, 4, 2, 4));
+  check('размер клетки соблюдается и при другом tile', facesTiled(20, 3, 6, 9));
 }
 
 // --- 6. Шейдеры собраны без опечаток в объявлениях ---

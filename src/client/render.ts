@@ -41,6 +41,7 @@ import {
   PALETTE,
   SUN_INTENSITY,
 } from './look.js';
+import { armorTexture, concreteTexture, groundTexture, scaleBoxUv } from './textures.js';
 import {
   BOOM_GROUND,
   BOOM_HIT,
@@ -56,6 +57,13 @@ export { BONUS_COLORS } from './look.js';
 
 /** На какой высоте висит ящик над землёй. */
 const BONUS_HOVER = 1.7;
+
+/**
+ * Сколько метров занимает одна клетка текстуры. У земли крупнее: она видна
+ * с высоты и почти в профиль, и мелкий рисунок на ней превращается в рябь.
+ */
+const GROUND_TILE = 9;
+const BLOCK_TILE = 4;
 
 const CAMERA_DISTANCE = 15;
 const CAMERA_BASE_HEIGHT = 3.4;
@@ -279,6 +287,14 @@ export class Scene3D {
   /** Часы сцены в секундах: по ним шейдеры считают возраст следов и пылинок. */
   private clock = 0;
 
+  /**
+   * Текстуры рисуются один раз на всю игру, а не на карту: при смене карты
+   * материалы пересоздаются, и текстура на каждую карту утекала бы в видеопамять.
+   */
+  private readonly groundMap: THREE.CanvasTexture;
+  private readonly concreteMap: THREE.CanvasTexture;
+  private readonly armorMap: THREE.CanvasTexture;
+
   private readonly renderer: THREE.WebGLRenderer;
   private readonly tanks = new Map<number, TankHandle>();
   private readonly shells = new Map<number, ShellHandle>();
@@ -398,6 +414,10 @@ export class Scene3D {
     // не съедал поле, но дальняя стена через всю карту уже заметно подёрнута дымкой.
     this.scene.fog = new THREE.Fog(0x121822, 110, 300);
 
+    this.groundMap = groundTexture(this.renderer);
+    this.concreteMap = concreteTexture(this.renderer);
+    this.armorMap = armorTexture(this.renderer);
+
     // Цвет копится в полуплавающей точке: свечению нужны значения ярче единицы,
     // а в обычные 8 бит на канал они бы срезались ещё до размытия.
     this.composer = new EffectComposer(
@@ -462,10 +482,18 @@ export class Scene3D {
     this.dust.clear();
     this.debris.clear();
 
+    const groundSize = half * 6;
     const ground = new THREE.Mesh(
-      new THREE.PlaneGeometry(half * 6, half * 6),
-      new THREE.MeshStandardMaterial({ color: COLOR_GROUND, roughness: 1 }),
+      new THREE.PlaneGeometry(groundSize, groundSize),
+      new THREE.MeshStandardMaterial({
+        color: COLOR_GROUND,
+        roughness: 1,
+        map: this.groundMap,
+      }),
     );
+    // Текстура повторяется клеткой в GROUND_TILE метров: у плоскости развёртка
+    // одна на всю ширину, и без повтора крупа растянулась бы на 840 м в пятно.
+    this.groundMap.repeat.set(groundSize / GROUND_TILE, groundSize / GROUND_TILE);
     ground.rotation.x = -Math.PI / 2;
     ground.receiveShadow = true;
     this.world.add(ground);
@@ -476,7 +504,11 @@ export class Scene3D {
     (grid.material as THREE.Material).opacity = 0.35;
     this.world.add(grid);
 
-    const wallMaterial = new THREE.MeshStandardMaterial({ color: COLOR_WALL, roughness: 0.9 });
+    const wallMaterial = new THREE.MeshStandardMaterial({
+      color: COLOR_WALL,
+      roughness: 0.9,
+      map: this.concreteMap,
+    });
     const wallHeight = 4;
     const thickness = 2;
     const span = half * 2 + thickness * 2;
@@ -487,20 +519,34 @@ export class Scene3D {
       [-half - thickness / 2, 0, thickness, span],
     ];
     for (const [x, z, w, d] of walls) {
-      const wall = new THREE.Mesh(new THREE.BoxGeometry(w, wallHeight, d), wallMaterial);
+      const geometry = new THREE.BoxGeometry(w, wallHeight, d);
+      scaleBoxUv(geometry, w, wallHeight, d, BLOCK_TILE);
+      const wall = new THREE.Mesh(geometry, wallMaterial);
       wall.position.set(x, wallHeight / 2, z);
       wall.castShadow = true;
       wall.receiveShadow = true;
       this.world.add(wall);
     }
 
-    const boxMaterial = new THREE.MeshStandardMaterial({ color: COLOR_BOX, roughness: 0.85 });
+    const boxMaterial = new THREE.MeshStandardMaterial({
+      color: COLOR_BOX,
+      roughness: 0.85,
+      map: this.concreteMap,
+    });
     // Низкое укрытие простреливается насквозь, поэтому его надо отличать с одного
     // взгляда: другой цвет и заметно теплее — «за этим не спрячешься».
-    const lowMaterial = new THREE.MeshStandardMaterial({ color: COLOR_LOW_BOX, roughness: 1 });
+    const lowMaterial = new THREE.MeshStandardMaterial({
+      color: COLOR_LOW_BOX,
+      roughness: 1,
+      map: this.concreteMap,
+    });
     for (const box of obstacles) {
       const material = box.h >= SHELL_HEIGHT ? boxMaterial : lowMaterial;
-      const mesh = new THREE.Mesh(new THREE.BoxGeometry(box.w, box.h, box.d), material);
+      const geometry = new THREE.BoxGeometry(box.w, box.h, box.d);
+      // Развёртка правится на геометрии, а не отдельным материалом на блок:
+      // блоков на карте под сотню, и сотня материалов — это сотня шейдеров.
+      scaleBoxUv(geometry, box.w, box.h, box.d, BLOCK_TILE);
+      const mesh = new THREE.Mesh(geometry, material);
       mesh.position.set(box.x, box.h / 2, box.z);
       mesh.castShadow = true;
       mesh.receiveShadow = true;
@@ -539,6 +585,9 @@ export class Scene3D {
       color: paintColor,
       roughness: 0.72,
       metalness: 0.15,
+      // Текстура серая и светлая: она умножается на краску, поэтому цвет танка
+      // остаётся тем же, а броня перестаёт быть ровной заливкой.
+      map: this.armorMap,
     });
 
     const hull = new THREE.Mesh(this.geo.hull, bodyMaterial);
