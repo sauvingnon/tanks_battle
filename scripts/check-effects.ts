@@ -22,7 +22,6 @@ import {
   LEAN_MAX,
   ParticleField,
   TRACK_LENGTH,
-  TRACK_SIDE,
   TRACK_WIDTH,
   TRACK_Y,
   trackAnchor,
@@ -42,6 +41,12 @@ import {
   litLuminance,
   PAINTED_COLORS,
 } from '../src/client/look.js';
+import {
+  buildTankGeometry,
+  MUZZLE_TIP_Z,
+  TRACK_SIDE,
+  TURRET_Y,
+} from '../src/client/tank.js';
 import { scaleBoxUv } from '../src/client/textures.js';
 
 const checks: Array<[string, boolean]> = [];
@@ -368,6 +373,57 @@ const near = (a: number, b: number, eps = 1e-6) => Math.abs(a - b) < eps;
   check('на вытянутом блоке грани не растягиваются', facesTiled(20, 3, 6, 4));
   check('на стене во всю карту тоже', facesTiled(144, 4, 2, 4));
   check('размер клетки соблюдается и при другом tile', facesTiled(20, 3, 6, 9));
+}
+
+// --- 5е. Геометрия танка ---
+
+{
+  const tank = buildTankGeometry();
+  const bounds = (geometry: THREE.BufferGeometry) => {
+    geometry.computeBoundingBox();
+    return geometry.boundingBox!;
+  };
+
+  const hull = bounds(tank.hull);
+  const running = bounds(tank.running);
+  const barrel = bounds(tank.barrel);
+  const turret = bounds(tank.turret);
+
+  // Дульный срез: от него ставится вспышка выстрела. Стоит удлинить ствол или
+  // подвинуть дульный тормоз — и она молча уедет внутрь ствола или повиснет
+  // в воздухе, потому что константу правят отдельно от геометрии.
+  check('дульный срез совпадает с концом ствола', near(barrel.max.z, MUZZLE_TIP_Z, 1e-6));
+  check('ствол смотрит вперёд', barrel.min.z > 0);
+
+  // Ходовая обязана стоять там, где её ищут следы на земле.
+  check('колея совпадает с шириной следов', near(running.max.x, -running.min.x, 1e-6));
+  check('трак стоит на месте отпечатка', running.max.x > TRACK_SIDE && running.min.x < -TRACK_SIDE);
+
+  // Ничто не должно уходить под землю: танк ездит по плоскости y = 0, и
+  // утопленный каток проявился бы полосой мерцания на всю карту.
+  check('ходовая не тонет в земле', running.min.y >= -0.02);
+  check('корпус не тонет в земле', hull.min.y >= -0.02);
+
+  // И не должно вылезать выше подписи: ник висит на 3.7 м над центром танка.
+  const topmost = TURRET_Y + Math.max(turret.max.y, bounds(tank.turretMetal).max.y);
+  check('башня не достаёт до ника', topmost < 3.4);
+  check('башня всё же выше корпуса', TURRET_Y + turret.min.y >= hull.max.y - 0.5);
+
+  // Силуэт менять нельзя: по нему игрок оценивает дистанцию, а радиус
+  // столкновений на сервере — 2.4 м и от внешнего вида не зависит вовсе.
+  // Прежний танк был 1.84 м в полуширину (траки) и 2.45 в полудлину.
+  const halfWidth = Math.max(hull.max.x, running.max.x, -hull.min.x, -running.min.x);
+  const halfLength = Math.max(hull.max.z, running.max.z, -hull.min.z, -running.min.z);
+  check('танк не шире прежнего заметно', halfWidth <= 2.0);
+  check('танк не длиннее прежнего', halfLength <= 2.5);
+  // И не уже: похудевший танк начали бы недооценивать по дистанции.
+  check('танк не сузился', halfWidth >= 1.7);
+
+  // Слияние должно было дать по одной геометрии на материал, а не по одной
+  // на деталь: иначе весь смысл — в вызовах отрисовки — теряется.
+  for (const [name, geometry] of Object.entries(tank)) {
+    check(`${name} — одна слитая геометрия`, geometry.getAttribute('position').count > 0);
+  }
 }
 
 // --- 6. Шейдеры собраны без опечаток в объявлениях ---

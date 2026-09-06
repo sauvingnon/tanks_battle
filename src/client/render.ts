@@ -11,7 +11,6 @@ import {
   DEBRIS_FIELD,
   DUST_FIELD,
   ParticleField,
-  TRACK_SIDE,
   trackAnchor,
   TrackMarks,
   WRECK_S,
@@ -41,6 +40,12 @@ import {
   PALETTE,
   SUN_INTENSITY,
 } from './look.js';
+import {
+  buildTankGeometry,
+  MUZZLE_TIP_Z,
+  type TankGeometry,
+  TURRET_Y,
+} from './tank.js';
 import { armorTexture, concreteTexture, groundTexture, scaleBoxUv } from './textures.js';
 import {
   BOOM_GROUND,
@@ -142,10 +147,6 @@ const TRACER_LENGTH = 6;
 
 // --- Отдача ствола ---
 
-/** Штатное положение ствола внутри башни по оси Z. */
-const BARREL_Z = 2.3;
-/** Дульный срез в координатах башни: ствол длиной 3 стоит центром на BARREL_Z. */
-const MUZZLE_TIP_Z = BARREL_Z + 1.5;
 /** На сколько метров ствол уходит назад в момент выстрела. */
 const RECOIL_BACK = 0.62;
 /** Скорость возврата: ствол откатывается рывком, а выходит обратно плавно. */
@@ -295,6 +296,9 @@ export class Scene3D {
   private readonly concreteMap: THREE.CanvasTexture;
   private readonly armorMap: THREE.CanvasTexture;
 
+  /** Геометрия танка: общая на всех, разница между танками только в цвете. */
+  private readonly tankGeo: TankGeometry = buildTankGeometry();
+
   private readonly renderer: THREE.WebGLRenderer;
   private readonly tanks = new Map<number, TankHandle>();
   private readonly shells = new Map<number, ShellHandle>();
@@ -309,11 +313,6 @@ export class Scene3D {
 
   /** Геометрии переиспользуются всеми танками — их много, а форма одна. */
   private readonly geo = {
-    hull: new THREE.BoxGeometry(3, 1, 4.4),
-    track: new THREE.BoxGeometry(0.78, 0.85, 4.9),
-    turret: new THREE.BoxGeometry(2, 0.75, 2.3),
-    barrel: new THREE.CylinderGeometry(0.14, 0.16, 3, 12),
-    cupola: new THREE.CylinderGeometry(0.34, 0.34, 0.3, 12),
     shell: new THREE.CapsuleGeometry(0.16, 0.7, 4, 8),
     flash: new THREE.SphereGeometry(1, 12, 10),
     ring: new THREE.RingGeometry(0.72, 1, 28),
@@ -590,36 +589,31 @@ export class Scene3D {
       map: this.armorMap,
     });
 
-    const hull = new THREE.Mesh(this.geo.hull, bodyMaterial);
-    hull.position.y = 1.15;
+    // Геометрия уже слита по материалам и стоит на своих местах: пять мешей
+    // на танк вместо двух десятков, и каждый из них — один вызов отрисовки.
+    const hull = new THREE.Mesh(this.tankGeo.hull, bodyMaterial);
     hull.castShadow = true;
     hull.receiveShadow = true;
     body.add(hull);
 
-    for (const side of [-1, 1]) {
-      const track = new THREE.Mesh(this.geo.track, this.trackMaterial);
-      track.position.set(side * TRACK_SIDE, 0.5, 0);
-      track.castShadow = true;
-      track.receiveShadow = true;
-      body.add(track);
-    }
+    const running = new THREE.Mesh(this.tankGeo.running, this.trackMaterial);
+    running.castShadow = true;
+    running.receiveShadow = true;
+    body.add(running);
 
     const turret = new THREE.Group();
-    turret.position.y = 1.78;
+    turret.position.y = TURRET_Y;
 
-    const turretBody = new THREE.Mesh(this.geo.turret, bodyMaterial);
-    turretBody.position.y = 0.32;
+    const turretBody = new THREE.Mesh(this.tankGeo.turret, bodyMaterial);
     turretBody.castShadow = true;
     turret.add(turretBody);
 
-    const cupola = new THREE.Mesh(this.geo.cupola, this.metalMaterial);
-    cupola.position.set(0.55, 0.82, -0.3);
-    cupola.castShadow = true;
-    turret.add(cupola);
+    const turretMetal = new THREE.Mesh(this.tankGeo.turretMetal, this.metalMaterial);
+    turretMetal.castShadow = true;
+    turret.add(turretMetal);
 
-    const barrel = new THREE.Mesh(this.geo.barrel, this.metalMaterial);
-    barrel.rotation.x = Math.PI / 2;
-    barrel.position.set(0, 0.36, BARREL_Z);
+    // Ствол отдельным мешем: он единственный ездит внутри башни.
+    const barrel = new THREE.Mesh(this.tankGeo.barrel, this.metalMaterial);
     barrel.castShadow = true;
     turret.add(barrel);
 
@@ -1216,7 +1210,7 @@ export class Scene3D {
     for (const handle of this.tanks.values()) {
       if (handle.recoil <= 0) continue;
       handle.recoil = handle.recoil * k < 0.01 ? 0 : handle.recoil * k;
-      handle.barrel.position.z = BARREL_Z - handle.recoil * RECOIL_BACK;
+      handle.barrel.position.z = -handle.recoil * RECOIL_BACK;
     }
   }
 
