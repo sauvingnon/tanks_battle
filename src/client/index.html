@@ -19,16 +19,48 @@
       <div id="death" hidden>
         <div class="death-card">
           <b>Танк уничтожен</b>
-          <span>В строю через <b id="death-timer">4</b></span>
+          <span id="death-respawn">В строю через <b id="death-timer">4</b></span>
+          <span id="death-note" hidden></span>
         </div>
       </div>
+
+      <div id="wave-banner" hidden>
+        <b id="wave-title">Волна 1</b>
+        <span id="wave-sub"></span>
+      </div>
+
+      <div id="setup" hidden>
+        <div class="setup-head">
+          <b>Настройки боя</b>
+          <span id="setup-owner"></span>
+        </div>
+        <div class="setup-label">Карта</div>
+        <div class="setup-row" id="setup-maps"></div>
+        <p class="setup-hint" id="hint-map"></p>
+        <div class="setup-label">Режим</div>
+        <div class="setup-row" id="setup-modes"></div>
+        <p class="setup-hint" id="hint-mode"></p>
+        <div class="setup-label">Сложность ботов</div>
+        <div class="setup-row" id="setup-diffs"></div>
+        <p class="setup-hint" id="hint-diff"></p>
+        <label class="setup-check">
+          <input type="checkbox" id="setup-bonuses" />
+          <span>Бонусы на карте</span>
+        </label>
+        <p class="setup-hint" id="hint-bonuses"></p>
+        <p class="setup-note">Волны растут: сначала числом, потом выучкой. Жизнь одна на волну — павших поднимет зачистка. На карте разом не больше трёх ботов на каждого живого игрока.</p>
+      </div>
+
+      <button id="setup-toggle" type="button" title="Настройки боя (M)" hidden>⚙</button>
 
       <div id="hud" hidden>
         <div class="hud-left">
           <div class="hud-row">
             <span class="hud-chip"><b id="hud-online">0</b> в бою</span>
             <span class="hud-chip"><b id="hud-ping">—</b> мс</span>
+            <span class="hud-chip" id="hud-mode">Все против всех</span>
           </div>
+          <div class="hud-row" id="hud-fx"></div>
           <div class="hud-bar hud-hp">
             <i id="hud-hp-fill"></i>
             <span><b id="hud-hp-value">100</b> HP</span>
@@ -43,7 +75,7 @@
         </div>
       </div>
 
-      <div id="hint" hidden>Кликни по экрану, чтобы захватить мышь · <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> — ход, мышь — башня, <kbd>ЛКМ</kbd> — огонь, <kbd>Esc</kbd> — освободить курсор</div>
+      <div id="hint" hidden>Кликни по экрану, чтобы захватить мышь · <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> — ход, мышь — башня, <kbd>ЛКМ</kbd> — огонь, колесо — приблизить, <kbd>M</kbd> — настройки, <kbd>Esc</kbd> — освободить курсор</div>
 
       <div id="touch" hidden>
         <div id="stick"><div id="stick-knob"></div></div>
@@ -53,7 +85,7 @@
       <div id="overlay">
         <form id="join-form" autocomplete="off">
           <h1>Танковый бой</h1>
-          <p class="sub">Одна карта, все против всех. 100 HP, снаряд снимает 25.</p>
+          <p class="sub">Четыре карты, все против всех или волны ботов. 100 HP, снаряд снимает 25.</p>
           <input id="name-input" name="name" maxlength="16" placeholder="Твой позывной" required />
           <button id="join-button" type="submit">В бой</button>
           <p id="status" class="status"></p>

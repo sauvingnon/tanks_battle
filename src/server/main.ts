@@ -4,7 +4,7 @@ import { extname, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer, type WebSocket } from 'ws';
 
-import { DT, SNAPSHOT_EVERY, TICK_HZ, MAP_HALF } from '../shared/constants.js';
+import { DT, SNAPSHOT_EVERY, TICK_HZ, MAP_HALF, isMode } from '../shared/constants.js';
 import { decode, encode, type ClientMessage, type ServerMessage } from '../shared/protocol.js';
 import { Room, type Player } from './room.js';
 
@@ -16,14 +16,24 @@ const MAX_PLAYERS = Number(process.env.MAX_PLAYERS ?? 32);
 const STATIC_DIR = resolve(fileURLToPath(new URL('../../dist', import.meta.url)));
 const SERVE_STATIC = existsSync(STATIC_DIR);
 
-const room = new Room();
+// Комната сама рассылает то, что рождается внутри неё: появление и гибель ботов,
+// смену волны, смену настроек. Ботам слать нечего — у них нет сокета.
+const room = new Room((msg) => broadcast(msg));
 
 // --- HTTP ---
 
 const http = createServer((req, res) => {
   if (req.url === '/health') {
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, players: room.players.size, tick: room.tickCount }));
+    res.end(
+      JSON.stringify({
+        ok: true,
+        players: room.humanCount,
+        bots: room.botCount,
+        mode: room.mode,
+        tick: room.tickCount,
+      }),
+    );
     return;
   }
   if (SERVE_STATIC) {
@@ -97,7 +107,7 @@ wss.on('connection', (ws) => {
 
     if (msg.t === 'join') {
       if (session.player) return; // повторный join игнорируем
-      if (room.players.size >= MAX_PLAYERS) {
+      if (room.humanCount >= MAX_PLAYERS) {
         send(ws, { t: 'error', message: 'Комната заполнена, попробуй позже' });
         ws.close();
         return;
@@ -114,9 +124,23 @@ wss.on('connection', (ws) => {
         tickHz: TICK_HZ,
         map: { half: MAP_HALF, obstacles: room.obstacles },
         players: room.allInfo(),
+        ...room.config(),
+        wave: room.waveState(),
       });
       broadcastExcept(player.id, { t: 'joined', player: room.info(player) });
-      console.log(`[+] ${player.name} (#${player.id}), онлайн: ${room.players.size}`);
+      console.log(`[+] ${player.name} (#${player.id}), онлайн: ${room.humanCount}`);
+      return;
+    }
+
+    if (msg.t === 'setup') {
+      // Настраивает только хост: иначе любой мог бы переключить режим посреди боя.
+      if (!session.player || session.player.id !== room.hostId) return;
+      room.setup(
+        isMode(msg.mode) ? msg.mode : undefined,
+        msg.diff,
+        typeof msg.bonuses === 'boolean' ? msg.bonuses : undefined,
+        msg.map,
+      );
       return;
     }
 
@@ -144,7 +168,7 @@ wss.on('connection', (ws) => {
     if (!player) return;
     room.remove(player.id);
     broadcastExcept(player.id, { t: 'left', id: player.id });
-    console.log(`[-] ${player.name} (#${player.id}), онлайн: ${room.players.size}`);
+    console.log(`[-] ${player.name} (#${player.id}), онлайн: ${room.humanCount}`);
   });
 
   ws.on('error', () => ws.terminate());
@@ -170,13 +194,17 @@ function send(ws: WebSocket, msg: ServerMessage): void {
 
 function broadcast(msg: ServerMessage): void {
   const data = encode(msg);
-  for (const player of room.players.values()) player.send(data);
+  for (const player of room.players.values()) {
+    if (player.brain) continue; // бот в сети не сидит
+    player.send(data);
+  }
 }
 
 function broadcastExcept(exceptId: number, msg: ServerMessage): void {
   const data = encode(msg);
   for (const player of room.players.values()) {
-    if (player.id !== exceptId) player.send(data);
+    if (player.brain || player.id === exceptId) continue;
+    player.send(data);
   }
 }
 
@@ -212,24 +240,21 @@ setInterval(() => {
   }
 
   if (room.tickCount % SNAPSHOT_EVERY !== 0) return;
-  if (room.players.size === 0) return;
+  if (room.humanCount === 0) return;
 
-  const entries = room.snapshotEntries();
+  // Тяжёлую часть снапшота сериализуем один раз на всех: у игроков различается
+  // только ack. С ботами танков в снапшоте втрое больше, и отдельный
+  // JSON.stringify на каждого клиента был бы самой дорогой строчкой сервера.
   // Пустые массивы не шлём: снаряды и взрывы бывают в считаных процентах тиков.
-  const shells = room.shellCount > 0 ? room.snapshotShells() : undefined;
-  const booms = room.boomEvents.length > 0 ? room.boomEvents : undefined;
+  let tail = `,"tick":${room.tickCount},"players":${JSON.stringify(room.snapshotEntries())}`;
+  if (room.shellCount > 0) tail += `,"shells":${JSON.stringify(room.snapshotShells())}`;
+  if (room.boomEvents.length > 0) tail += `,"booms":${JSON.stringify(room.boomEvents)}`;
+  if (room.bonusCount > 0) tail += `,"bonuses":${JSON.stringify(room.snapshotBonuses())}`;
 
   for (const player of room.players.values()) {
-    player.send(
-      encode({
-        t: 'snapshot',
-        tick: room.tickCount,
-        ack: player.ack,
-        players: entries,
-        shells,
-        booms,
-      }),
-    );
+    if (player.brain) continue;
+    // ack — целое из input.seq | 0, так что подстановка в строку безопасна.
+    player.send(`{"t":"snapshot","ack":${player.ack}${tail}}`);
   }
 }, STEP_MS / 2);
 

@@ -45,6 +45,12 @@ export interface ShellState {
   life: number;
   /** Сколько раз уже отскочил. */
   bounces: number;
+  /**
+   * Урон, с которым снаряд вышел из ствола. Фиксируется на выстреле: пока он летит,
+   * стрелок может погибнуть, выйти из игры или потерять бонус на урон — на уже
+   * выпущенный снаряд это не влияет. У пробных лучей поля нет.
+   */
+  dmg?: number;
 }
 
 /** Что показать в месте попадания. */
@@ -67,11 +73,18 @@ export interface Boom {
   o: number;
 }
 
+/** Команды. Огонь по своим включён, так что команда — это только «за кого играешь». */
+export const TEAM_PLAYERS = 0;
+export const TEAM_BOTS = 1;
+
 export interface PlayerInfo {
   id: number;
   name: string;
   /** Индекс цвета в палитре клиента. */
   color: number;
+  team: number;
+  /** Есть только у ботов — клиент по нему подписывает танк иначе. */
+  bot?: 1;
 }
 
 /** Состояние игрока внутри снапшота (короткие ключи — трафик). */
@@ -84,6 +97,26 @@ export interface SnapshotEntry {
   s: number; // speed
   h: number; // hp
   d: 0 | 1; // уничтожен
+  /** Маска активных бонусов; шлём, только когда она не пуста. */
+  f?: number;
+}
+
+/** Ящик с бонусом на карте. */
+export interface BonusState {
+  id: number;
+  kind: number;
+  x: number;
+  z: number;
+  /** Тик, на котором неподобранный ящик исчезнет. */
+  until: number;
+}
+
+/** Ящик в снапшоте. */
+export interface SnapshotBonus {
+  i: number; // id
+  k: number; // вид
+  x: number;
+  z: number;
 }
 
 /** Снаряд в снапшоте. Угол нужен клиенту для разворота меша и меняется на отскоках. */

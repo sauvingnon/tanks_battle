@@ -8,10 +8,17 @@ import {
   BOOM_RICOCHET,
   type Box,
   type BoomKind,
+  type SnapshotBonus,
 } from '../shared/types.js';
 
 /** Цвета корпусов; сервер присылает индекс в этой палитре. */
 const PALETTE = [0x4f7d5a, 0x7a5f9c, 0xa8632f, 0x3f6f96, 0x8a8f3a, 0x9c4a52, 0x3f8f88, 0x8a6a44];
+
+/** Цвета ящиков: ремонт, урон, заряжание, ход, маскировка. */
+export const BONUS_COLORS = [0x6ad46a, 0xff7a4d, 0xffd24d, 0x4db8ff, 0xb388ff];
+
+/** На какой высоте висит ящик над землёй. */
+const BONUS_HOVER = 1.7;
 
 const UP = new THREE.Vector3(0, 1, 0);
 
@@ -64,6 +71,8 @@ export interface TankHandle {
   labelVisible: boolean;
   /** Подбитый танк не рисуется и не подписывается. */
   alive: boolean;
+  /** Под «Маскировкой» и достаточно далеко: корпус и подпись не рисуются. */
+  cloaked: boolean;
   hp: number;
 }
 
@@ -85,6 +94,9 @@ interface Effect {
 export class Scene3D {
   readonly scene = new THREE.Scene();
   readonly camera: THREE.PerspectiveCamera;
+
+  /** Земля, стены и блоки текущей карты: при смене карты группа собирается заново. */
+  private readonly world = new THREE.Group();
 
   private readonly renderer: THREE.WebGLRenderer;
   private readonly tanks = new Map<number, TankHandle>();
@@ -108,7 +120,24 @@ export class Scene3D {
     shell: new THREE.CapsuleGeometry(0.16, 0.7, 4, 8),
     flash: new THREE.SphereGeometry(1, 12, 10),
     ring: new THREE.RingGeometry(0.72, 1, 28),
+    bonus: new THREE.BoxGeometry(1.7, 1.7, 1.7),
   };
+
+  /** Цвет ящика по виду бонуса: тот же порядок, что и в BONUS_NAMES. */
+  private readonly bonusMaterials = BONUS_COLORS.map(
+    (color) =>
+      new THREE.MeshStandardMaterial({
+        color,
+        emissive: color,
+        emissiveIntensity: 0.5,
+        roughness: 0.4,
+        metalness: 0.1,
+      }),
+  );
+
+  private readonly bonuses = new Map<number, { mesh: THREE.Mesh; seen: boolean }>();
+  /** Общая фаза вращения ящиков — чтобы они крутились в такт, а не вразнобой. */
+  private bonusSpin = 0;
 
   /** Снаряд светится сам: он мелкий и должен читаться на любом фоне. */
   private readonly shellMaterial = new THREE.MeshBasicMaterial({ color: 0xffd27a });
@@ -145,6 +174,7 @@ export class Scene3D {
     // не съедал поле, но дальняя стена через всю карту уже заметно подёрнута дымкой.
     this.scene.fog = new THREE.Fog(0x121822, 110, 300);
 
+    this.scene.add(this.world);
     this.setupLights();
     this.resize();
     window.addEventListener('resize', this.resize);
@@ -174,21 +204,28 @@ export class Scene3D {
     this.scene.add(sun);
   }
 
-  /** Строит землю, стены по периметру и препятствия, присланные сервером. */
+  /**
+   * Строит землю, стены по периметру и препятствия, присланные сервером.
+   * Вызывается заново при смене карты, поэтому вся геометрия мира живёт в одной
+   * группе: старую снимаем целиком и освобождаем её буферы, иначе смена карты
+   * оставляла бы прошлые блоки и в сцене, и в видеопамяти.
+   */
   buildWorld(half: number, obstacles: Box[]): void {
+    this.clearWorld();
+
     const ground = new THREE.Mesh(
       new THREE.PlaneGeometry(half * 6, half * 6),
       new THREE.MeshStandardMaterial({ color: 0x39412f, roughness: 1 }),
     );
     ground.rotation.x = -Math.PI / 2;
     ground.receiveShadow = true;
-    this.scene.add(ground);
+    this.world.add(ground);
 
     const grid = new THREE.GridHelper(half * 2, half / 2.5, 0x5c6b52, 0x475040);
     grid.position.y = 0.02;
     (grid.material as THREE.Material).transparent = true;
     (grid.material as THREE.Material).opacity = 0.35;
-    this.scene.add(grid);
+    this.world.add(grid);
 
     const wallMaterial = new THREE.MeshStandardMaterial({ color: 0x4a5160, roughness: 0.9 });
     const wallHeight = 4;
@@ -205,7 +242,7 @@ export class Scene3D {
       wall.position.set(x, wallHeight / 2, z);
       wall.castShadow = true;
       wall.receiveShadow = true;
-      this.scene.add(wall);
+      this.world.add(wall);
     }
 
     const boxMaterial = new THREE.MeshStandardMaterial({ color: 0x6d6357, roughness: 0.85 });
@@ -214,11 +251,29 @@ export class Scene3D {
       mesh.position.set(box.x, box.h / 2, box.z);
       mesh.castShadow = true;
       mesh.receiveShadow = true;
-      this.scene.add(mesh);
+      this.world.add(mesh);
     }
   }
 
-  addTank(id: number, name: string, colorIndex: number, isSelf: boolean): TankHandle {
+  /** Снимает прошлую карту вместе с её буферами. */
+  private clearWorld(): void {
+    for (const child of this.world.children) {
+      const mesh = child as THREE.Mesh;
+      mesh.geometry?.dispose();
+      const material = mesh.material;
+      if (Array.isArray(material)) for (const m of material) m.dispose();
+      else material?.dispose();
+    }
+    this.world.clear();
+  }
+
+  addTank(
+    id: number,
+    name: string,
+    colorIndex: number,
+    isSelf: boolean,
+    isBot = false,
+  ): TankHandle {
     const existing = this.tanks.get(id);
     if (existing) return existing;
 
@@ -267,7 +322,7 @@ export class Scene3D {
     this.scene.add(root);
 
     const label = document.createElement('div');
-    label.className = isSelf ? 'nameplate is-self' : 'nameplate';
+    label.className = isSelf ? 'nameplate is-self' : isBot ? 'nameplate is-bot' : 'nameplate';
 
     const text = document.createElement('span');
     text.textContent = name;
@@ -294,6 +349,7 @@ export class Scene3D {
       labelHeight: label.offsetHeight,
       labelVisible: true,
       alive: true,
+      cloaked: false,
       hp: MAX_HP,
     };
     this.tanks.set(id, handle);
@@ -315,9 +371,21 @@ export class Scene3D {
 
     if (alive !== handle.alive) {
       handle.alive = alive;
-      handle.root.visible = alive;
+      handle.root.visible = alive && !handle.cloaked;
       // Подпись погасит updateLabels(): она и так каждый кадр решает, видно ли её.
     }
+  }
+
+  /**
+   * «Маскировка»: издали танк не рисуется и не подписан. Вплотную он виден —
+   * иначе бонус превращался бы в неуязвимость. Порог считает вызывающая сторона,
+   * ровно тот же, по которому его перестают видеть боты на сервере.
+   */
+  setTankStealth(id: number, cloaked: boolean): void {
+    const handle = this.tanks.get(id);
+    if (!handle || handle.cloaked === cloaked) return;
+    handle.cloaked = cloaked;
+    handle.root.visible = handle.alive && !cloaked;
   }
 
   removeTank(id: number): void {
@@ -338,9 +406,16 @@ export class Scene3D {
   }
 
   /** Камера летит за танком: позиция задаётся углами обзора, а не поворотом корпуса. */
-  updateCamera(x: number, z: number, yaw: number, pitch: number, dt: number): void {
-    const distance = CAMERA_DISTANCE * Math.cos(pitch) + 2;
-    const height = CAMERA_BASE_HEIGHT + Math.sin(pitch) * CAMERA_DISTANCE;
+  updateCamera(
+    x: number,
+    z: number,
+    yaw: number,
+    pitch: number,
+    dt: number,
+    zoom = CAMERA_DISTANCE,
+  ): void {
+    const distance = zoom * Math.cos(pitch) + 2;
+    const height = CAMERA_BASE_HEIGHT + Math.sin(pitch) * zoom;
 
     const desiredX = x - Math.sin(yaw) * distance;
     const desiredZ = z - Math.cos(yaw) * distance;
@@ -361,6 +436,19 @@ export class Scene3D {
 
     this.cameraTarget.set(x, 2.2, z);
     this.camera.lookAt(this.cameraTarget);
+  }
+
+  /**
+   * Точка мира в координатах экрана, в тех же пикселях, что и ники.
+   * null — точка за камерой, рисовать нечего.
+   */
+  project(x: number, y: number, z: number): { x: number; y: number } | null {
+    this.projected.set(x, y, z).project(this.camera);
+    if (this.projected.z < -1 || this.projected.z > 1) return null;
+    return {
+      x: (this.projected.x * 0.5 + 0.5) * this.viewWidth,
+      y: (-this.projected.y * 0.5 + 0.5) * this.viewHeight,
+    };
   }
 
   // --- Снаряды ---
@@ -398,6 +486,51 @@ export class Scene3D {
 
   clearShells(): void {
     this.syncShells([]);
+  }
+
+  // --- Ящики с бонусами ---
+
+  /** Ставит ящики по списку из снапшота: пропавшие подобрали или они истекли. */
+  syncBonuses(list: SnapshotBonus[]): void {
+    for (const handle of this.bonuses.values()) handle.seen = false;
+
+    for (const bonus of list) {
+      let handle = this.bonuses.get(bonus.i);
+      if (!handle) {
+        const mesh = new THREE.Mesh(
+          this.geo.bonus,
+          this.bonusMaterials[bonus.k % this.bonusMaterials.length],
+        );
+        mesh.castShadow = true;
+        this.scene.add(mesh);
+        handle = { mesh, seen: true };
+        this.bonuses.set(bonus.i, handle);
+      }
+      handle.seen = true;
+      handle.mesh.position.set(bonus.x, BONUS_HOVER, bonus.z);
+    }
+
+    for (const [id, handle] of this.bonuses) {
+      if (handle.seen) continue;
+      this.scene.remove(handle.mesh);
+      this.bonuses.delete(id);
+    }
+  }
+
+  clearBonuses(): void {
+    this.syncBonuses([]);
+  }
+
+  /** Ящик крутится и покачивается — так его видно издали на пёстром фоне. */
+  private updateBonuses(dt: number): void {
+    if (this.bonuses.size === 0) return;
+    this.bonusSpin += dt;
+    const bob = Math.sin(this.bonusSpin * 2.2) * 0.28;
+    for (const handle of this.bonuses.values()) {
+      handle.mesh.rotation.y = this.bonusSpin * 1.1;
+      handle.mesh.rotation.x = this.bonusSpin * 0.5;
+      handle.mesh.position.y = BONUS_HOVER + bob;
+    }
   }
 
   // --- Взрывы ---
@@ -482,6 +615,7 @@ export class Scene3D {
 
   render(dt: number): void {
     this.updateEffects(dt);
+    this.updateBonuses(dt);
     this.renderer.render(this.scene, this.camera);
     this.updateLabels();
   }
@@ -505,6 +639,7 @@ export class Scene3D {
       // z вне [-1, 1] значит «за камерой или за дальней плоскостью».
       const visible =
         handle.alive &&
+        !handle.cloaked &&
         distance < LABEL_MAX_DISTANCE &&
         this.projected.z > -1 &&
         this.projected.z < 1;
