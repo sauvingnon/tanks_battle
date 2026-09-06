@@ -5,6 +5,12 @@ const PITCH_MIN = -0.15;
 const PITCH_MAX = 1.05;
 const STICK_RADIUS = 56;
 
+/** Отдаление камеры: метры от танка, пределы и цена одного «щелчка» колеса. */
+const ZOOM_DEFAULT = 15;
+const ZOOM_MIN = 7;
+const ZOOM_MAX = 36;
+const ZOOM_PER_PIXEL = 0.02;
+
 /**
  * Ввод игрока, приведённый к абстрактным осям. Клавиатура и тач пишут в одни и те
  * же поля, поэтому игровой логике всё равно, с чего играют.
@@ -13,6 +19,8 @@ export class Controls {
   /** Куда смотрит камера. Башня доворачивается к этому углу. */
   yaw = 0;
   pitch = 0.42;
+  /** Насколько камера отнесена от танка, м. Крутится колесом и щипком. */
+  distance = ZOOM_DEFAULT;
 
   throttle = 0;
   steer = 0;
@@ -28,6 +36,11 @@ export class Controls {
 
   private lookTouchId: number | null = null;
   private lookPrev = { x: 0, y: 0 };
+
+  /** Второй палец на правой половине: вместе с lookTouchId даёт щипок зума. */
+  private pinchTouchId: number | null = null;
+  private pinchPoint = { x: 0, y: 0 };
+  private pinchGap = 0;
 
   private fireTouchId: number | null = null;
   private mouseFire = false;
@@ -45,6 +58,8 @@ export class Controls {
     window.addEventListener('blur', this.onBlur);
 
     this.canvas.addEventListener('click', this.onCanvasClick);
+    // passive: false — иначе браузер не даст отменить прокрутку и масштаб страницы.
+    this.canvas.addEventListener('wheel', this.onWheel, { passive: false });
     window.addEventListener('mousemove', this.onMouseMove);
     window.addEventListener('mousedown', this.onMouseDown);
     window.addEventListener('mouseup', this.onMouseUp);
@@ -127,6 +142,26 @@ export class Controls {
     }
   };
 
+  /** Колесо отдаляет и приближает камеру. */
+  private onWheel = (e: WheelEvent) => {
+    e.preventDefault();
+    // deltaMode: 0 — пиксели, 1 — строки (Firefox), 2 — страницы. Приводим к пикселям.
+    const scale = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 100 : 1;
+    this.zoomBy(e.deltaY * scale * ZOOM_PER_PIXEL);
+  };
+
+  private zoomBy(delta: number): void {
+    this.distance = clamp(this.distance + delta, ZOOM_MIN, ZOOM_MAX);
+  }
+
+  /** Пальцы разъехались — приближаем, сошлись — отдаляем. */
+  private applyPinch(): void {
+    if (this.pinchTouchId === null || this.lookTouchId === null) return;
+    const gap = Math.hypot(this.pinchPoint.x - this.lookPrev.x, this.pinchPoint.y - this.lookPrev.y);
+    if (this.pinchGap > 0) this.zoomBy((this.pinchGap - gap) * ZOOM_PER_PIXEL);
+    this.pinchGap = gap;
+  }
+
   private onMouseMove = (e: MouseEvent) => {
     if (document.pointerLockElement !== this.canvas) return;
     this.applyLook(e.movementX, e.movementY);
@@ -155,6 +190,14 @@ export class Controls {
       } else if (!isLeftHalf && this.lookTouchId === null) {
         this.lookTouchId = touch.identifier;
         this.lookPrev = { x: touch.clientX, y: touch.clientY };
+      } else if (!isLeftHalf && this.pinchTouchId === null) {
+        // Второй палец на правой половине — щипок зума вместо обзора.
+        this.pinchTouchId = touch.identifier;
+        this.pinchPoint = { x: touch.clientX, y: touch.clientY };
+        this.pinchGap = Math.hypot(
+          this.pinchPoint.x - this.lookPrev.x,
+          this.pinchPoint.y - this.lookPrev.y,
+        );
       }
     }
   };
@@ -171,8 +214,15 @@ export class Controls {
         const ky = clamp(dy, -STICK_RADIUS, STICK_RADIUS);
         this.knob.style.transform = `translate(${kx}px, ${ky}px)`;
       } else if (touch.identifier === this.lookTouchId) {
-        this.applyLook(touch.clientX - this.lookPrev.x, touch.clientY - this.lookPrev.y);
+        // Пока идёт щипок, тот же палец камеру не крутит — иначе обзор дёргается.
+        if (this.pinchTouchId === null) {
+          this.applyLook(touch.clientX - this.lookPrev.x, touch.clientY - this.lookPrev.y);
+        }
         this.lookPrev = { x: touch.clientX, y: touch.clientY };
+        this.applyPinch();
+      } else if (touch.identifier === this.pinchTouchId) {
+        this.pinchPoint = { x: touch.clientX, y: touch.clientY };
+        this.applyPinch();
       }
     }
   };
@@ -187,6 +237,8 @@ export class Controls {
         this.stick.style.opacity = '0.35';
       } else if (touch.identifier === this.lookTouchId) {
         this.lookTouchId = null;
+      } else if (touch.identifier === this.pinchTouchId) {
+        this.pinchTouchId = null;
       }
     }
   };
