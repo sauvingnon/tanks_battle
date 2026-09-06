@@ -1,6 +1,8 @@
 import * as THREE from 'three';
 
 import { MAX_HP, SHELL_HEIGHT } from '../shared/constants.js';
+import { wrapAngle } from '../shared/sim.js';
+import { bodyLean, DustField, TRACK_SIDE, trackAnchor, TrackMarks } from './ground.js';
 import {
   BOOM_GROUND,
   BOOM_HIT,
@@ -114,13 +116,47 @@ const SHAKE_DECAY = 2.6;
 const SHAKE_AMPLITUDE = 0.6;
 const SHAKE_FREQ = 21;
 
+// --- Ходовая: крен, следы, пыль ---
+
+/** Скорость подхода к целевому наклону корпуса. */
+const LEAN_RATE = 9;
+
+/** Через сколько метров пути кладётся новый отпечаток. */
+const TRACK_STEP = 0.85;
+/** Через сколько метров вылетает пылинка и с какой скорости начинается пыль. */
+const DUST_STEP = 2;
+const DUST_MIN_SPEED = 5;
+
+/**
+ * Скачок больше этого за кадр — это респавн или смена карты, а не езда.
+ * Без отсечки телепорт через полкарты давал бы «скорость» в сотни м/с,
+ * танк складывался бы пополам, а по всей карте протягивался бы след.
+ */
+const TELEPORT_STEP = 4;
+
 export interface TankHandle {
   root: THREE.Group;
+  /**
+   * Корпус с башней. Отдельный узел внутри root нужен, чтобы крен и клевок
+   * жили в осях самого танка: root уже повёрнут по курсу, и наклон в его
+   * системе координат смешивал бы поворот с креном.
+   */
+  body: THREE.Group;
   turret: THREE.Group;
   /** Ствол ходит отдельно от башни: по нему играется откат. */
   barrel: THREE.Mesh;
   /** Остаток отката, 1 в момент выстрела и 0 в покое. */
   recoil: number;
+  /** Прошлое положение: по нему считаются скорость и поворот за кадр. */
+  lastX: number;
+  lastZ: number;
+  lastYaw: number;
+  speed: number;
+  roll: number;
+  pitch: number;
+  /** Пройденный путь с прошлого отпечатка и с прошлой пылинки, м. */
+  trackDistance: number;
+  dustDistance: number;
   label: HTMLElement;
   hpFill: HTMLElement;
   /** Размеры подписи в пикселях, замеряются один раз — текст не меняется. */
@@ -161,6 +197,12 @@ export class Scene3D {
 
   /** Земля, стены и блоки текущей карты: при смене карты группа собирается заново. */
   private readonly world = new THREE.Group();
+
+  /** Следы гусениц и пыль: живут отдельно от карты, но чистятся вместе с ней. */
+  private readonly tracks = new TrackMarks();
+  private readonly dust = new DustField();
+  /** Часы сцены в секундах: по ним шейдеры считают возраст следов и пылинок. */
+  private clock = 0;
 
   private readonly renderer: THREE.WebGLRenderer;
   private readonly tanks = new Map<number, TankHandle>();
@@ -266,6 +308,8 @@ export class Scene3D {
     this.scene.fog = new THREE.Fog(0x121822, 110, 300);
 
     this.scene.add(this.world);
+    this.scene.add(this.tracks.mesh);
+    this.scene.add(this.dust.points);
     this.setupLights();
     this.resize();
     window.addEventListener('resize', this.resize);
@@ -303,6 +347,9 @@ export class Scene3D {
    */
   buildWorld(half: number, obstacles: Box[]): void {
     this.clearWorld();
+    // Следы и пыль от прошлой карты к новой геометрии отношения не имеют.
+    this.tracks.clear();
+    this.dust.clear();
 
     const ground = new THREE.Mesh(
       new THREE.PlaneGeometry(half * 6, half * 6),
@@ -373,6 +420,9 @@ export class Scene3D {
     if (existing) return existing;
 
     const root = new THREE.Group();
+    const body = new THREE.Group();
+    root.add(body);
+
     const bodyMaterial = new THREE.MeshStandardMaterial({
       color: PALETTE[colorIndex % PALETTE.length],
       roughness: 0.72,
@@ -383,14 +433,14 @@ export class Scene3D {
     hull.position.y = 1.15;
     hull.castShadow = true;
     hull.receiveShadow = true;
-    root.add(hull);
+    body.add(hull);
 
     for (const side of [-1, 1]) {
       const track = new THREE.Mesh(this.geo.track, this.trackMaterial);
-      track.position.set(side * 1.45, 0.5, 0);
+      track.position.set(side * TRACK_SIDE, 0.5, 0);
       track.castShadow = true;
       track.receiveShadow = true;
-      root.add(track);
+      body.add(track);
     }
 
     const turret = new THREE.Group();
@@ -412,7 +462,7 @@ export class Scene3D {
     barrel.castShadow = true;
     turret.add(barrel);
 
-    root.add(turret);
+    body.add(turret);
 
     this.scene.add(root);
 
@@ -435,9 +485,18 @@ export class Scene3D {
 
     const handle: TankHandle = {
       root,
+      body,
       turret,
       barrel,
       recoil: 0,
+      lastX: 0,
+      lastZ: 0,
+      lastYaw: 0,
+      speed: 0,
+      roll: 0,
+      pitch: 0,
+      trackDistance: 0,
+      dustDistance: 0,
       label,
       hpFill,
       // Читаем размеры один раз: offsetWidth каждый кадр заставлял бы браузер
@@ -813,6 +872,84 @@ export class Scene3D {
     }
   }
 
+  /**
+   * Ходовая часть: крен на повороте, клевок на разгоне и торможении, следы
+   * и пыль из-под траков. Всё считается из перемещения за кадр — своё,
+   * предсказанное, и чужое, интерполированное, приходят сюда одинаково.
+   */
+  private updateChassis(dt: number): void {
+    if (dt <= 0) return;
+    const k = 1 - Math.exp(-dt * LEAN_RATE);
+
+    for (const handle of this.tanks.values()) {
+      const x = handle.root.position.x;
+      const z = handle.root.position.z;
+      const yaw = handle.root.rotation.y;
+
+      const dx = x - handle.lastX;
+      const dz = z - handle.lastZ;
+      const yawDelta = wrapAngle(yaw - handle.lastYaw);
+      const step = Math.hypot(dx, dz);
+      handle.lastX = x;
+      handle.lastZ = z;
+      handle.lastYaw = yaw;
+
+      if (step > TELEPORT_STEP) {
+        handle.speed = 0;
+        handle.roll = 0;
+        handle.pitch = 0;
+        handle.trackDistance = 0;
+        handle.dustDistance = 0;
+        handle.body.rotation.set(0, 0, 0);
+        continue;
+      }
+
+      const forwardX = Math.sin(yaw);
+      const forwardZ = Math.cos(yaw);
+      // Знаковая скорость: проекция шага на курс. Задний ход выходит отрицательным,
+      // и танк на нём клюёт в другую сторону — как и должен.
+      const speed = (dx * forwardX + dz * forwardZ) / dt;
+      const accel = (speed - handle.speed) / dt;
+      handle.speed = speed;
+
+      const lean = bodyLean(yawDelta / dt, speed, accel);
+      handle.roll += (lean.roll - handle.roll) * k;
+      handle.pitch += (lean.pitch - handle.pitch) * k;
+      handle.body.rotation.z = handle.roll;
+      handle.body.rotation.x = handle.pitch;
+
+      // Подбитый не месит землю, а замаскированный не должен выдавать себя
+      // ни следом, ни облаком пыли за спиной.
+      if (!handle.alive || handle.cloaked || step === 0) continue;
+
+      handle.trackDistance += step;
+      handle.dustDistance += step;
+      const laysTrack = handle.trackDistance >= TRACK_STEP;
+      const raisesDust = handle.dustDistance >= DUST_STEP && Math.abs(speed) >= DUST_MIN_SPEED;
+      if (!laysTrack && !raisesDust) continue;
+      if (laysTrack) handle.trackDistance %= TRACK_STEP;
+      if (raisesDust) handle.dustDistance %= DUST_STEP;
+
+      for (const side of [-1, 1]) {
+        const at = trackAnchor(x, z, yaw, side);
+        if (laysTrack) this.tracks.emit(at.x, at.z, yaw, this.clock);
+        if (!raisesDust) continue;
+        // Пыль выбрасывает назад из-под трака и подбрасывает вверх.
+        this.dust.emit(
+          at.x,
+          0.25,
+          at.z,
+          -forwardX * 1.3 + (Math.random() - 0.5) * 1.4,
+          0.9 + Math.random() * 0.9,
+          -forwardZ * 1.3 + (Math.random() - 0.5) * 1.4,
+          // Метры, а не пиксели: шейдер сам растит клуб до 1.9 м к концу жизни.
+          0.55 + Math.random() * 0.45,
+          this.clock,
+        );
+      }
+    }
+  }
+
   /** Ствол уходит назад рывком и выходит обратно экспонентой — как накатник. */
   private updateRecoil(dt: number): void {
     const k = Math.exp(-dt * RECOIL_RETURN);
@@ -824,9 +961,13 @@ export class Scene3D {
   }
 
   render(dt: number): void {
+    this.clock += dt;
     this.updateEffects(dt);
     this.updateRecoil(dt);
+    this.updateChassis(dt);
     this.updateBonuses(dt);
+    this.tracks.update(this.clock);
+    this.dust.update(this.clock);
     this.renderer.render(this.scene, this.camera);
     this.updateLabels();
   }
@@ -876,5 +1017,7 @@ export class Scene3D {
     this.camera.aspect = width / height;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(width, height, false);
+    // Размер пылинки задан в метрах, а шейдер выдаёт пиксели устройства.
+    this.dust.setViewport(height * this.renderer.getPixelRatio(), this.camera.fov);
   };
 }
