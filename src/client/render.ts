@@ -7,9 +7,11 @@ import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPa
 import { MAX_HP, SHELL_HEIGHT } from '../shared/constants.js';
 import { wrapAngle } from '../shared/sim.js';
 import {
+  bodyKick,
   bodyLean,
   DEBRIS_FIELD,
   DUST_FIELD,
+  KICK_DECAY,
   ParticleField,
   trackAnchor,
   TrackMarks,
@@ -160,13 +162,27 @@ const RECOIL_RETURN = 8;
  * в упор фугас встряхивает по-настоящему.
  */
 const SHAKE_DECAY = 2.6;
-const SHAKE_AMPLITUDE = 0.6;
+const SHAKE_AMPLITUDE = 0.95;
 const SHAKE_FREQ = 21;
 
 // --- Ходовая: крен, следы, пыль ---
 
 /** Скорость подхода к целевому наклону корпуса. */
 const LEAN_RATE = 9;
+
+/**
+ * Толчок корпуса, рад: от своего выстрела и от прилетевшего снаряда. Оба заметно
+ * меньше LEAN_MAX (~6°): это удар, а не поза, и он должен читаться как вздрагивание,
+ * а не как отдельное положение танка.
+ */
+const SHOT_KICK = 0.045;
+const HIT_KICK = 0.06;
+/**
+ * Дальше этого взрыв ни с каким танком не связывается. Снаряд рвётся на границе
+ * круга цели — в 2.7 м от центра, — так что порог только отсекает взрывы о землю
+ * и стены рядом с танком, а не ищет цель по-настоящему.
+ */
+const HIT_KICK_RANGE = 4;
 
 /** Через сколько метров пути кладётся новый отпечаток. */
 const TRACK_STEP = 0.85;
@@ -223,6 +239,13 @@ export interface TankHandle {
   speed: number;
   roll: number;
   pitch: number;
+  /**
+   * Толчок от выстрела или попадания. Живёт отдельно от ходового крена и
+   * складывается с ним: крен — это положение корпуса на подвеске, толчок —
+   * удар поверх него, со своим затуханием.
+   */
+  kickRoll: number;
+  kickPitch: number;
   /** Пройденный путь с прошлого отпечатка и с прошлой пылинки, м. */
   trackDistance: number;
   dustDistance: number;
@@ -656,6 +679,8 @@ export class Scene3D {
       speed: 0,
       roll: 0,
       pitch: 0,
+      kickRoll: 0,
+      kickPitch: 0,
       trackDistance: 0,
       dustDistance: 0,
       paint: bodyMaterial,
@@ -1016,6 +1041,42 @@ export class Scene3D {
 
   boom(x: number, z: number, kind: BoomKind): void {
     this.spawnEffect(x, BOOM_HEIGHT[kind], z, BOOM_PRESETS[kind]);
+    if (kind === BOOM_HIT) this.tankHit(x, z);
+  }
+
+  /**
+   * Качнуть танк, в который прилетело. Кого именно задело, снапшот не сообщает —
+   * и не нужно: снаряд взрывается ровно на границе круга цели, то есть в 2.7 м
+   * от её центра, поэтому ближайший танк и есть тот самый. Заодно из места
+   * взрыва берётся направление удара, а его в сообщении не было бы.
+   *
+   * Только BOOM_HIT: взрыв гибели сервер ставит в центр танка, направления из
+   * него не вычесть, да и осанку остову всё равно задаёт сама гибель.
+   */
+  private tankHit(x: number, z: number): void {
+    let victim: TankHandle | null = null;
+    let best = HIT_KICK_RANGE;
+    for (const handle of this.tanks.values()) {
+      if (!handle.alive) continue;
+      const gap = Math.hypot(handle.root.position.x - x, handle.root.position.z - z);
+      if (gap < best) {
+        best = gap;
+        victim = handle;
+      }
+    }
+    if (!victim || best < 1e-3) return;
+
+    // Сила смотрит от места попадания внутрь танка — с той стороны он и вздёрнется.
+    const fx = (victim.root.position.x - x) / best;
+    const fz = (victim.root.position.z - z) / best;
+    const yaw = victim.root.rotation.y;
+    const kick = bodyKick(
+      fx * Math.sin(yaw) + fz * Math.cos(yaw),
+      fx * Math.cos(yaw) - fz * Math.sin(yaw),
+      HIT_KICK,
+    );
+    victim.kickRoll += kick.roll;
+    victim.kickPitch += kick.pitch;
   }
 
   /**
@@ -1030,6 +1091,14 @@ export class Scene3D {
     const handle = this.tanks.get(id);
     if (!handle) return false;
     handle.recoil = 1;
+
+    // Корпус качает отдачей: сила приходит с той стороны, куда смотрит ствол,
+    // и та сторона задирается. Считаем в осях корпуса, поэтому берём угол башни
+    // относительно него, а не мировой.
+    const gun = handle.turret.rotation.y;
+    const kick = bodyKick(-Math.cos(gun), -Math.sin(gun), SHOT_KICK);
+    handle.kickRoll += kick.roll;
+    handle.kickPitch += kick.pitch;
 
     // Замаскированный танк себя выстрелом не выдаёт: иначе бонус переставал бы
     // работать ровно в тот момент, ради которого его и брали.
@@ -1163,7 +1232,14 @@ export class Scene3D {
     if (dt <= 0) return;
     const k = 1 - Math.exp(-dt * LEAN_RATE);
 
+    // Толчок гаснет у всех и всегда: он поставлен в момент удара, и ветки
+    // «подбит» или «телепорт» ниже до него бы не дошли.
+    const kickLeft = Math.exp(-dt * KICK_DECAY);
+
     for (const handle of this.tanks.values()) {
+      handle.kickRoll *= kickLeft;
+      handle.kickPitch *= kickLeft;
+
       const x = handle.root.position.x;
       const z = handle.root.position.z;
       const yaw = handle.root.rotation.y;
@@ -1180,6 +1256,8 @@ export class Scene3D {
         handle.speed = 0;
         handle.roll = 0;
         handle.pitch = 0;
+        handle.kickRoll = 0;
+        handle.kickPitch = 0;
         handle.trackDistance = 0;
         handle.dustDistance = 0;
         handle.body.rotation.set(0, 0, 0);
@@ -1204,8 +1282,8 @@ export class Scene3D {
       const lean = bodyLean(yawDelta / dt, speed, accel);
       handle.roll += (lean.roll - handle.roll) * k;
       handle.pitch += (lean.pitch - handle.pitch) * k;
-      handle.body.rotation.z = handle.roll;
-      handle.body.rotation.x = handle.pitch;
+      handle.body.rotation.z = handle.roll + handle.kickRoll;
+      handle.body.rotation.x = handle.pitch + handle.kickPitch;
 
       // Замаскированный не должен выдавать себя ни следом, ни облаком пыли.
       if (handle.cloaked || step === 0) continue;

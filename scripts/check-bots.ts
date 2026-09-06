@@ -8,6 +8,7 @@
 import {
   BONUS_DAMAGE,
   BONUS_HEAL,
+  BONUS_HEAL_HP,
   BONUS_RELOAD,
   BONUS_SPEED,
   BONUS_STEALTH,
@@ -433,7 +434,7 @@ function dropOn(room: Room, player: Player, kind: number): void {
   dropOn(room, hero, BONUS_HEAL);
   run(room, 1);
   check('ремонт подобран', room.bonusCount === 0);
-  check('ремонт чинит до максимума', hero.hp === MAX_HP);
+  check('ремонт вернул здоровье', hero.hp === 30 + BONUS_HEAL_HP);
 
   hero.hp = MAX_HP - 10;
   dropOn(room, hero, BONUS_HEAL);

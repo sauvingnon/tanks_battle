@@ -113,15 +113,15 @@ const knownShells = new Set<number>();
  * расстоянии, так что отдельного «тряхнуть при уроне» не нужно.
  */
 const BOOM_SHAKE: Record<BoomKind, number> = {
-  [BOOM_GROUND]: 0.2,
-  [BOOM_HIT]: 0.32,
-  [BOOM_KILL]: 0.55,
-  [BOOM_RICOCHET]: 0.08,
+  [BOOM_GROUND]: 0.28,
+  [BOOM_HIT]: 0.45,
+  [BOOM_KILL]: 0.75,
+  [BOOM_RICOCHET]: 0.11,
 };
 /** Дальше этого взрыв уже не чувствуется, м. */
 const SHAKE_RANGE = 26;
 /** Отдача собственной пушки. Заметна, но целиться не мешает. */
-const SELF_SHOT_SHAKE = 0.3;
+const SELF_SHOT_SHAKE = 0.42;
 
 /** Своя перезарядка считается локально — она нужна только для полоски в HUD. */
 let reloadUntil = 0;

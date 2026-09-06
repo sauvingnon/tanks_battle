@@ -2,6 +2,7 @@
   BONUS_DAMAGE,
   BONUS_DAMAGE_MUL,
   BONUS_HEAL,
+  BONUS_HEAL_HP,
   BONUS_KINDS,
   BONUS_LIFETIME_S,
   BONUS_MAX,
@@ -608,9 +609,10 @@ export class Room {
 
   private applyBonus(player: Player, kind: number): void {
     if (kind === BONUS_HEAL) {
-      // Чиним полностью, а не на фиксированное число: максимум у бота свой,
-      // и прибавка в HP лечила бы его либо до потолка, либо мимо него.
-      player.hp = player.brain ? BOT_HP : MAX_HP;
+      // Потолок берётся по самому танку: у бота он свой, и общий MAX_HP вылечил
+      // бы его выше собственного максимума. Ящики боты не подбирают, но правило
+      // должно быть верным само по себе, а не за счёт того, что не срабатывает.
+      player.hp = Math.min(player.brain ? BOT_HP : MAX_HP, player.hp + BONUS_HEAL_HP);
     } else {
       // Второй ящик того же вида не складывается, а отсчитывает срок заново.
       player.fx[kind] = this.tick + Math.round(BONUS_DURATION_S[kind] * TICK_HZ);
