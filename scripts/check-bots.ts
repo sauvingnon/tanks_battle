@@ -351,7 +351,15 @@ for (let id = 0; id < MAP_NAMES.length; id++) {
   const room = new Room();
   const player = room.add('Игрок', noop);
   room.setup(MODE_PVE, 3, false);
-  run(room, 8 * TICK_HZ);
+  // Игрок неподвижен, а боты здесь тира «Ас»: за восемь секунд они его дожимают,
+  // забег кончается и карта чистится. Проверяем-то мы не это, поэтому держим
+  // его в строю — иначе проверка падала бы примерно раз в десять запусков.
+  for (let i = 0; i < 8 * TICK_HZ; i++) {
+    run(room, 1);
+    player.hp = MAX_HP;
+    player.dead = false;
+    player.waiting = false;
+  }
   check('сложность применилась', room.difficulty === 3);
   check('боты на карте есть', bots(room).length > 0);
 
@@ -564,14 +572,16 @@ function dropOn(room: Room, player: Player, kind: number): void {
 
 {
   const room = new Room();
-  const hero = room.add('Игрок', noop);
+  room.add('Игрок', noop);
   room.setup(MODE_PVE, 0, false);
   run(room, 8 * TICK_HZ);
 
   const bot = bots(room)[0];
   check('бот вышел с уменьшенным запасом здоровья', bot !== undefined && bot.hp === BOT_HP);
   check('бота убивают три попадания, а игрока четыре', Math.ceil(BOT_HP / SHELL_DAMAGE) === 3 && Math.ceil(MAX_HP / SHELL_DAMAGE) === 4);
-  check('у человека запас прежний', hero.hp === MAX_HP);
+  // Спрашиваем у того, кто только что зашёл: первый простоял под огнём восемь
+  // секунд, и его текущее здоровье говорит об удаче ботов, а не о запасе людей.
+  check('у человека запас прежний', room.add('Второй', noop).hp === MAX_HP);
 }
 
 // --- Манера боя: та же выучка, другая дистанция ---
@@ -586,14 +596,23 @@ function holdDistance(stance: number): number {
   room.setup(MODE_PVE, 1, false, 0, stance);
   hero.state = createTankState(0, 0, 0);
 
+  // Первые секунды боты едут от спавнов на краю карты — это дорога, а не манера.
+  const warmup = 10 * TICK_HZ;
   let sum = 0;
   let samples = 0;
-  for (let i = 0; i < 40 * TICK_HZ; i++) {
+  for (let i = 0; i < warmup + 40 * TICK_HZ; i++) {
     // Держим человека живым и на месте: меряем поведение ботов, а не бой.
     hero.hp = MAX_HP;
     hero.dead = false;
     hero.state = createTankState(0, 0, 0);
+    // И ботов тоже: их промахи прилетают друг в друга, квота волны утекает,
+    // и к концу прогона замер шёл бы по двум выжившим вместо полной карты.
+    for (const bot of bots(room)) {
+      bot.hp = BOT_HP;
+      bot.dead = false;
+    }
     run(room, 1);
+    if (i < warmup) continue;
     for (const bot of bots(room)) {
       sum += Math.hypot(bot.state.x, bot.state.z);
       samples++;
@@ -627,21 +646,19 @@ function holdDistance(stance: number): number {
 
 {
   const room = new Room();
-  const heroes = [
-    room.add('Первый', noop),
-    room.add('Второй', noop),
-    room.add('Третий', noop),
-    room.add('Четвёртый', noop),
-  ];
+  // Четверо людей: потолок одновременных ботов считается от их числа.
+  for (const name of ['Первый', 'Второй', 'Третий', 'Четвёртый']) room.add(name, noop);
   room.setup(MODE_PVE, 2, false);
 
-  // Замер должен идти при полной карте, поэтому людей держим бессмертными:
-  // иначе боты дожмут их, забег кончится и мерить будет нечего.
+  // Замер должен идти при полной карте, поэтому бессмертны здесь все. Люди —
+  // иначе боты дожмут их, забег кончится и мерить будет нечего. Боты — потому
+  // что промахи прилетают друг в друга: за минуту прогона квота волны утекала
+  // в чужие фраги, и на карте оставалось меньше десятка.
   const revive = () => {
-    for (const hero of heroes) {
-      hero.hp = MAX_HP;
-      hero.dead = false;
-      hero.waiting = false;
+    for (const tank of room.players.values()) {
+      tank.hp = MAX_HP;
+      tank.dead = false;
+      tank.waiting = false;
     }
   };
 

@@ -30,9 +30,12 @@ import { coverBoxes, MAP_NAMES } from '../shared/map.js';
 import { clamp, lerpAngle, sweepShell } from '../shared/sim.js';
 import type { RoomConfig, ServerMessage, WaveState } from '../shared/protocol.js';
 import {
+  BOOM_GROUND,
   BOOM_HIT,
   BOOM_KILL,
+  BOOM_RICOCHET,
   type Boom,
+  type BoomKind,
   type Box,
   type PlayerInfo,
   type ShellState,
@@ -96,6 +99,22 @@ const pendingBooms: Array<{ at: number; boom: Boom }> = [];
 
 /** id снарядов, которые мы уже видели: по новым рисуем вспышку выстрела. */
 const knownShells = new Set<number>();
+
+/**
+ * Насколько трясёт камеру, если рвануло вплотную; дальше сила падает линейно до
+ * нуля на SHAKE_RANGE. Прилетевшее в тебя попадание — это взрыв в нулевом
+ * расстоянии, так что отдельного «тряхнуть при уроне» не нужно.
+ */
+const BOOM_SHAKE: Record<BoomKind, number> = {
+  [BOOM_GROUND]: 0.2,
+  [BOOM_HIT]: 0.32,
+  [BOOM_KILL]: 0.55,
+  [BOOM_RICOCHET]: 0.08,
+};
+/** Дальше этого взрыв уже не чувствуется, м. */
+const SHAKE_RANGE = 26;
+/** Отдача собственной пушки. Заметна, но целиться не мешает. */
+const SELF_SHOT_SHAKE = 0.3;
 
 /** Своя перезарядка считается локально — она нужна только для полоски в HUD. */
 let reloadUntil = 0;
@@ -372,6 +391,10 @@ function frame(now: number): void {
         // иначе она поедет вдвое медленнее, чем пушка на самом деле готова.
         reloadSpan = RELOAD_S * 1000 * (hasEffect(myEffects, BONUS_RELOAD) ? BONUS_RELOAD_MUL : 1);
         reloadUntil = now + reloadSpan;
+        // Свой выстрел показываем сразу, не дожидаясь снапшота: та же перезарядка
+        // считается и на сервере, так что отказать он может только в спорный тик.
+        scene.tankFired(selfId);
+        scene.addShake(SELF_SHOT_SHAKE);
       }
 
       const input = self.step(controls.throttle, controls.steer, controls.yaw, wantFire);
@@ -397,6 +420,11 @@ function playBooms(now: number): void {
   while (pendingBooms.length > 0 && pendingBooms[0].at <= now) {
     const { boom } = pendingBooms.shift()!;
     scene.boom(boom.x, boom.z, boom.k);
+
+    const distance = Math.hypot(boom.x - selfX, boom.z - selfZ);
+    const near = 1 - distance / SHAKE_RANGE;
+    if (near > 0) scene.addShake(BOOM_SHAKE[boom.k] * near);
+
     // Отметка о попадании — только стрелявшему и только по живой цели.
     if (boom.o === selfId && (boom.k === BOOM_HIT || boom.k === BOOM_KILL)) showHitmarker();
   }
@@ -516,13 +544,17 @@ function drawShells(from: BufferedSnapshot, to: BufferedSnapshot, t: number): vo
   const list = to.shells.map((shell) => {
     const start = previous.get(shell.i);
     if (!start) {
-      // Первый кадр снаряда: показываем вспышку у ствола стрелявшего.
+      // Первый кадр снаряда: показываем выстрел у ствола стрелявшего. Свой уже
+      // отыгран в момент нажатия — второй раз его рисовать нечего.
       if (!knownShells.has(shell.i)) {
         knownShells.add(shell.i);
-        if (shell.o !== selfId) {
+        // Танк стрелявшего мог ещё не доехать сообщением joined; тогда остаётся
+        // вспышка по координатам снаряда, отмотанным назад к дульному срезу.
+        if (shell.o !== selfId && !scene.tankFired(shell.o)) {
           scene.muzzleFlash(
             shell.x - Math.sin(shell.a) * MUZZLE_OFFSET * 0.25,
             shell.z - Math.cos(shell.a) * MUZZLE_OFFSET * 0.25,
+            shell.a,
           );
         }
       }

@@ -20,8 +20,6 @@ export const BONUS_COLORS = [0x6ad46a, 0xff7a4d, 0xffd24d, 0x4db8ff, 0xb388ff];
 /** На какой высоте висит ящик над землёй. */
 const BONUS_HOVER = 1.7;
 
-const UP = new THREE.Vector3(0, 1, 0);
-
 const CAMERA_DISTANCE = 15;
 const CAMERA_BASE_HEIGHT = 3.4;
 
@@ -39,15 +37,29 @@ const LABEL_HEIGHT = 3.7;
 /** Дальше этого ники не рисуем — всё равно нечитаемо, а DOM грузится. */
 const LABEL_MAX_DISTANCE = 160;
 
-/** Как выглядит взрыв каждого вида: радиус, время жизни, цвет и есть ли кольцо по земле. */
-const BOOM_PRESETS: Record<BoomKind, { radius: number; life: number; color: number; ring: boolean }> =
-  {
-    [BOOM_GROUND]: { radius: 1.6, life: 0.34, color: 0xffb257, ring: false },
-    [BOOM_HIT]: { radius: 2.2, life: 0.4, color: 0xffd27a, ring: false },
-    [BOOM_KILL]: { radius: 4.2, life: 0.75, color: 0xff8a3c, ring: true },
-    // Рикошет — короткая белая искра: снаряд жив и полетел дальше, взрыва не было.
-    [BOOM_RICOCHET]: { radius: 0.9, life: 0.16, color: 0xfff4c8, ring: false },
-  };
+/**
+ * Как выглядит вспышка: radius — размер шара, life — сколько живёт, ring — кольцо
+ * по земле, cone — длина направленного языка пламени, rise — с какой скоростью
+ * всплывает (для дыма), grow — насколько разрастается, alpha — стартовая плотность.
+ */
+interface EffectPreset {
+  radius: number;
+  life: number;
+  color: number;
+  ring?: boolean;
+  cone?: number;
+  rise?: number;
+  grow?: number;
+  alpha?: number;
+}
+
+const BOOM_PRESETS: Record<BoomKind, EffectPreset> = {
+  [BOOM_GROUND]: { radius: 1.6, life: 0.34, color: 0xffb257 },
+  [BOOM_HIT]: { radius: 2.2, life: 0.4, color: 0xffd27a },
+  [BOOM_KILL]: { radius: 4.2, life: 0.75, color: 0xff8a3c, ring: true },
+  // Рикошет — короткая белая искра: снаряд жив и полетел дальше, взрыва не было.
+  [BOOM_RICOCHET]: { radius: 0.9, life: 0.16, color: 0xfff4c8 },
+};
 
 /** На какой высоте рвануло: у земли, по корпусу танка или на высоте полёта снаряда. */
 const BOOM_HEIGHT: Record<BoomKind, number> = {
@@ -57,12 +69,58 @@ const BOOM_HEIGHT: Record<BoomKind, number> = {
   [BOOM_RICOCHET]: SHELL_HEIGHT,
 };
 
-/** Вспышка у дульного среза, когда стреляет чужой танк. */
-const MUZZLE_PRESET = { radius: 1.1, life: 0.12, color: 0xfff0c0, ring: false };
+/**
+ * Вспышка у дульного среза. Она короче любого взрыва — её задача не «гореть»,
+ * а отметить кадр выстрела: длинный факел смазывается в кашу и читается как взрыв.
+ */
+const MUZZLE_PRESET: EffectPreset = { radius: 0.85, life: 0.085, color: 0xfff3d0, cone: 4 };
+
+/**
+ * Дым от выстрела: всплывает и расплывается. Держим его редким и небольшим —
+ * своя пушка стоит прямо на линии взгляда, и плотное облако закрывало бы цель
+ * ровно на перезарядку.
+ */
+const MUZZLE_SMOKE: EffectPreset = {
+  radius: 0.85,
+  life: 0.7,
+  color: 0x7d7568,
+  rise: 1.3,
+  grow: 2,
+  alpha: 0.26,
+};
+
+/** Длина трассера за снарядом, м. */
+const TRACER_LENGTH = 6;
+
+// --- Отдача ствола ---
+
+/** Штатное положение ствола внутри башни по оси Z. */
+const BARREL_Z = 2.3;
+/** Дульный срез в координатах башни: ствол длиной 3 стоит центром на BARREL_Z. */
+const MUZZLE_TIP_Z = BARREL_Z + 1.5;
+/** На сколько метров ствол уходит назад в момент выстрела. */
+const RECOIL_BACK = 0.62;
+/** Скорость возврата: ствол откатывается рывком, а выходит обратно плавно. */
+const RECOIL_RETURN = 8;
+
+// --- Тряска камеры ---
+
+/**
+ * Тряска живёт одним числом «встряски» 0..1, которое затухает. Сила берётся как
+ * его квадрат: близкие мелкие толчки тогда почти не мешают целиться, а прилетевший
+ * в упор фугас встряхивает по-настоящему.
+ */
+const SHAKE_DECAY = 2.6;
+const SHAKE_AMPLITUDE = 0.6;
+const SHAKE_FREQ = 21;
 
 export interface TankHandle {
   root: THREE.Group;
   turret: THREE.Group;
+  /** Ствол ходит отдельно от башни: по нему играется откат. */
+  barrel: THREE.Mesh;
+  /** Остаток отката, 1 в момент выстрела и 0 в покое. */
+  recoil: number;
   label: HTMLElement;
   hpFill: HTMLElement;
   /** Размеры подписи в пикселях, замеряются один раз — текст не меняется. */
@@ -77,7 +135,8 @@ export interface TankHandle {
 }
 
 interface ShellHandle {
-  mesh: THREE.Mesh;
+  /** Снаряд и его трассер ездят вместе, поэтому это группа, а не меш. */
+  group: THREE.Group;
   /** Помечается каждый кадр: непомеченные снаряды сервер больше не присылает. */
   seen: boolean;
 }
@@ -86,9 +145,14 @@ interface Effect {
   group: THREE.Group;
   flash: THREE.Mesh;
   ring: THREE.Mesh;
+  /** Направленный язык пламени; у взрывов выключен. */
+  cone: THREE.Mesh;
   life: number;
   duration: number;
   radius: number;
+  rise: number;
+  grow: number;
+  alpha: number;
 }
 
 export class Scene3D {
@@ -101,7 +165,7 @@ export class Scene3D {
   private readonly renderer: THREE.WebGLRenderer;
   private readonly tanks = new Map<number, TankHandle>();
   private readonly shells = new Map<number, ShellHandle>();
-  private readonly shellPool: THREE.Mesh[] = [];
+  private readonly shellPool: THREE.Group[] = [];
   private readonly effects: Effect[] = [];
   private readonly effectPool: Effect[] = [];
 
@@ -121,6 +185,10 @@ export class Scene3D {
     flash: new THREE.SphereGeometry(1, 12, 10),
     ring: new THREE.RingGeometry(0.72, 1, 28),
     bonus: new THREE.BoxGeometry(1.7, 1.7, 1.7),
+    // Оба конуса единичной высоты и без донышка: длину задаёт масштаб, а крышка
+    // светящегося конуса выглядела бы как приклеенный к снаряду диск.
+    cone: new THREE.ConeGeometry(0.5, 1, 10, 1, true),
+    tracer: new THREE.ConeGeometry(0.32, 1, 8, 1, true),
   };
 
   /** Цвет ящика по виду бонуса: тот же порядок, что и в BONUS_NAMES. */
@@ -142,6 +210,18 @@ export class Scene3D {
   /** Снаряд светится сам: он мелкий и должен читаться на любом фоне. */
   private readonly shellMaterial = new THREE.MeshBasicMaterial({ color: 0xffd27a });
 
+  /**
+   * Трассер складывается со светом сцены, а не перекрывает его, и не пишет в
+   * буфер глубины: иначе полупрозрачный хвост вырезал бы дыру в том, что за ним.
+   */
+  private readonly tracerMaterial = new THREE.MeshBasicMaterial({
+    color: 0xff9d3a,
+    transparent: true,
+    opacity: 0.4,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+  });
+
   private readonly trackMaterial = new THREE.MeshStandardMaterial({
     color: 0x23262b,
     roughness: 0.95,
@@ -154,6 +234,17 @@ export class Scene3D {
 
   private readonly cameraTarget = new THREE.Vector3();
   private cameraReady = false;
+  /**
+   * Сглаженная высота камеры держится отдельно от camera.position.y: тряска пишет
+   * в позицию, и если бы догонялка читала её же, камера гонялась бы за собственным
+   * дрожанием и всплывала вверх на каждом залпе.
+   */
+  private cameraHeight = 0;
+  private trauma = 0;
+  private shakeTime = 0;
+
+  /** Рабочие векторы для дульной вспышки: считается она несколько раз в секунду. */
+  private readonly muzzlePoint = new THREE.Vector3();
 
   constructor(
     private readonly canvas: HTMLCanvasElement,
@@ -317,7 +408,7 @@ export class Scene3D {
 
     const barrel = new THREE.Mesh(this.geo.barrel, this.metalMaterial);
     barrel.rotation.x = Math.PI / 2;
-    barrel.position.set(0, 0.36, 2.3);
+    barrel.position.set(0, 0.36, BARREL_Z);
     barrel.castShadow = true;
     turret.add(barrel);
 
@@ -345,6 +436,8 @@ export class Scene3D {
     const handle: TankHandle = {
       root,
       turret,
+      barrel,
+      recoil: 0,
       label,
       hpFill,
       // Читаем размеры один раз: offsetWidth каждый кадр заставлял бы браузер
@@ -429,21 +522,44 @@ export class Scene3D {
     const desiredZ = z - Math.cos(yaw) * distance;
 
     if (!this.cameraReady) {
-      this.camera.position.set(desiredX, height, desiredZ);
+      this.cameraHeight = height;
       this.cameraReady = true;
     } else {
-      // По горизонтали камера жёстко привязана к танку: позиция танка уже
-      // интерполирована и сглажена, а второй слой догонялки поверх первого давал
-      // качание влево-вправо на скорости.
-      this.camera.position.x = desiredX;
-      this.camera.position.z = desiredZ;
       // Высоту сглаживаем: её меняет только колесо обзора, рывков от движения нет.
-      const k = 1 - Math.exp(-dt * 14);
-      this.camera.position.y += (height - this.camera.position.y) * k;
+      this.cameraHeight += (height - this.cameraHeight) * (1 - Math.exp(-dt * 14));
     }
+    // По горизонтали камера жёстко привязана к танку: позиция танка уже
+    // интерполирована и сглажена, а второй слой догонялки поверх первого давал
+    // качание влево-вправо на скорости.
+    this.camera.position.set(desiredX, this.cameraHeight, desiredZ);
 
+    // Цель взгляда не трясётся вместе с камерой: смещаем только точку съёмки,
+    // и толчок выходит поворотом кадра, а не сползанием прицела с танка.
     this.cameraTarget.set(x, 2.2, z);
+    this.applyShake(dt);
     this.camera.lookAt(this.cameraTarget);
+  }
+
+  /**
+   * Толчок камеры. Копится «встряской» 0..1 — сложить два события можно, но выше
+   * единицы она не уйдёт, поэтому залп в упор не выбивает кадр за пределы экрана.
+   */
+  addShake(amount: number): void {
+    this.trauma = Math.min(1, this.trauma + amount);
+  }
+
+  private applyShake(dt: number): void {
+    if (this.trauma <= 0) return;
+    this.trauma = Math.max(0, this.trauma - dt * SHAKE_DECAY);
+    this.shakeTime += dt;
+
+    // Три несоизмеримые частоты вместо случайных чисел: покадровый шум на 144 Гц
+    // читается как рябь картинки, а не как удар.
+    const t = this.shakeTime * SHAKE_FREQ;
+    const power = this.trauma * this.trauma * SHAKE_AMPLITUDE;
+    this.camera.position.x += Math.sin(t * 1.7) * power;
+    this.camera.position.y += Math.sin(t * 2.3 + 1.1) * power;
+    this.camera.position.z += Math.sin(t * 1.3 + 2.7) * power;
   }
 
   /**
@@ -471,25 +587,42 @@ export class Scene3D {
     for (const shell of list) {
       let handle = this.shells.get(shell.id);
       if (!handle) {
-        const mesh = this.shellPool.pop() ?? new THREE.Mesh(this.geo.shell, this.shellMaterial);
-        mesh.visible = true;
-        this.scene.add(mesh);
-        handle = { mesh, seen: true };
+        const group = this.shellPool.pop() ?? this.createShell();
+        this.scene.add(group);
+        handle = { group, seen: true };
         this.shells.set(shell.id, handle);
       }
       handle.seen = true;
-      handle.mesh.position.set(shell.x, SHELL_HEIGHT, shell.z);
-      // Капсула стоит вдоль Y — кладём её вдоль полёта.
-      handle.mesh.rotation.set(Math.PI / 2, 0, 0);
-      handle.mesh.rotateOnWorldAxis(UP, shell.angle);
+      handle.group.position.set(shell.x, SHELL_HEIGHT, shell.z);
+      // Группа собрана вдоль своего +Z, а угол 0 в игре смотрит в мировой +Z.
+      handle.group.rotation.y = shell.angle;
     }
 
     for (const [id, handle] of this.shells) {
       if (handle.seen) continue;
-      this.scene.remove(handle.mesh);
-      this.shellPool.push(handle.mesh);
+      this.scene.remove(handle.group);
+      this.shellPool.push(handle.group);
       this.shells.delete(id);
     }
+  }
+
+  /** Снаряд: светящееся тело и трассер, вытянутый назад по ходу полёта. */
+  private createShell(): THREE.Group {
+    const group = new THREE.Group();
+
+    const core = new THREE.Mesh(this.geo.shell, this.shellMaterial);
+    core.rotation.x = Math.PI / 2; // капсула стоит вдоль Y — кладём её вдоль полёта
+    group.add(core);
+
+    // Конус растёт вдоль своего +Y, поворот на -90° уводит остриё назад, в -Z:
+    // хвост сходит на нет позади снаряда, а широким концом сидит на нём.
+    const tracer = new THREE.Mesh(this.geo.tracer, this.tracerMaterial);
+    tracer.rotation.x = -Math.PI / 2;
+    tracer.scale.set(1, TRACER_LENGTH, 1);
+    tracer.position.z = -TRACER_LENGTH / 2;
+    group.add(tracer);
+
+    return group;
   }
 
   clearShells(): void {
@@ -544,31 +677,68 @@ export class Scene3D {
   // --- Взрывы ---
 
   boom(x: number, z: number, kind: BoomKind): void {
-    this.spawnEffect(x, z, BOOM_PRESETS[kind], BOOM_HEIGHT[kind]);
+    this.spawnEffect(x, BOOM_HEIGHT[kind], z, BOOM_PRESETS[kind]);
   }
 
-  /** Вспышка выстрела: рисуем её у дульного среза чужого танка. */
-  muzzleFlash(x: number, z: number): void {
-    this.spawnEffect(x, z, MUZZLE_PRESET, SHELL_HEIGHT);
+  /**
+   * Танк выстрелил: откат ствола, вспышка и дым у самого дульного среза.
+   * Точку берём из матрицы башни, а не из места, где снаряд оказался к первому
+   * снапшоту: тот к этому моменту улетел на пару метров, и вспышка висела в воздухе.
+   *
+   * Возвращает false, если танка на сцене нет, — вызывающему остаётся рисовать
+   * вспышку по координатам снаряда.
+   */
+  tankFired(id: number): boolean {
+    const handle = this.tanks.get(id);
+    if (!handle) return false;
+    handle.recoil = 1;
+
+    // Замаскированный танк себя выстрелом не выдаёт: иначе бонус переставал бы
+    // работать ровно в тот момент, ради которого его и брали.
+    if (!handle.alive || handle.cloaked) return true;
+
+    // Матрицу считает рендер, то есть в ней прошлый кадр; обновляем вручную,
+    // иначе вспышка отстаёт от башни на кадр при быстром довороте.
+    handle.turret.updateWorldMatrix(true, false);
+    const point = handle.turret.localToWorld(this.muzzlePoint.set(0, 0.36, MUZZLE_TIP_Z));
+    // Ствол смотрит вдоль +Z башни, а башня крутится только вокруг вертикали.
+    const angle = handle.root.rotation.y + handle.turret.rotation.y;
+
+    this.spawnEffect(point.x, point.y, point.z, MUZZLE_PRESET, angle);
+    this.spawnEffect(point.x, point.y, point.z, MUZZLE_SMOKE, angle);
+    return true;
   }
 
-  private spawnEffect(
-    x: number,
-    z: number,
-    preset: { radius: number; life: number; color: number; ring: boolean },
-    height: number,
-  ): void {
+  /** Запасная вспышка по координатам: танк ещё не доехал до клиента сообщением. */
+  muzzleFlash(x: number, z: number, angle: number): void {
+    this.spawnEffect(x, SHELL_HEIGHT, z, MUZZLE_PRESET, angle);
+  }
+
+  private spawnEffect(x: number, y: number, z: number, preset: EffectPreset, angle = 0): void {
     const fx = this.effectPool.pop() ?? this.createEffect();
-    fx.group.position.set(x, height, z);
+    fx.group.position.set(x, y, z);
+    fx.group.rotation.y = angle;
     fx.group.visible = true;
     fx.life = preset.life;
     fx.duration = preset.life;
     fx.radius = preset.radius;
-    (fx.flash.material as THREE.MeshBasicMaterial).color.setHex(preset.color);
-    (fx.ring.material as THREE.MeshBasicMaterial).color.setHex(preset.color);
-    fx.ring.visible = preset.ring;
+    fx.rise = preset.rise ?? 0;
+    fx.grow = preset.grow ?? 0.85;
+    fx.alpha = preset.alpha ?? 0.9;
+
+    for (const mesh of [fx.flash, fx.ring, fx.cone]) {
+      (mesh.material as THREE.MeshBasicMaterial).color.setHex(preset.color);
+    }
+    fx.ring.visible = preset.ring === true;
     // Кольцо стелется по земле независимо от того, на какой высоте рвануло.
-    fx.ring.position.y = 0.15 - height;
+    fx.ring.position.y = 0.15 - y;
+
+    fx.cone.visible = preset.cone !== undefined;
+    if (preset.cone !== undefined) {
+      fx.cone.scale.set(1, preset.cone, 1);
+      fx.cone.position.z = preset.cone / 2;
+    }
+
     this.effects.push(fx);
   }
 
@@ -593,8 +763,23 @@ export class Scene3D {
     ring.rotation.x = -Math.PI / 2;
     group.add(ring);
 
+    // Язык пламени бьёт вдоль +Z группы, то есть туда же, куда ушёл снаряд.
+    // Поворот на -90° ставит остриё конуса в сторону -Z: вместе со сдвигом на
+    // половину длины остриё садится ровно на дульный срез, а раструб уходит вперёд.
+    const cone = new THREE.Mesh(
+      this.geo.cone,
+      new THREE.MeshBasicMaterial({
+        transparent: true,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+        blending: THREE.AdditiveBlending,
+      }),
+    );
+    cone.rotation.x = -Math.PI / 2;
+    group.add(cone);
+
     this.scene.add(group);
-    return { group, flash, ring, life: 0, duration: 1, radius: 1 };
+    return { group, flash, ring, cone, life: 0, duration: 1, radius: 1, rise: 0, grow: 0.85, alpha: 0.9 };
   }
 
   private updateEffects(dt: number): void {
@@ -610,10 +795,17 @@ export class Scene3D {
 
       const t = 1 - fx.life / fx.duration; // 0 в момент взрыва, 1 в конце
       const fade = (1 - t) * (1 - t);
+      if (fx.rise !== 0) fx.group.position.y += fx.rise * dt;
 
-      const scale = fx.radius * (0.35 + t * 0.85);
+      const scale = fx.radius * (0.35 + t * fx.grow);
       fx.flash.scale.setScalar(scale);
-      (fx.flash.material as THREE.MeshBasicMaterial).opacity = fade * 0.9;
+      (fx.flash.material as THREE.MeshBasicMaterial).opacity = fade * fx.alpha;
+
+      if (fx.cone.visible) {
+        // Язык пламени только гаснет: растягивать его вслед за вспышкой нельзя —
+        // он тут же дотянулся бы до стены, в которую стреляют в упор.
+        (fx.cone.material as THREE.MeshBasicMaterial).opacity = fade * 0.8;
+      }
 
       if (!fx.ring.visible) continue;
       fx.ring.scale.setScalar(fx.radius * (0.4 + t * 2.4));
@@ -621,8 +813,19 @@ export class Scene3D {
     }
   }
 
+  /** Ствол уходит назад рывком и выходит обратно экспонентой — как накатник. */
+  private updateRecoil(dt: number): void {
+    const k = Math.exp(-dt * RECOIL_RETURN);
+    for (const handle of this.tanks.values()) {
+      if (handle.recoil <= 0) continue;
+      handle.recoil = handle.recoil * k < 0.01 ? 0 : handle.recoil * k;
+      handle.barrel.position.z = BARREL_Z - handle.recoil * RECOIL_BACK;
+    }
+  }
+
   render(dt: number): void {
     this.updateEffects(dt);
+    this.updateRecoil(dt);
     this.updateBonuses(dt);
     this.renderer.render(this.scene, this.camera);
     this.updateLabels();
