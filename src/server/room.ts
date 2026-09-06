@@ -374,6 +374,16 @@ export class Room {
       // Пауза общая на танк, а не на пару: иначе в свалке трое разом снимали бы
       // с одного полный урон каждый тик, и таран решал бы бой без единого выстрела.
       if (this.tick < a.ramAt || this.tick < b.ramAt) continue;
+
+      // Урон округляем: физика считает его непрерывно от скорости сближения, а
+      // здоровье — целое число, которое игрок читает с полоски. Дробные остатки
+      // ничего не решают и только превращают понятный размен в «87.3 из 100».
+      const toA = Math.round(hit.damageA);
+      const toB = Math.round(hit.damageB);
+      // Совсем слабый контакт округлился в ноль — это не таран, и паузу он
+      // тратить не должен: иначе им можно было бы прикрыться от настоящего.
+      if (toA === 0 && toB === 0) continue;
+
       a.ramAt = this.tick + RAM_COOLDOWN_TICKS;
       b.ramAt = this.tick + RAM_COOLDOWN_TICKS;
 
@@ -381,8 +391,8 @@ export class Room {
       // таран — это размен, а не очередь. Имена берём заранее по той же причине.
       const nameA = a.name;
       const nameB = b.name;
-      this.hurt(a, hit.damageA, b.id, nameB);
-      this.hurt(b, hit.damageB, a.id, nameA);
+      if (toA > 0) this.hurt(a, toA, b.id, nameB);
+      if (toB > 0) this.hurt(b, toB, a.id, nameA);
     }
   }
 
