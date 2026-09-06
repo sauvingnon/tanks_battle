@@ -77,6 +77,122 @@ export const RESPAWN_S = 4;
 /** Потолок числа снарядов в мире — страховка, а не игровое ограничение. */
 export const MAX_SHELLS = 120;
 
+// --- Режимы ---
+
+/** Все против всех: бесконечная перестрелка, respawn через RESPAWN_S. */
+export const MODE_DM = 'dm';
+/** Все против ботов: волны, одна жизнь на волну. */
+export const MODE_PVE = 'pve';
+export type GameMode = typeof MODE_DM | typeof MODE_PVE;
+
+export function isMode(v: unknown): v is GameMode {
+  return v === MODE_DM || v === MODE_PVE;
+}
+
+/** Четыре уровня сложности; индекс — он же стартовый тир ботов. */
+export const DIFFICULTY_NAMES = ['Новичок', 'Средний', 'Ветеран', 'Ас'];
+export const MAX_TIER = DIFFICULTY_NAMES.length - 1;
+
+// --- Волны ---
+
+/**
+ * Потолок ботов на карте. Считаны они дёшево, но 12 танков на 140-метровом
+ * квадрате — уже толчея, дальше волна растёт не числом, а тиром.
+ */
+export const BOT_LIMIT = 12;
+
+/** Сколько ботов всего выйдет за волну N (нумерация с 1). */
+export function waveQuota(wave: number): number {
+  return 4 + 2 * (wave - 1);
+}
+
+/**
+ * Сколько ботов приходится на одного живого человека. На карте в 140 метров
+ * четверо, доехавших до тебя разом, побеждают не игрой, а числом: увернуться
+ * уже негде. Поэтому карту наполняем по числу игроков, а волна растёт квотой
+ * и выучкой противника, а не толпой.
+ */
+export const BOTS_PER_HUMAN = 3;
+
+/** Сколько ботов волны N живут на карте одновременно: квота выпускается порциями. */
+export function waveConcurrent(wave: number, humans: number): number {
+  return Math.max(1, Math.min(BOT_LIMIT, 4 + wave, humans * BOTS_PER_HUMAN));
+}
+
+/**
+ * Тир ботов волны N при выбранной сложности. Ботов больше 12 не станет,
+ * поэтому после середины забега волна усиливается только качеством противника.
+ */
+export function waveTier(wave: number, difficulty: number): number {
+  return Math.min(MAX_TIER, difficulty + Math.floor((wave - 1) / WAVE_TIER_STEP));
+}
+
+/** Через сколько волн тир поднимается на ступень. */
+export const WAVE_TIER_STEP = 2;
+
+/**
+ * Доля «элиты» в волне — ботов на тир выше остальных. Растёт с номером волны,
+ * чтобы усиление шло плавно, а не ступенькой раз в две волны.
+ */
+export function waveElite(wave: number): number {
+  return Math.min(0.5, (wave - 1) * 0.06);
+}
+
+/** Пауза между появлением соседних ботов волны, с. */
+export const WAVE_SPAWN_DELAY_S = 2.2;
+/** Первые двое выходят почти сразу, иначе волна начинается с пустой карты. */
+export const WAVE_OPENING_BOTS = 2;
+/** Передышка между волнами: в ней возрождаются все павшие союзники, с. */
+export const WAVE_BREAK_S = 5;
+/** Сколько висит экран проигрыша до автоматического рестарта с первой волны, с. */
+export const WAVE_OVER_S = 8;
+
+// --- Бонусы ---
+
+/**
+ * Ящики на карте: подъехал — усилился. Включаются хостом и работают в обоих режимах.
+ * Виды идут индексами: они же — биты в маске активных эффектов в снапшоте.
+ */
+export const BONUS_HEAL = 0;
+export const BONUS_DAMAGE = 1;
+export const BONUS_RELOAD = 2;
+export const BONUS_SPEED = 3;
+export const BONUS_STEALTH = 4;
+export const BONUS_KINDS = 5;
+
+export const BONUS_NAMES = ['Ремонт', 'Урон', 'Заряжание', 'Ход', 'Маскировка'];
+
+/** Сколько HP возвращает «Ремонт». Действует мгновенно, поэтому длительности нет. */
+export const BONUS_HEAL_HP = 50;
+/** Урон снаряда 25 -> 40. */
+export const BONUS_DAMAGE_MUL = 1.6;
+/** Перезарядка 1.6 -> 0.8 с. */
+export const BONUS_RELOAD_MUL = 0.5;
+/** Максимальная скорость и разгон +40%. */
+export const BONUS_SPEED_MUL = 1.4;
+/**
+ * Дальше этого замаскированный танк не подписан ником и не берётся ботами в цель.
+ * Не невидимость: вплотную его видно, иначе бонус превращался бы в неуязвимость.
+ */
+export const BONUS_STEALTH_RANGE = 22;
+
+/** Сколько держится эффект каждого вида, с. У «Ремонта» длительности нет. */
+export const BONUS_DURATION_S = [0, 20, 20, 20, 15];
+
+/** Как часто на карте появляется новый ящик, с. */
+export const BONUS_SPAWN_S = 12;
+/** Сколько ящиков лежит одновременно. */
+export const BONUS_MAX = 5;
+/** Радиус подбора, м. */
+export const BONUS_RADIUS = 3.2;
+/** Сколько ящик лежит, если его не подобрали, с. */
+export const BONUS_LIFETIME_S = 45;
+
+/** Активен ли эффект в маске снапшота. */
+export function hasEffect(mask: number, kind: number): boolean {
+  return (mask & (1 << kind)) !== 0;
+}
+
 // --- Сеть ---
 export const MAX_NAME_LEN = 16;
 /** Максимум инпутов в очереди игрока (защита от «ускорения» пачкой пакетов). */
