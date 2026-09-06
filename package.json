@@ -18,6 +18,7 @@
     "check:smoothness": "tsx scripts/check-smoothness.ts",
     "check:combat": "tsx scripts/check-combat.ts",
     "check:bots": "tsx scripts/check-bots.ts",
+    "bench:pve": "tsx scripts/bench-pve.ts",
     "smoke": "node scripts/smoke.mjs"
   },
   "dependencies": {

@@ -17,7 +17,10 @@
   DT,
   MAP_HALF,
   MAX_BOUNCES,
+  BOT_HP,
   MAX_HP,
+  STANCE_NEUTRAL,
+  isStance,
   MAX_INPUT_QUEUE,
   MAX_NAME_LEN,
   MAX_SHELLS,
@@ -147,6 +150,12 @@ export class Room {
    * и подпись «со следующей волны» врала бы.
    */
   runDifficulty = 1;
+  /**
+   * Манера боя ботов. Ручка, независимая от сложности: та отвечает за выучку,
+   * эта — за дистанцию и за право лезть в упор. Читается ИИ каждый тик, поэтому
+   * переключение действует сразу, не дожидаясь новой волны.
+   */
+  stance = STANCE_NEUTRAL;
   /** Ящики с усилениями на карте. Работают в обоих режимах. */
   bonusesOn = false;
   hostId = 0;
@@ -347,7 +356,7 @@ export class Room {
         hp: bot.hp,
         brain: bot.brain!,
       },
-      { tick: this.tick, obstacles: this.obstacles, tanks: this.tanks },
+      { tick: this.tick, obstacles: this.obstacles, tanks: this.tanks, stance: this.stance },
     );
     stepTank(bot.state, bot.last, DT, this.obstacles);
     if (bot.last.fire) {
@@ -489,7 +498,7 @@ export class Room {
   private respawn(player: Player): void {
     const spawn = spawnPoint(this.spawnCounter++, this.mapId);
     player.state = createTankState(spawn.x, spawn.z, spawn.angle);
-    player.hp = MAX_HP;
+    player.hp = player.brain ? BOT_HP : MAX_HP;
     player.dead = false;
     player.readyAt = this.tick;
     // seq не сбрасываем: клиент продолжает свою нумерацию, ack должен остаться в её шкале.
@@ -613,10 +622,12 @@ export class Room {
     difficulty: number | undefined,
     bonuses: boolean | undefined,
     map?: number,
+    stance?: number,
   ): void {
     if (typeof difficulty === 'number' && Number.isFinite(difficulty)) {
       this.difficulty = clamp(Math.round(difficulty), 0, MAX_TIER);
     }
+    if (isStance(stance)) this.stance = stance;
     if (typeof bonuses === 'boolean' && bonuses !== this.bonusesOn) {
       this.bonusesOn = bonuses;
       // Выключили — карта и все действующие усиления чистятся сразу.
@@ -685,7 +696,9 @@ export class Room {
     }
 
     const alive = this.botCount;
-    const room = waveConcurrent(this.wave, this.humanCount);
+    // Толпа растёт по той же лестнице, что и выучка: иначе на «Новичке» поздние
+    // волны по 20 ботов ползли бы по двое и превращались в тир.
+    const room = waveConcurrent(this.wave, this.humanCount, waveTier(this.wave, this.runDifficulty));
     if (this.quotaLeft > 0 && alive < room && this.tick >= this.spawnAt) {
       this.spawnBot();
     } else if (this.quotaLeft === 0 && alive === 0) {
@@ -746,6 +759,7 @@ export class Room {
       NO_SEND,
     );
     bot.brain = createBrain(tier, this.tick, index);
+    bot.hp = BOT_HP;
     this.players.set(bot.id, bot);
     this.emit({ t: 'joined', player: this.info(bot) });
 
@@ -809,6 +823,7 @@ export class Room {
       difficulty: this.difficulty,
       // Что реально в силе прямо сейчас: в бою это может отставать от выбора хоста.
       active: this.mode === MODE_PVE && this.phase === 'fight' ? this.runDifficulty : this.difficulty,
+      stance: this.stance,
       bonuses: this.bonusesOn,
       hostId: this.hostId,
     };

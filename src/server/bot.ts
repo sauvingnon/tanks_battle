@@ -8,8 +8,11 @@
  */
 import {
   BONUS_STEALTH_RANGE,
+  BOT_HP,
+  STANCE_COUNT,
+  STANCE_NEUTRAL,
   MAX_BOUNCES,
-  MAX_HP,
+  RELOAD_S,
   SHELL_LIFETIME,
   SHELL_SPEED,
   TANK_RADIUS,
@@ -53,6 +56,19 @@ export interface BotTier {
   /** Дистанция, на которой предпочитает драться, м. */
   range: number;
   /**
+   * Ближе этого не подходит тот, кому не досталось слота наседающего. Дистанция
+   * и есть половина сложности: ошибка прицела в радианах на 45 м промахивается
+   * вдвое дальше, чем на 25, поэтому «робкий» бот и мажет заметно чаще.
+   */
+  keep: number;
+  /**
+   * Пауза сверх перезарядки, с. Орудие готово — но новичок ещё возит стволом,
+   * прежде чем выстрелить. Единственный способ развести уровни по темпу огня:
+   * перезарядка у всех общая, а втроём по тебе стреляют втрое чаще, и никакая
+   * точность этого перевеса не отыгрывает.
+   */
+  hesitate: number;
+  /**
    * Сколько ботов одновременно имеют право идти на сближение с одной целью.
    * Остальные держат дистанцию. Один наседающий — это дуэль, в которой надо
    * мансить; четверо разом — это уже не бой, а раздавили числом. Поэтому
@@ -64,11 +80,36 @@ export interface BotTier {
 // Ошибка прицела в радианах разворачивается в метры промаха на дистанции:
 // на 30 м 0.14 рад — это 4 м мимо при радиусе танка 2.4, то есть чаще мимо, чем в цель.
 export const BOT_TIERS: BotTier[] = [
-  { reaction: 0.9, aimError: 0.17, lead: 0, fireGate: 1.6, cover: false, ricochet: false, range: 32, pressers: 1 },
-  { reaction: 0.45, aimError: 0.125, lead: 0, fireGate: 1.2, cover: true, ricochet: false, range: 36, pressers: 2 },
-  { reaction: 0.22, aimError: 0.075, lead: 0.6, fireGate: 0.9, cover: true, ricochet: true, range: 40, pressers: 3 },
-  { reaction: 0.11, aimError: 0.018, lead: 1, fireGate: 0.7, cover: true, ricochet: true, range: 44, pressers: 4 },
+  { reaction: 1.3, aimError: 0.26, lead: 0, fireGate: 1.7, cover: false, ricochet: false, range: 52, keep: 46, hesitate: 2.6, pressers: 1 },
+  { reaction: 0.6, aimError: 0.17, lead: 0, fireGate: 1.25, cover: true, ricochet: false, range: 42, keep: 36, hesitate: 1.4, pressers: 1 },
+  { reaction: 0.25, aimError: 0.085, lead: 0.6, fireGate: 0.95, cover: true, ricochet: true, range: 40, keep: 30, hesitate: 0.6, pressers: 2 },
+  { reaction: 0.11, aimError: 0.018, lead: 1, fireGate: 0.7, cover: true, ricochet: true, range: 44, keep: 26, hesitate: 0, pressers: 3 },
 ];
+
+/**
+ * Манера боя: надстройка над тиром, общая для всей комнаты. Тир говорит, как
+ * хорошо бот играет, манера — как именно. Отдельная ручка нужна потому, что
+ * «толпа в упор» и «точный огонь издали» давят игрока совершенно по-разному,
+ * и лечится это тоже по-разному.
+ */
+export interface BotStance {
+  /** Множитель дистанции, на которой бот держится. */
+  keep: number;
+  /** Сдвиг числа слотов наседающих; итог не опускается ниже нуля. */
+  pressers: number;
+}
+
+export const BOT_STANCES: BotStance[] = [
+  // Дистанция: в упор не идёт никто, работают только с рабочего расстояния.
+  { keep: 1.45, pressers: -4 },
+  { keep: 1, pressers: 0 },
+  // Напор: лезут все и вплотную. Самый честный способ сделать больно.
+  { keep: 0.55, pressers: 4 },
+];
+
+function stanceOf(id: number | undefined): BotStance {
+  return BOT_STANCES[id !== undefined && id >= 0 && id < STANCE_COUNT ? id : STANCE_NEUTRAL];
+}
 
 /** Позывные ботов. Кончились — дальше идут с номером. */
 const BOT_NAMES = [
@@ -146,20 +187,14 @@ export interface BotWorld {
   tick: number;
   obstacles: Box[];
   tanks: Iterable<BotTarget>;
+  /** Манера боя комнаты; не задана — нейтральная. */
+  stance?: number;
 }
 
 /** Раз в столько тиков бот пересматривает цель — полсекунды. */
 const RETHINK_TICKS = Math.round(TICK_HZ / 2);
 /** Длина щупов объезда, м. */
 const FEELER = 13;
-
-/**
- * Дистанция, ближе которой не подходит бот без слота наседающего. Толпа, разом
- * доехавшая до игрока, побеждает не игрой, а тем, что её много: на карте 140 м
- * от четверых в упор не увернуться. Поэтому лезет в ближний бой только тот,
- * кому это разрешил тир, а остальные работают с дистанции.
- */
-const KEEP_MIN = 26;
 
 /** Рабочая дистанция и предел сближения для того, кто занял слот наседающего. */
 const PRESS_RANGE = 15;
@@ -218,10 +253,13 @@ export function think(self: BotSelf, world: BotWorld): Input {
   const aimed = Math.abs(angleDiff(me.turret, turret)) < gate;
   const fire =
     clear && aimed && dist < MAX_ENGAGE && world.tick >= brain.readyAt && !self.dead;
+  // Свой таймер бот держит длиннее перезарядки ровно на hesitate, поэтому комната
+  // его выстрел никогда не отклонит: она готова раньше, чем он решится.
+  if (fire) brain.readyAt = world.tick + Math.round((RELOAD_S + tier.hesitate) * TICK_HZ);
 
   // --- Ход ---
   // На низком HP разрывает дистанцию: подставляться под добивание невыгодно.
-  const retreat = tier.cover && self.hp <= MAX_HP * 0.35;
+  const retreat = tier.cover && self.hp <= BOT_HP * 0.35;
   const want = heading(self, target.state, dist, tier, world, retreat, shot);
   const drive = unstick(brain, me, world.tick, steerTo(me, want, world.obstacles));
 
@@ -258,7 +296,9 @@ function retarget(self: BotSelf, world: BotWorld, tier: BotTier): void {
   // Смена цели стоит боту реакции: мгновенно переносить огонь умеет только Ас.
   if (best.id !== brain.targetId) {
     brain.targetId = best.id;
-    brain.readyAt = world.tick + Math.round(tier.reaction * TICK_HZ);
+    // Только откладываем выстрел, но никогда не приближаем: иначе смена цели
+    // обнуляла бы паузу hesitate и новичок стрелял бы чаще ветерана.
+    brain.readyAt = Math.max(brain.readyAt, world.tick + Math.round(tier.reaction * TICK_HZ));
   }
   brain.aimBias = (Math.random() * 2 - 1) * tier.aimError;
 
@@ -271,7 +311,7 @@ function retarget(self: BotSelf, world: BotWorld, tier: BotTier): void {
     if (tank.id === self.id || tank.dead || tank.team !== self.team) continue;
     if (Math.hypot(best.state.x - tank.state.x, best.state.z - tank.state.z) < myGap) closer++;
   }
-  brain.press = closer < tier.pressers;
+  brain.press = closer < Math.max(0, tier.pressers + stanceOf(world.stance).pressers);
 
   // Рикошет ищем только когда прямого выстрела нет — иначе он и не нужен.
   brain.bank =
@@ -321,8 +361,10 @@ function heading(
   const tz = (target.z - me.z) / dist;
 
   // Наседающему разрешён ближний бой, остальным — только работа с дистанции.
-  const range = self.brain.press ? PRESS_RANGE : tier.range;
-  const floor = self.brain.press ? PRESS_MIN : KEEP_MIN;
+  // Манера растягивает или сжимает обе дистанции разом, чтобы строй не рвался.
+  const stance = stanceOf(world.stance);
+  const range = (self.brain.press ? PRESS_RANGE : tier.range) * stance.keep;
+  const floor = (self.brain.press ? PRESS_MIN : tier.keep) * stance.keep;
 
   let radial: number;
   if (retreat || dist < floor) radial = -1; // подбит или слишком близко — назад

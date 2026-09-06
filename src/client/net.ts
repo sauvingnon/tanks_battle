@@ -59,7 +59,13 @@ export class Net {
   }
 
   /** Настройка комнаты. Сервер примет её только от хоста. */
-  sendSetup(setup: { mode?: GameMode; diff?: number; bonuses?: boolean; map?: number }): void {
+  sendSetup(setup: {
+    mode?: GameMode;
+    diff?: number;
+    bonuses?: boolean;
+    map?: number;
+    stance?: number;
+  }): void {
     this.send({ t: 'setup', ...setup });
   }
 

@@ -14,7 +14,10 @@ import {
   DT,
   hasEffect,
   INTERP_DELAY_MS,
+  BOT_HP,
   MAX_HP,
+  STANCE_NAMES,
+  STANCE_NEUTRAL,
   MODE_DM,
   MODE_PVE,
   MUZZLE_OFFSET,
@@ -107,6 +110,7 @@ let mode: GameMode = MODE_DM;
 let difficulty = 1;
 /** Сложность, по которой идёт бой сейчас: посреди волны отстаёт от выбранной. */
 let activeDifficulty = 1;
+let stance = STANCE_NEUTRAL;
 let bonusesOn = false;
 let hostId = 0;
 /** Первый config пришёл: до него о «сменах» настроек сообщать нечего. */
@@ -118,6 +122,13 @@ const MAP_HINTS = [
   'Срабатывает сразу: бой начинается заново. Стены с четырьмя воротами — есть что держать.',
   'Срабатывает сразу: бой начинается заново. Кварталы и улицы: близко, тесно, много рикошетов.',
   'Срабатывает сразу: бой начинается заново. Стена делит карту надвое, три прохода.',
+];
+
+/** Что делает манера боя — подпись под выбором. Порядок как в STANCE_NAMES. */
+const STANCE_HINTS = [
+  'Срабатывает сразу: держатся втрое дальше и работают огнём. В упор не идёт никто.',
+  'Срабатывает сразу: в ближний бой идут только те, кому это разрешает уровень.',
+  'Срабатывает сразу: лезут вплотную все разом. Урона прилетает столько же, но разорвать дистанцию не дадут.',
 ];
 
 const MODE_NAMES: Record<GameMode, string> = {
@@ -212,6 +223,7 @@ function applyConfig(next: RoomConfig): void {
   const wasMode = mode;
   const wasDifficulty = difficulty;
   const wasBonuses = bonusesOn;
+  const wasStance = stance;
 
   const wasMap = mapId;
 
@@ -221,6 +233,7 @@ function applyConfig(next: RoomConfig): void {
   difficulty = next.difficulty;
   activeDifficulty = next.active;
   bonusesOn = next.bonuses;
+  stance = next.stance;
   hostId = next.hostId;
 
   if (!bonusesOn) {
@@ -241,6 +254,9 @@ function applyConfig(next: RoomConfig): void {
     }
     if (difficulty !== wasDifficulty) {
       pushFeed(`Сложность: ${DIFFICULTY_NAMES[difficulty]} · ${whenDifficulty()}`, 'is-setup');
+    }
+    if (stance !== wasStance) {
+      pushFeed(`Манера боя: ${STANCE_NAMES[stance]} · сразу`, 'is-setup');
     }
     if (bonusesOn !== wasBonuses) {
       pushFeed(`Бонусы ${bonusesOn ? 'включены' : 'выключены'} · сразу`, 'is-setup');
@@ -457,7 +473,7 @@ function drawOthers(renderTime: number): void {
     if (!players.has(id)) continue; // снапшот обогнал сообщение joined
     // Здоровье и «жив ли» берём и для себя тоже: свой танк рисуется предсказанием,
     // но его полоска и видимость живут по тем же данным, что и у остальных.
-    scene.setTankHealth(id, target.h, target.d === 0);
+    scene.setTankHealth(id, target.h, target.d === 0, players.get(id)?.bot ? BOT_HP : MAX_HP);
     // Свой танк под маскировкой видно всегда: прятать его от себя незачем.
     scene.setTankStealth(
       id,
@@ -548,10 +564,12 @@ const setupOwner = el('setup-owner');
 const setupMaps = el('setup-maps');
 const setupModes = el('setup-modes');
 const setupDiffs = el('setup-diffs');
+const setupStances = el('setup-stances');
 const setupBonuses = el<HTMLInputElement>('setup-bonuses');
 const hintMap = el('hint-map');
 const hintMode = el('hint-mode');
 const hintDiff = el('hint-diff');
+const hintStance = el('hint-stance');
 const hintBonuses = el('hint-bonuses');
 
 function updateHud(): void {
@@ -647,6 +665,15 @@ DIFFICULTY_NAMES.forEach((label, index) => {
   setupDiffs.appendChild(button);
 });
 
+STANCE_NAMES.forEach((label, index) => {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.textContent = label;
+  button.dataset.stance = String(index);
+  button.addEventListener('click', () => net.sendSetup({ stance: index }));
+  setupStances.appendChild(button);
+});
+
 setupBonuses.addEventListener('change', () => net.sendSetup({ bonuses: setupBonuses.checked }));
 
 function renderSetup(): void {
@@ -674,6 +701,12 @@ function renderSetup(): void {
     // Сложность имеет смысл только в режиме ботов.
     button.disabled = !isHost || mode !== MODE_PVE;
   }
+
+  for (const button of setupStances.querySelectorAll('button')) {
+    button.classList.toggle('is-on', Number(button.dataset.stance) === stance);
+    button.disabled = !isHost;
+  }
+  hintStance.textContent = STANCE_HINTS[stance];
 
   // Главное, чего не хватало: когда настройка сработает.
   hintMap.textContent = MAP_HINTS[mapId];

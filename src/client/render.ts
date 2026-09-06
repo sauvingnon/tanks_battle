@@ -356,14 +356,18 @@ export class Scene3D {
     return handle;
   }
 
-  /** Здоровье и «жив ли»: подбитый корпус убираем со сцены до респавна. */
-  setTankHealth(id: number, hp: number, alive: boolean): void {
+  /**
+   * Здоровье и «жив ли»: подбитый корпус убираем со сцены до респавна.
+   * Максимум передаётся снаружи — у ботов он свой, и без него полный бот
+   * показывал бы полоску, залитую на три четверти.
+   */
+  setTankHealth(id: number, hp: number, alive: boolean, max = MAX_HP): void {
     const handle = this.tanks.get(id);
     if (!handle) return;
 
     if (hp !== handle.hp) {
       handle.hp = hp;
-      const fraction = Math.max(0, Math.min(1, hp / MAX_HP));
+      const fraction = Math.max(0, Math.min(1, hp / max));
       handle.hpFill.style.width = `${(fraction * 100).toFixed(0)}%`;
       // Зелёный -> жёлтый -> красный по мере потери брони.
       handle.hpFill.style.background = `hsl(${Math.round(fraction * 105)} 70% 48%)`;

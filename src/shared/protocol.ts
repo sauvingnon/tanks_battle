@@ -40,6 +40,8 @@ export interface RoomConfig {
    * нужны оба числа, чтобы честно подписать, когда настройка сработает.
    */
   active: number;
+  /** Манера боя ботов: дистанция / нейтрал / напор. Действует сразу. */
+  stance: number;
   bonuses: boolean;
   hostId: number;
 }
@@ -50,7 +52,7 @@ export type ClientMessage =
   | { t: 'input'; seq: number; th: number; st: number; tu: number; f?: 1 }
   | { t: 'ping'; id: number }
   /** Настройка комнаты; принимается только от хоста. */
-  | { t: 'setup'; mode?: GameMode; diff?: number; bonuses?: boolean; map?: number };
+  | { t: 'setup'; mode?: GameMode; diff?: number; bonuses?: boolean; map?: number; stance?: number };
 
 /** Сервер -> клиент. */
 export type ServerMessage =

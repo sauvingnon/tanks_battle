@@ -39,6 +39,14 @@ export const MAX_HP = 100;
 export const SHELL_DAMAGE = 25; // четыре попадания = смерть
 
 /**
+ * Здоровье бота. Их всегда больше, чем игроков, и на равном здоровье размен
+ * получается заведомо не в пользу человека: чтобы снять одного бота, нужно
+ * 4 попадания и 6.4 с перезарядки, а стреляют в это время по тебе втроём.
+ * Три попадания вместо четырёх — четверть времени волны обратно игроку.
+ */
+export const BOT_HP = 75;
+
+/**
  * Снаряд летит по прямой без гравитации: так попадание считается в 2D, а игроку
  * понятно, куда целиться. 62 м/с — карту в поперечнике проходит за 2.3 с,
  * то есть по едущему танку надо брать упреждение.
@@ -93,6 +101,20 @@ export function isMode(v: unknown): v is GameMode {
 export const DIFFICULTY_NAMES = ['Новичок', 'Средний', 'Ветеран', 'Ас'];
 export const MAX_TIER = DIFFICULTY_NAMES.length - 1;
 
+/**
+ * Манера боя — ручка, независимая от сложности. Сложность отвечает за выучку
+ * (реакция, точность, упреждение), манера — за дистанцию и за право лезть в упор.
+ * Разводить их приходится потому, что ощущаются они по-разному: «Ас» издали
+ * страшен точностью, «Новичок» в упор — тем, что от него некуда деться.
+ */
+export const STANCE_NAMES = ['Дистанция', 'Нейтрал', 'Напор'];
+export const STANCE_NEUTRAL = 1;
+export const STANCE_COUNT = STANCE_NAMES.length;
+
+export function isStance(v: unknown): v is number {
+  return typeof v === 'number' && Number.isInteger(v) && v >= 0 && v < STANCE_COUNT;
+}
+
 // --- Волны ---
 
 /**
@@ -107,16 +129,22 @@ export function waveQuota(wave: number): number {
 }
 
 /**
- * Сколько ботов приходится на одного живого человека. На карте в 140 метров
- * четверо, доехавших до тебя разом, побеждают не игрой, а числом: увернуться
- * уже негде. Поэтому карту наполняем по числу игроков, а волна растёт квотой
- * и выучкой противника, а не толпой.
+ * Сколько ботов приходится на одного живого человека — по уровню сложности.
+ * Численный перевес человек отыграть не может в принципе: перезарядка у всех
+ * одна, и трое стреляют в тебя ровно втрое чаще, чем ты в них. Поэтому толпа —
+ * это и есть сложность, а не декорация к ней: на «Новичке» дерёшься с двумя,
+ * на «Асе» — с тремя, и разница чувствуется сразу.
  */
-export const BOTS_PER_HUMAN = 3;
+export const BOTS_PER_HUMAN = [2, 2, 3, 3];
 
 /** Сколько ботов волны N живут на карте одновременно: квота выпускается порциями. */
-export function waveConcurrent(wave: number, humans: number): number {
-  return Math.max(1, Math.min(BOT_LIMIT, 4 + wave, humans * BOTS_PER_HUMAN));
+export function waveConcurrent(wave: number, humans: number, difficulty = 0): number {
+  const perHuman = BOTS_PER_HUMAN[clampTier(difficulty)];
+  return Math.max(1, Math.min(BOT_LIMIT, 4 + wave, humans * perHuman));
+}
+
+function clampTier(tier: number): number {
+  return Math.max(0, Math.min(MAX_TIER, Math.round(tier)));
 }
 
 /**

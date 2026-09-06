@@ -12,8 +12,11 @@ import {
   BONUS_RELOAD,
   BONUS_SPEED,
   BONUS_STEALTH,
+  BOT_HP,
   BOTS_PER_HUMAN,
   MAX_HP,
+  MAX_TIER,
+  STANCE_NAMES,
   MODE_DM,
   MODE_PVE,
   RESPAWN_S,
@@ -93,8 +96,8 @@ function duel(victim: Player, shooter: Player): void {
 
   run(room, 8 * TICK_HZ);
   check(
-    'на одного игрока на карте не больше трёх ботов',
-    bots(room).length === waveConcurrent(1, 1) && bots(room).length === BOTS_PER_HUMAN,
+    'на одного игрока выходит столько ботов, сколько разрешает сложность',
+    bots(room).length === waveConcurrent(1, 1, 0) && bots(room).length === BOTS_PER_HUMAN[0],
   );
   check('остальная квота волны ждёт своей очереди', room.waveState().left === waveQuota(1));
   check('хост — первый вошедший', room.hostId === player.id);
@@ -123,7 +126,7 @@ function duel(victim: Player, shooter: Player): void {
 
   run(room, 12 * TICK_HZ);
   check('квота волны 2 больше первой', room.waveState().left === waveQuota(2));
-  check('одновременно на карте не больше лимита волны', bots(room).length <= waveConcurrent(2, 1));
+  check('одновременно на карте не больше лимита волны', bots(room).length <= waveConcurrent(2, 1, MAX_TIER));
 }
 
 // --- Потолок ботов растёт вместе с числом игроков ---
@@ -134,8 +137,8 @@ function duel(victim: Player, shooter: Player): void {
   room.add('Второй', noop);
   room.setup(MODE_PVE, 0, false);
   run(room, 8 * TICK_HZ);
-  check('вдвоём на карте помещается больше ботов', bots(room).length > BOTS_PER_HUMAN);
-  check('но не больше трёх на каждого', bots(room).length <= 2 * BOTS_PER_HUMAN);
+  check('вдвоём на карте помещается больше ботов', bots(room).length > BOTS_PER_HUMAN[0]);
+  check('но не больше положенного на каждого', bots(room).length <= 2 * BOTS_PER_HUMAN[0]);
 }
 
 // --- Сложность вступает в силу на границе волн ---
@@ -555,6 +558,69 @@ function dropOn(room: Room, player: Player, kind: number): void {
 
   run(room, Math.round(1.2 * TICK_HZ), [shooter]);
   check('уничтоженный танк теряет эффекты', victim.dead && victim.fx.every((v) => v === 0));
+}
+
+// --- Бот тоньше игрока: три попадания вместо четырёх ---
+
+{
+  const room = new Room();
+  const hero = room.add('Игрок', noop);
+  room.setup(MODE_PVE, 0, false);
+  run(room, 8 * TICK_HZ);
+
+  const bot = bots(room)[0];
+  check('бот вышел с уменьшенным запасом здоровья', bot !== undefined && bot.hp === BOT_HP);
+  check('бота убивают три попадания, а игрока четыре', Math.ceil(BOT_HP / SHELL_DAMAGE) === 3 && Math.ceil(MAX_HP / SHELL_DAMAGE) === 4);
+  check('у человека запас прежний', hero.hp === MAX_HP);
+}
+
+// --- Манера боя: та же выучка, другая дистанция ---
+
+/**
+ * Средняя дистанция, на которой боты держатся от игрока. Человек стоит на месте,
+ * поэтому число зависит только от манеры, а не от того, кто кого переехал.
+ */
+function holdDistance(stance: number): number {
+  const room = new Room();
+  const hero = room.add('Игрок', noop);
+  room.setup(MODE_PVE, 1, false, 0, stance);
+  hero.state = createTankState(0, 0, 0);
+
+  let sum = 0;
+  let samples = 0;
+  for (let i = 0; i < 40 * TICK_HZ; i++) {
+    // Держим человека живым и на месте: меряем поведение ботов, а не бой.
+    hero.hp = MAX_HP;
+    hero.dead = false;
+    hero.state = createTankState(0, 0, 0);
+    run(room, 1);
+    for (const bot of bots(room)) {
+      sum += Math.hypot(bot.state.x, bot.state.z);
+      samples++;
+    }
+  }
+  return samples > 0 ? sum / samples : 0;
+}
+
+{
+  const far = holdDistance(0);
+  const neutral = holdDistance(1);
+  const close = holdDistance(2);
+  console.log(
+    `
+Средняя дистанция до игрока: ${STANCE_NAMES[0]} ${far.toFixed(1)} м, ` +
+      `${STANCE_NAMES[1]} ${neutral.toFixed(1)} м, ${STANCE_NAMES[2]} ${close.toFixed(1)} м`,
+  );
+  check('«Дистанция» держит ботов дальше нейтральной манеры', far > neutral + 3);
+  check('«Напор» подводит ботов ближе нейтральной манеры', close < neutral - 3);
+  check('на «Дистанции» боты не подходят вплотную', far > 30);
+
+  const room = new Room();
+  room.add('Игрок', noop);
+  room.setup(MODE_PVE, 1, false, 0, 2);
+  check('манера доезжает до настроек комнаты', room.config().stance === 2);
+  room.setup(undefined, undefined, undefined, undefined, 0);
+  check('манера переключается отдельно от сложности', room.config().stance === 0 && room.config().difficulty === 1);
 }
 
 // --- Цена тика с полной картой ботов ---

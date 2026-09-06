@@ -140,6 +140,7 @@ wss.on('connection', (ws) => {
         msg.diff,
         typeof msg.bonuses === 'boolean' ? msg.bonuses : undefined,
         msg.map,
+        msg.stance,
       );
       return;
     }
