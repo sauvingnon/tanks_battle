@@ -28,6 +28,18 @@ import {
   WRECK_S,
   wreckSink,
 } from '../src/client/ground.js';
+import {
+  BLOOM_THRESHOLD,
+  GLOW_BOOM,
+  GLOW_KILL,
+  GLOW_MUZZLE,
+  GLOW_RICOCHET,
+  GLOW_SHELL,
+  GLOW_TRACER,
+  linearLuminance,
+  litLuminance,
+  PAINTED_COLORS,
+} from '../src/client/look.js';
 
 const checks: Array<[string, boolean]> = [];
 const check = (label: string, ok: boolean) => checks.push([label, ok]);
@@ -266,6 +278,45 @@ const near = (a: number, b: number, eps = 1e-6) => Math.abs(a - b) < eps;
   // За концом кривая не должна уводить остов в бесконечность: кадр может
   // прийти и позже срока, а мы по этой же функции ставим корпус.
   check('после срока оседание не растёт', near(wreckSink(WRECK_S * 3), end));
+}
+
+// --- 5г. Арифметика свечения ---
+
+{
+  // Порог сравнивается с линейной яркостью кадра до тонмаппинга. Это не то же
+  // самое, что «цвет выглядит ярким», и вся настройка держится на разнице.
+  const glows = (hex: number, gain = 1) => linearLuminance(hex, gain) > BLOOM_THRESHOLD;
+
+  check('порог стоит на «ярче белого»', BLOOM_THRESHOLD === 1);
+
+  // Главное: сам по себе яркий цвет порог не берёт. Если эта проверка упадёт,
+  // значит порог опустили — и светиться начнёт заодно всё подряд.
+  check('жёлтый снаряд без подъёма не светится', !glows(0xffd27a));
+  check('белая вспышка без подъёма не светится', !glows(0xfff3d0));
+
+  // А с подъёмом — светится каждый источник, который должен.
+  check('снаряд светится', glows(0xffd27a, GLOW_SHELL));
+  check('трассер светится', glows(0xff9d3a, GLOW_TRACER));
+  check('дульная вспышка светится', glows(0xfff3d0, GLOW_MUZZLE));
+  check('взрыв по земле светится', glows(0xffb257, GLOW_BOOM));
+  check('попадание светится', glows(0xffd27a, GLOW_BOOM));
+  check('гибель светится', glows(0xff8a3c, GLOW_KILL));
+  check('рикошетная искра светится', glows(0xfff4c8, GLOW_RICOCHET));
+
+  // Дым не светится ни при каких обстоятельствах: светящийся дым — это уже туман.
+  check('дым выстрела не светится', !glows(0x7d7568));
+  check('дым остова не светится', !glows(0x36322c));
+  check('пыль не светится', !glows(DUST_FIELD.color));
+  check('обломки не светятся', !glows(DEBRIS_FIELD.color));
+
+  // И запас снизу: ни одна крашеная поверхность в игре под этим светом до порога
+  // не дотягивает. Считается по настоящим силам света и настоящим цветам,
+  // поэтому проверка поймает и поднятое солнце, и новый слишком светлый материал.
+  const brightest = Math.max(...PAINTED_COLORS.map(litLuminance));
+  check('ни одна крашеная поверхность не светится', brightest < BLOOM_THRESHOLD);
+  // Половина порога — не придирка: блик добавляет к диффузной части сверху,
+  // и без запаса светиться начали бы края освещённых граней.
+  check('и запас при этом двукратный', brightest < BLOOM_THRESHOLD * 0.5);
 }
 
 // --- 6. Шейдеры собраны без опечаток в объявлениях ---

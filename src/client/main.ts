@@ -607,11 +607,13 @@ const setupModes = el('setup-modes');
 const setupDiffs = el('setup-diffs');
 const setupStances = el('setup-stances');
 const setupBonuses = el<HTMLInputElement>('setup-bonuses');
+const setupBloom = el<HTMLInputElement>('setup-bloom');
 const hintMap = el('hint-map');
 const hintMode = el('hint-mode');
 const hintDiff = el('hint-diff');
 const hintStance = el('hint-stance');
 const hintBonuses = el('hint-bonuses');
+const hintBloom = el('hint-bloom');
 
 function updateHud(): void {
   // Ботов в «в бою» не считаем: это счётчик живых людей.
@@ -717,6 +719,20 @@ STANCE_NAMES.forEach((label, index) => {
 
 setupBonuses.addEventListener('change', () => net.sendSetup({ bonuses: setupBonuses.checked }));
 
+/**
+ * Свечение — личная настройка, в сеть она не уходит: три прохода размытия по
+ * полному кадру стоят заметно, и что тянет одна машина, не тянет другая.
+ * Выбор помним между заходами, иначе его пришлось бы снимать каждый раз.
+ */
+let bloomOn = localStorage.getItem('tanks:bloom') !== 'off';
+scene.setBloom(bloomOn);
+setupBloom.addEventListener('change', () => {
+  bloomOn = setupBloom.checked;
+  localStorage.setItem('tanks:bloom', bloomOn ? 'on' : 'off');
+  scene.setBloom(bloomOn);
+  renderSetup();
+});
+
 function renderSetup(): void {
   const isHost = selfId !== 0 && selfId === hostId;
   const host = players.get(hostId);
@@ -724,6 +740,12 @@ function renderSetup(): void {
 
   setupBonuses.checked = bonusesOn;
   setupBonuses.disabled = !isHost;
+
+  // Единственная галка в панели, которая работает у всех: она не про бой.
+  setupBloom.checked = bloomOn;
+  hintBloom.textContent = bloomOn
+    ? 'Трассеры, вспышки и взрывы разгораются. Если кадры проседают — сними.'
+    : 'Выключено: кадр рисуется одним проходом, без размытия по всему экрану.';
 
   for (const button of setupMaps.querySelectorAll('button')) {
     button.classList.toggle('is-on', Number(button.dataset.map) === mapId);

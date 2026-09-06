@@ -1,4 +1,8 @@
 import * as THREE from 'three';
+import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
+import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
+import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 
 import { MAX_HP, SHELL_HEIGHT } from '../shared/constants.js';
 import { wrapAngle } from '../shared/sim.js';
@@ -14,6 +18,30 @@ import {
   wreckSink,
 } from './ground.js';
 import {
+  AMBIENT_INTENSITY,
+  BLOOM_RADIUS,
+  BLOOM_STRENGTH,
+  BLOOM_THRESHOLD,
+  BONUS_COLORS,
+  COLOR_BOX,
+  COLOR_GROUND,
+  COLOR_LOW_BOX,
+  COLOR_METAL,
+  COLOR_TRACK,
+  COLOR_WALL,
+  EXPOSURE,
+  FILL_INTENSITY,
+  GLOW_BONUS,
+  GLOW_BOOM,
+  GLOW_KILL,
+  GLOW_MUZZLE,
+  GLOW_RICOCHET,
+  GLOW_SHELL,
+  GLOW_TRACER,
+  PALETTE,
+  SUN_INTENSITY,
+} from './look.js';
+import {
   BOOM_GROUND,
   BOOM_HIT,
   BOOM_KILL,
@@ -23,11 +51,8 @@ import {
   type SnapshotBonus,
 } from '../shared/types.js';
 
-/** Цвета корпусов; сервер присылает индекс в этой палитре. */
-const PALETTE = [0x4f7d5a, 0x7a5f9c, 0xa8632f, 0x3f6f96, 0x8a8f3a, 0x9c4a52, 0x3f8f88, 0x8a6a44];
-
-/** Цвета ящиков: ремонт, урон, заряжание, ход, маскировка. */
-export const BONUS_COLORS = [0x6ad46a, 0xff7a4d, 0xffd24d, 0x4db8ff, 0xb388ff];
+// Палитра живёт в look.ts вместе со светом: стенд сверяет её с порогом свечения.
+export { BONUS_COLORS } from './look.js';
 
 /** На какой высоте висит ящик над землёй. */
 const BONUS_HOVER = 1.7;
@@ -35,14 +60,6 @@ const BONUS_HOVER = 1.7;
 const CAMERA_DISTANCE = 15;
 const CAMERA_BASE_HEIGHT = 3.4;
 
-/**
- * Яркость сцены. Крутить эти четыре числа, если картинка кажется тёмной или
- * пересвеченной; оттенки света задаются отдельно и их менять не нужно.
- */
-const EXPOSURE = 1.18; // общая экспозиция поверх тонмаппинга
-const SUN_INTENSITY = 2.7; // прямой свет: даёт блики и тени
-const AMBIENT_INTENSITY = 2.0; // заполняющий свет: определяет, насколько черны тени
-const FILL_INTENSITY = 0.5; // подсветка с теневой стороны, чтобы корпуса не проваливались
 
 /** Высота, на которой висит ник над центром танка. */
 const LABEL_HEIGHT = 3.7;
@@ -63,14 +80,19 @@ interface EffectPreset {
   rise?: number;
   grow?: number;
   alpha?: number;
+  /**
+   * Во сколько раз цвет поднят над обычным диапазоном. Всё, что больше единицы,
+   * перешагивает порог свечения; единица — «не светится», для дыма.
+   */
+  glow?: number;
 }
 
 const BOOM_PRESETS: Record<BoomKind, EffectPreset> = {
-  [BOOM_GROUND]: { radius: 1.6, life: 0.34, color: 0xffb257 },
-  [BOOM_HIT]: { radius: 2.2, life: 0.4, color: 0xffd27a },
-  [BOOM_KILL]: { radius: 4.2, life: 0.75, color: 0xff8a3c, ring: true },
+  [BOOM_GROUND]: { radius: 1.6, life: 0.34, color: 0xffb257, glow: GLOW_BOOM },
+  [BOOM_HIT]: { radius: 2.2, life: 0.4, color: 0xffd27a, glow: GLOW_BOOM },
+  [BOOM_KILL]: { radius: 4.2, life: 0.75, color: 0xff8a3c, ring: true, glow: GLOW_KILL },
   // Рикошет — короткая белая искра: снаряд жив и полетел дальше, взрыва не было.
-  [BOOM_RICOCHET]: { radius: 0.9, life: 0.16, color: 0xfff4c8 },
+  [BOOM_RICOCHET]: { radius: 0.9, life: 0.16, color: 0xfff4c8, glow: GLOW_RICOCHET },
 };
 
 /** На какой высоте рвануло: у земли, по корпусу танка или на высоте полёта снаряда. */
@@ -85,7 +107,13 @@ const BOOM_HEIGHT: Record<BoomKind, number> = {
  * Вспышка у дульного среза. Она короче любого взрыва — её задача не «гореть»,
  * а отметить кадр выстрела: длинный факел смазывается в кашу и читается как взрыв.
  */
-const MUZZLE_PRESET: EffectPreset = { radius: 0.85, life: 0.085, color: 0xfff3d0, cone: 4 };
+const MUZZLE_PRESET: EffectPreset = {
+  radius: 0.85,
+  life: 0.085,
+  color: 0xfff3d0,
+  cone: 4,
+  glow: GLOW_MUZZLE,
+};
 
 /**
  * Дым от выстрела: всплывает и расплывается. Держим его редким и небольшим —
@@ -286,7 +314,9 @@ export class Scene3D {
       new THREE.MeshStandardMaterial({
         color,
         emissive: color,
-        emissiveIntensity: 0.5,
+        // Выше единицы вместе с собственным цветом ящика: ящик должен светиться
+        // и находиться взглядом на пёстрой карте, а не просто быть ярким.
+        emissiveIntensity: GLOW_BONUS,
         roughness: 0.4,
         metalness: 0.1,
       }),
@@ -296,15 +326,20 @@ export class Scene3D {
   /** Общая фаза вращения ящиков — чтобы они крутились в такт, а не вразнобой. */
   private bonusSpin = 0;
 
-  /** Снаряд светится сам: он мелкий и должен читаться на любом фоне. */
-  private readonly shellMaterial = new THREE.MeshBasicMaterial({ color: 0xffd27a });
+  /**
+   * Снаряд светится сам: он мелкий и должен читаться на любом фоне. Цвет поднят
+   * за единицу — это и делает его светящимся, а не просто ярко-жёлтым.
+   */
+  private readonly shellMaterial = new THREE.MeshBasicMaterial({
+    color: new THREE.Color(0xffd27a).multiplyScalar(GLOW_SHELL),
+  });
 
   /**
    * Трассер складывается со светом сцены, а не перекрывает его, и не пишет в
    * буфер глубины: иначе полупрозрачный хвост вырезал бы дыру в том, что за ним.
    */
   private readonly tracerMaterial = new THREE.MeshBasicMaterial({
-    color: 0xff9d3a,
+    color: new THREE.Color(0xff9d3a).multiplyScalar(GLOW_TRACER),
     transparent: true,
     opacity: 0.4,
     depthWrite: false,
@@ -312,14 +347,23 @@ export class Scene3D {
   });
 
   private readonly trackMaterial = new THREE.MeshStandardMaterial({
-    color: 0x23262b,
+    color: COLOR_TRACK,
     roughness: 0.95,
   });
   private readonly metalMaterial = new THREE.MeshStandardMaterial({
-    color: 0x3a3f47,
+    color: COLOR_METAL,
     roughness: 0.6,
     metalness: 0.25,
   });
+
+  /**
+   * Цепочка постобработки для свечения. Держится собранной всегда, но при
+   * выключенном свечении не используется: сборка её на лету означала бы
+   * перекомпиляцию шейдеров и заметный рывок прямо в бою.
+   */
+  private readonly composer: EffectComposer;
+  private readonly bloomPass: UnrealBloomPass;
+  private bloomOn = true;
 
   private readonly cameraTarget = new THREE.Vector3();
   private cameraReady = false;
@@ -353,6 +397,24 @@ export class Scene3D {
     // Ближняя граница вынесена за игровую зону (карта 140 м в поперечнике), чтобы туман
     // не съедал поле, но дальняя стена через всю карту уже заметно подёрнута дымкой.
     this.scene.fog = new THREE.Fog(0x121822, 110, 300);
+
+    // Цвет копится в полуплавающей точке: свечению нужны значения ярче единицы,
+    // а в обычные 8 бит на канал они бы срезались ещё до размытия.
+    this.composer = new EffectComposer(
+      this.renderer,
+      new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType }),
+    );
+    this.composer.addPass(new RenderPass(this.scene, this.camera));
+    this.bloomPass = new UnrealBloomPass(
+      new THREE.Vector2(1, 1),
+      BLOOM_STRENGTH,
+      BLOOM_RADIUS,
+      BLOOM_THRESHOLD,
+    );
+    this.composer.addPass(this.bloomPass);
+    // Тонмаппинг и перевод в sRGB делает последний проход: при рендере в буфер
+    // three их пропускает, и без OutputPass картинка вышла бы пересвеченной.
+    this.composer.addPass(new OutputPass());
 
     this.scene.add(this.world);
     this.scene.add(this.tracks.mesh);
@@ -402,7 +464,7 @@ export class Scene3D {
 
     const ground = new THREE.Mesh(
       new THREE.PlaneGeometry(half * 6, half * 6),
-      new THREE.MeshStandardMaterial({ color: 0x39412f, roughness: 1 }),
+      new THREE.MeshStandardMaterial({ color: COLOR_GROUND, roughness: 1 }),
     );
     ground.rotation.x = -Math.PI / 2;
     ground.receiveShadow = true;
@@ -414,7 +476,7 @@ export class Scene3D {
     (grid.material as THREE.Material).opacity = 0.35;
     this.world.add(grid);
 
-    const wallMaterial = new THREE.MeshStandardMaterial({ color: 0x4a5160, roughness: 0.9 });
+    const wallMaterial = new THREE.MeshStandardMaterial({ color: COLOR_WALL, roughness: 0.9 });
     const wallHeight = 4;
     const thickness = 2;
     const span = half * 2 + thickness * 2;
@@ -432,10 +494,10 @@ export class Scene3D {
       this.world.add(wall);
     }
 
-    const boxMaterial = new THREE.MeshStandardMaterial({ color: 0x6d6357, roughness: 0.85 });
+    const boxMaterial = new THREE.MeshStandardMaterial({ color: COLOR_BOX, roughness: 0.85 });
     // Низкое укрытие простреливается насквозь, поэтому его надо отличать с одного
     // взгляда: другой цвет и заметно теплее — «за этим не спрячешься».
-    const lowMaterial = new THREE.MeshStandardMaterial({ color: 0x8a6a3f, roughness: 1 });
+    const lowMaterial = new THREE.MeshStandardMaterial({ color: COLOR_LOW_BOX, roughness: 1 });
     for (const box of obstacles) {
       const material = box.h >= SHELL_HEIGHT ? boxMaterial : lowMaterial;
       const mesh = new THREE.Mesh(new THREE.BoxGeometry(box.w, box.h, box.d), material);
@@ -925,8 +987,11 @@ export class Scene3D {
     fx.grow = preset.grow ?? 0.85;
     fx.alpha = preset.alpha ?? 0.9;
 
+    // Цвет уходит за единицу намеренно: там его подхватывает порог свечения,
+    // а при выключенном свечении тонмаппинг сам сводит перебор в тёплый белый.
+    const glow = preset.glow ?? 1;
     for (const mesh of [fx.flash, fx.ring, fx.cone]) {
-      (mesh.material as THREE.MeshBasicMaterial).color.setHex(preset.color);
+      (mesh.material as THREE.MeshBasicMaterial).color.setHex(preset.color).multiplyScalar(glow);
     }
     fx.ring.visible = preset.ring === true;
     // Кольцо стелется по земле независимо от того, на какой высоте рвануло.
@@ -1116,8 +1181,17 @@ export class Scene3D {
     this.tracks.update(this.clock);
     this.dust.update(this.clock);
     this.debris.update(this.clock);
-    this.renderer.render(this.scene, this.camera);
+    if (this.bloomOn) this.composer.render();
+    else this.renderer.render(this.scene, this.camera);
     this.updateLabels();
+  }
+
+  /**
+   * Свечение — личная настройка: три прохода размытия по полному кадру стоят
+   * заметно, и на слабой машине их лучше снять. На бой это не влияет никак.
+   */
+  setBloom(on: boolean): void {
+    this.bloomOn = on;
   }
 
   /**
@@ -1165,6 +1239,10 @@ export class Scene3D {
     this.camera.aspect = width / height;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(width, height, false);
+    // Композитор тянет пиксельную плотность из рендерера сам, поэтому размер
+    // ему отдаётся в тех же условных пикселях, что и рендереру.
+    this.composer.setSize(width, height);
+    this.bloomPass.setSize(width, height);
     // Размер частицы задан в метрах, а шейдер выдаёт пиксели устройства.
     const heightPx = height * this.renderer.getPixelRatio();
     this.dust.setViewport(heightPx, this.camera.fov);
