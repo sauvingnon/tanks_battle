@@ -33,7 +33,17 @@ import { createTankState, type Box, type Input, type ShellState, type TankState 
 
 /** Что тир меняет в поведении. Характеристики самого танка одинаковы у всех. */
 export interface BotTier {
-  /** Задержка на смену цели и на осознание нового положения прицела, с. */
+  /**
+   * Реакция, с. Это не пауза, а возраст картинки: бот наводится не туда, где
+   * цель есть, а туда, где он её видел в последний раз, и обновляет это место
+   * раз в reaction. По стоящему танку такой бот не промахнётся никогда — оба
+   * места совпадают; по едущему новичок стреляет туда, где тот был секунду
+   * назад, а это семнадцать метров мимо. Заодно тем же числом откладывается
+   * выстрел при смене цели.
+   *
+   * Раньше здесь была только эта отсрочка, а ствол всё остальное время держал
+   * цель идеально — и «Новичок» вёл огонь с точностью, которой не бывает.
+   */
   reaction: number;
   /** Постоянный увод ствола, рад; пересчитывается раз в reaction. */
   aimError: number;
@@ -134,6 +144,12 @@ export interface BotBrain {
   readyAt: number;
   /** Текущий увод ствола. */
   aimBias: number;
+  /** Последнее увиденное (уже с упреждением) место цели: в него и наводится ствол. */
+  aimX: number;
+  aimZ: number;
+  /** По какой цели запомнено место и на каком тике оно устареет. */
+  aimFor: number;
+  aimAt: number;
   /** Найденный угол выстрела с отскоком; null — стреляем напрямую. */
   bank: number | null;
   /** Занял слот наседающего: этому боту разрешён ближний бой. */
@@ -158,6 +174,10 @@ export function createBrain(tier: number, tick: number, index: number): BotBrain
     rethinkAt: tick + (index % RETHINK_TICKS),
     readyAt: tick + Math.round(BOT_TIERS[tier].reaction * TICK_HZ),
     aimBias: 0,
+    aimX: 0,
+    aimZ: 0,
+    aimFor: 0,
+    aimAt: tick,
     bank: null,
     press: false,
     orbit: Math.random() < 0.5 ? 1 : -1,
@@ -246,7 +266,20 @@ export function think(self: BotSelf, world: BotWorld): Input {
   }
 
   // --- Прицел ---
-  const aim = brain.bank ?? leadAngle(me, target.state, dist, tier.lead);
+  // Место цели бот освежает раз в tier.reaction, а между обновлениями держит
+  // ствол на устаревшей точке. Из этого сама собой выходит вся разница уровней
+  // по едущей цели: наводится он идеально, но не туда.
+  if (brain.aimFor !== target.id || world.tick >= brain.aimAt) {
+    brain.aimFor = target.id;
+    brain.aimAt = world.tick + Math.max(1, Math.round(tier.reaction * TICK_HZ));
+    // Упреждение считается в момент взгляда: оно поправляет ту картинку, которую
+    // бот видит, а не ту, которой он не видит.
+    const flight = (dist / SHELL_SPEED) * tier.lead;
+    brain.aimX = target.state.x + Math.sin(target.state.angle) * target.state.speed * flight;
+    brain.aimZ = target.state.z + Math.cos(target.state.angle) * target.state.speed * flight;
+  }
+
+  const aim = brain.bank ?? Math.atan2(brain.aimX - me.x, brain.aimZ - me.z);
   const turret = aim + brain.aimBias;
 
   const shot = hasShot(me, target.state, world.cover);
@@ -332,14 +365,6 @@ function findTank(world: BotWorld, id: number): BotTarget | null {
   if (id === 0) return null;
   for (const tank of world.tanks) if (tank.id === id) return tank;
   return null;
-}
-
-/** Угол на упреждённую точку: цель успеет проехать, пока летит снаряд. */
-function leadAngle(me: TankState, target: TankState, dist: number, lead: number): number {
-  const flight = (dist / SHELL_SPEED) * lead;
-  const px = target.x + Math.sin(target.angle) * target.speed * flight;
-  const pz = target.z + Math.cos(target.angle) * target.speed * flight;
-  return Math.atan2(px - me.x, pz - me.z);
 }
 
 /**
@@ -544,7 +569,7 @@ function steerTo(me: TankState, want: number, obstacles: Box[]): { throttle: num
 
 /**
  * Танк уперся: газ есть, а с места не двигается — значит встал в блок, в угол
- * карты или в борт соседа (удар о препятствие оставляет от скорости четверть).
+ * карты или в борт соседа (лобовой упор в грань гасит ход за полторы десятых).
  * Тогда на восемь десятых секунды сдаём назад с вывернутым рулём: этого хватает,
  * чтобы съехать с грани и зайти иначе. Башня при этом работает как работала —
  * отползающий бот всё ещё стреляет.

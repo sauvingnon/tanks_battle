@@ -9,22 +9,28 @@ import {
   DT,
   MAX_BOUNCES,
   MAX_HP,
+  MAX_SPEED,
+  RAM_DAMAGE,
+  RAM_MIN_SPEED,
   RELOAD_S,
   RESPAWN_S,
   RICOCHET_SPEED_KEEP,
   SHELL_DAMAGE,
   SHELL_LIFETIME,
   SHELL_SPEED,
+  TANK_RADIUS,
   TICK_HZ,
 } from '../src/shared/constants.js';
-import { bounceShell, canRicochet, sweepShell } from '../src/shared/sim.js';
+import { bounceShell, canRicochet, stepTank, sweepShell } from '../src/shared/sim.js';
 import { coverBoxes } from '../src/shared/map.js';
 import {
   BOOM_GROUND,
   BOOM_HIT,
   BOOM_KILL,
   BOOM_RICOCHET,
+  createTankState,
   type BoomKind,
+  type Box,
   type ShellState,
 } from '../src/shared/types.js';
 import { Room, type Player } from '../src/server/room.js';
@@ -294,6 +300,80 @@ const noop = () => {};
   const booms = run(room, 15);
   check('смерть приходит событием BOOM_KILL', booms.includes(BOOM_KILL));
   check('обычного попадания при добивании нет', !booms.includes(BOOM_HIT));
+}
+
+// --- 10. Скольжение вдоль грани ---
+//
+// Главное свойство новой физики упора: вдоль стены танк едет, а в стену — встаёт.
+// Проверяется на голой stepTank, без комнаты: это общий для клиента и сервера код.
+{
+  // Одинокий блок посреди пустоты — так проверяется грань, а не карта.
+  const wall: Box[] = [{ x: 0, z: 0, w: 40, d: 4, h: 4 }];
+  const gauge = (angle: number, ticks: number): number => {
+    // Ставим танк вплотную к северной грани блока и даём полный газ.
+    const state = createTankState(-15, 2 + TANK_RADIUS - 0.05, angle);
+    state.speed = MAX_SPEED;
+    for (let i = 0; i < ticks; i++) {
+      stepTank(state, { seq: 0, throttle: 1, steer: 0, turret: angle }, DT, wall);
+    }
+    return state.speed;
+  };
+
+  const second = Math.round(TICK_HZ);
+  // Танк стоит у северной грани, поэтому «в стену» — это в минус по Z, то есть
+  // угол больше PI/2: угол 0 смотрит в +Z.
+  const deg = (d: number, ticks = second) => gauge(Math.PI / 2 + (d * Math.PI) / 180, ticks);
+
+  check('вдоль грани танк едет на полном ходу', deg(0) > MAX_SPEED * 0.99);
+  check('касание бортом ход не отнимает', deg(10) > MAX_SPEED * 0.99);
+  check('под 30° танк всё ещё скользит', deg(30) > MAX_SPEED * 0.99);
+  check('под 45° скольжение почти без потерь', deg(45) > MAX_SPEED * 0.95);
+  check('под 55° грань уже держит', deg(55) < 1);
+  check('лобовой упор останавливает', deg(90, second / 2) < 0.5);
+  check('чем прямее удар, тем сильнее торможение', deg(45) > deg(50) && deg(50) > deg(55));
+}
+
+// --- 11. Таран ---
+{
+  // Разгоняем одного в борт стоящему. Оба — люди: боты друг друга не таранят.
+  const room = new Room();
+  const rammer = room.add('Таран', noop);
+  const victim = room.add('Мишень', noop);
+  place(rammer, 30, 40, 0);
+  place(victim, 30, 46, Math.PI / 2);
+  rammer.state.speed = MAX_SPEED;
+
+  for (let i = 0; i < 8; i++) {
+    seq++;
+    room.pushInput(rammer, { seq, throttle: 1, steer: 0, turret: 0 });
+    room.pushInput(victim, { seq, throttle: 0, steer: 0, turret: Math.PI / 2 });
+    room.update();
+  }
+
+  check('таран снял здоровье с протараненного', victim.hp < MAX_HP);
+  check('наехавший тоже получил, но меньше', rammer.hp < MAX_HP && rammer.hp > victim.hp);
+  check('урон тарана не превысил потолок', MAX_HP - victim.hp <= RAM_DAMAGE + 1e-6);
+  // Пауза важнее самой формулы: расталкивание идёт каждый тик, и без неё восемь
+  // тиков контакта означали бы восемь таранов подряд.
+  check('таран за контакт засчитан один раз', MAX_HP - victim.hp <= RAM_DAMAGE);
+}
+
+// --- 12. Медленное касание тараном не считается ---
+{
+  const room = new Room();
+  const creeper = room.add('Ползун', noop);
+  const victim = room.add('Мишень', noop);
+  place(creeper, -30, 40, 0);
+  place(victim, -30, 45, Math.PI);
+  creeper.state.speed = RAM_MIN_SPEED - 1;
+
+  for (let i = 0; i < 6; i++) {
+    seq++;
+    room.pushInput(creeper, { seq, throttle: 0, steer: 0, turret: 0 });
+    room.pushInput(victim, { seq, throttle: 0, steer: 0, turret: Math.PI });
+    room.update();
+  }
+  check('толчок на малом ходу урона не наносит', victim.hp === MAX_HP && creeper.hp === MAX_HP);
 }
 
 let failed = 0;

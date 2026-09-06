@@ -8,7 +8,6 @@
 import {
   BONUS_DAMAGE,
   BONUS_HEAL,
-  BONUS_HEAL_HP,
   BONUS_RELOAD,
   BONUS_SPEED,
   BONUS_STEALTH,
@@ -22,6 +21,8 @@ import {
   RESPAWN_S,
   SHELL_DAMAGE,
   SHELL_LIFETIME,
+  SHELL_SPEED,
+  TANK_RADIUS,
   TICK_HZ,
   WAVE_BREAK_S,
   waveConcurrent,
@@ -30,7 +31,7 @@ import {
 import { buildMap, MAP_NAMES, spawnPoint } from '../src/shared/map.js';
 import { sweepShell } from '../src/shared/sim.js';
 import { createTankState, type ShellState } from '../src/shared/types.js';
-import { findBankShot } from '../src/server/bot.js';
+import { createBrain, findBankShot, think } from '../src/server/bot.js';
 import { Room, type Player } from '../src/server/room.js';
 
 const checks: Array<[string, boolean]> = [];
@@ -432,7 +433,7 @@ function dropOn(room: Room, player: Player, kind: number): void {
   dropOn(room, hero, BONUS_HEAL);
   run(room, 1);
   check('ремонт подобран', room.bonusCount === 0);
-  check('ремонт вернул здоровье', hero.hp === 30 + BONUS_HEAL_HP);
+  check('ремонт чинит до максимума', hero.hp === MAX_HP);
 
   hero.hp = MAX_HP - 10;
   dropOn(room, hero, BONUS_HEAL);
@@ -689,6 +690,49 @@ function holdDistance(stance: number): number {
       `(${((perTick / budget) * 100).toFixed(1)}% ядра)`,
   );
   check('тик укладывается в десятую часть бюджета', perTick < budget / 10);
+}
+
+// --- Реакция: бот наводится на устаревшее место цели ---
+//
+// Это и есть вся разница уровней по едущей цели, и проверять её надо прямо на
+// think(): в бою она видна только как «мажет чаще», а такую метрику стенд
+// измерял бы часами и всё равно плавал бы от случая к случаю.
+{
+  const RANGE = 40;
+  const CROSS = 12; // цель идёт поперёк линии огня, м/с
+
+  /** Насколько мимо смотрит ствол: расстояние до точки, где цель будет к подлёту. */
+  const missOf = (tier: number, speed: number): number => {
+    const brain = createBrain(tier, 0, 0);
+    const me = { id: 1, team: 0, dead: false, stealth: false, state: createTankState(0, 0, 0), hp: BOT_HP, brain };
+    const foe = { id: 2, team: 1, dead: false, stealth: false, state: createTankState(0, RANGE, Math.PI / 2) };
+    foe.state.speed = speed;
+    const world = { tick: 0, obstacles: [], cover: [], tanks: [me, foe] };
+
+    // Полсекунды: столько цель успевает проехать между двумя мыслями новичка.
+    for (let i = 0; i <= Math.round(TICK_HZ / 2); i++) {
+      world.tick = i;
+      if (i > 0) foe.state.x += speed / TICK_HZ;
+      think(me, world);
+    }
+
+    // Куда снаряд придёт, если выстрелить сейчас, — с этим и сравниваем прицел.
+    const flight = Math.hypot(foe.state.x, foe.state.z) / SHELL_SPEED;
+    return Math.hypot(brain.aimX - (foe.state.x + speed * flight), brain.aimZ - foe.state.z);
+  };
+
+  const rookie = missOf(0, CROSS);
+  const ace = missOf(MAX_TIER, CROSS);
+  check('новичок наводится в устаревшее место', rookie > TANK_RADIUS * 2);
+  check('ас держит цель точно', ace < TANK_RADIUS);
+  check('чем выше тир, тем меньше промах', rookie > ace);
+  // По стоящей цели устаревшее место совпадает с настоящим: реакция наказывает
+  // только за движение, и стоять на месте от неё выгоднее не становится.
+  check('по стоящей цели промаха от реакции нет', missOf(0, 0) < 1e-9);
+  console.log(
+    `\nПрицел мимо точки подлёта при цели на ${CROSS} м/с: новичок ${rookie.toFixed(1)} м, ` +
+      `ас ${ace.toFixed(1)} м (радиус танка ${TANK_RADIUS} м)`,
+  );
 }
 
 // --- Итог ---

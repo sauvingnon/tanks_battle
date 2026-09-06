@@ -240,6 +240,12 @@ export interface TankHandle {
   everSeen: boolean;
   /** Когда остов выбросит следующий клуб дыма, в секундах от начала гибели. */
   smokeAt: number;
+  /**
+   * Танк уже вышел из комнаты и держится на сцене только ради остова: как
+   * догорит — убираем совсем. Так подбитый бот, которого сервер удаляет тем же
+   * тиком, всё-таки успевает сгореть на глазах.
+   */
+  retire: boolean;
   label: HTMLElement;
   hpFill: HTMLElement;
   /** Размеры подписи в пикселях, замеряются один раз — текст не меняется. */
@@ -656,6 +662,7 @@ export class Scene3D {
       paintColor,
       dying: -1,
       smokeAt: 0,
+      retire: false,
       everSeen: false,
       label,
       hpFill,
@@ -756,13 +763,14 @@ export class Scene3D {
 
   /** Горящий остов: оседает, дымит и в конце убирается со сцены. */
   private updateWrecks(dt: number): void {
-    for (const handle of this.tanks.values()) {
+    for (const [id, handle] of this.tanks) {
       if (handle.dying < 0) continue;
       handle.dying += dt;
 
       if (handle.dying >= WRECK_S) {
         handle.dying = -1;
         handle.root.visible = false;
+        if (handle.retire) this.dropTank(id, handle);
         continue;
       }
 
@@ -792,12 +800,38 @@ export class Scene3D {
     handle.root.visible = (handle.alive || handle.dying >= 0) && !cloaked;
   }
 
-  removeTank(id: number): void {
+  /**
+   * Танк ушёл из комнаты. killed — его подбили: тогда сцена оставляет остов
+   * догореть и убирает его сама, когда гибель доиграет.
+   *
+   * Различать обязательно: бота сервер удаляет из комнаты тем же тиком, в
+   * котором тот погиб, и «вышел» с «подбит» приходят одним сообщением. Без
+   * пометки бот исчезал бы с карты мгновенно — ровно как отключившийся игрок.
+   */
+  removeTank(id: number, killed = false): void {
     const handle = this.tanks.get(id);
     if (!handle) return;
+
+    if (killed && handle.everSeen && handle.alive) {
+      handle.alive = false;
+      handle.retire = true;
+      this.killTank(handle);
+      // Подпись гасит updateLabels: она смотрит на alive и снимет её сама.
+      return;
+    }
+    this.dropTank(id, handle);
+  }
+
+  /** Убрать танк со сцены совсем. */
+  private dropTank(id: number, handle: TankHandle): void {
     handle.label.remove();
     this.scene.remove(handle.root);
     this.tanks.delete(id);
+  }
+
+  /** Снести всех разом: переподключение начинает мир с чистого листа. */
+  clearTanks(): void {
+    for (const [id, handle] of this.tanks) this.dropTank(id, handle);
   }
 
   updateTank(id: number, x: number, z: number, angle: number, turret: number): void {

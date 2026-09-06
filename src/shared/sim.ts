@@ -1,13 +1,18 @@
 import {
   ACCEL,
   BRAKE,
-  BUMP_DAMPING,
+  BUMP_DECEL,
+  BUMP_GRAZE,
   FRICTION,
   MAP_HALF,
   MAX_BOUNCES,
   MAX_REVERSE,
   MAX_SPEED,
   MUZZLE_OFFSET,
+  RAM_DAMAGE,
+  RAM_FULL_SPEED,
+  RAM_MIN_SPEED,
+  RAM_SELF_SHARE,
   RICOCHET_MAX_COS,
   RICOCHET_SPEED_KEEP,
   SHELL_LIFETIME,
@@ -84,23 +89,63 @@ export function stepTank(
     state.turret + clamp(angleDiff(state.turret, input.turret), -maxTurn, maxTurn),
   );
 
-  resolveObstacles(state, obstacles);
-  resolveBounds(state);
+  // Оба выталкивания копят «насколько удар лобовой» и тормозят один раз: у стены
+  // из блоков танк касается сразу двух прямоугольников, и торможение за каждый
+  // отдельно останавливало бы вдвое резче, чем у такой же сплошной стены.
+  const hit = Math.max(resolveObstacles(state, obstacles), resolveBounds(state));
+  if (hit > 0) scrape(state, hit, dt);
 }
 
-function resolveBounds(state: TankState): void {
+/**
+ * Насколько контакт лобовой, 0..1: проекция курса на нормаль задетой грани.
+ * 1 — едем точно в стену, 0 — вдоль неё. Танк движется только по своему курсу,
+ * поэтому этого одного числа хватает, чтобы отличить удар от скольжения.
+ */
+function headOn(state: TankState, nx: number, nz: number): number {
+  if (state.speed === 0) return 0;
+  const into = -Math.sign(state.speed) * (Math.sin(state.angle) * nx + Math.cos(state.angle) * nz);
+  return clamp(into, 0, 1);
+}
+
+/**
+ * Торможение о грань. До BUMP_GRAZE стена не стоит ничего — там танк просто
+ * скользит вдоль неё выталкиванием, — а дальше сопротивление растёт квадратом и
+ * упор в лоб гасит ход почти мгновенно.
+ *
+ * Порог, а не плавная кривая, потому что мотор даёт всего ACCEL: любое
+ * торможение сильнее него — это уже полная остановка, а не «медленнее». Без
+ * порога полоса «едет, но вяло» получалась шириной градусов в пять, и всё, что
+ * круче, вставало намертво.
+ */
+function scrape(state: TankState, frac: number, dt: number): void {
+  const over = (frac - BUMP_GRAZE) / (1 - BUMP_GRAZE);
+  if (over <= 0) return;
+  const drop = BUMP_DECEL * over * over * dt;
+  state.speed = Math.abs(state.speed) <= drop ? 0 : state.speed - Math.sign(state.speed) * drop;
+}
+
+/** Стена по периметру карты. Возвращает, насколько удар лобовой; 0 — контакта нет. */
+function resolveBounds(state: TankState): number {
   const limit = MAP_HALF - TANK_RADIUS;
   const cx = clamp(state.x, -limit, limit);
   const cz = clamp(state.z, -limit, limit);
-  if (cx !== state.x || cz !== state.z) {
-    state.x = cx;
-    state.z = cz;
-    state.speed *= BUMP_DAMPING;
-  }
+  if (cx === state.x && cz === state.z) return 0;
+
+  // Нормаль смотрит внутрь карты: в угол упираются сразу по двум осям.
+  let nx = cx - state.x;
+  let nz = cz - state.z;
+  const len = Math.hypot(nx, nz) || 1;
+  nx /= len;
+  nz /= len;
+
+  state.x = cx;
+  state.z = cz;
+  return headOn(state, nx, nz);
 }
 
-/** Выталкивание круга танка из прямоугольных препятствий. */
-function resolveObstacles(state: TankState, obstacles: Box[]): void {
+/** Выталкивание круга танка из прямоугольных препятствий; результат — как у resolveBounds. */
+function resolveObstacles(state: TankState, obstacles: Box[]): number {
+  let worst = 0;
   for (const box of obstacles) {
     const hw = box.w / 2;
     const hd = box.d / 2;
@@ -109,8 +154,8 @@ function resolveObstacles(state: TankState, obstacles: Box[]): void {
     const nearestX = clamp(state.x, box.x - hw, box.x + hw);
     const nearestZ = clamp(state.z, box.z - hd, box.z + hd);
 
-    let dx = state.x - nearestX;
-    let dz = state.z - nearestZ;
+    const dx = state.x - nearestX;
+    const dz = state.z - nearestZ;
     const dist2 = dx * dx + dz * dz;
     if (dist2 >= TANK_RADIUS * TANK_RADIUS) continue;
 
@@ -119,6 +164,7 @@ function resolveObstacles(state: TankState, obstacles: Box[]): void {
       const push = (TANK_RADIUS - dist) / dist;
       state.x += dx * push;
       state.z += dz * push;
+      worst = Math.max(worst, headOn(state, dx / dist, dz / dist));
     } else {
       // Центр танка внутри прямоугольника — выталкиваем через ближайшую грань.
       const toLeft = state.x - (box.x - hw);
@@ -130,9 +176,11 @@ function resolveObstacles(state: TankState, obstacles: Box[]): void {
       else if (min === toRight) state.x = box.x + hw + TANK_RADIUS;
       else if (min === toBack) state.z = box.z - hd - TANK_RADIUS;
       else state.z = box.z + hd + TANK_RADIUS;
+      // Танк сидел внутри блока: это всегда упор, а не касание.
+      worst = 1;
     }
-    state.speed *= BUMP_DAMPING;
   }
+  return worst;
 }
 
 // --- Снаряды ---
@@ -297,19 +345,34 @@ export function bounceShell(shell: ShellState, hit: ShellHit): void {
 /** Зазор, на который снаряд отодвигается от стены после отскока. */
 const SURFACE_EPS = 1e-3;
 
+/** Столкновение двух танков, в котором кто-то разогнался: индексы во входном массиве. */
+export interface RamHit {
+  a: number;
+  b: number;
+  /** Скорость сближения по нормали удара, м/с. */
+  closing: number;
+  /** Урон каждому. Наезжающий получает меньше, но не ноль. */
+  damageA: number;
+  damageB: number;
+}
+
 /**
- * Расталкивание танков между собой. Вызывается только на сервере, после того как
- * все танки сделали свой шаг, — это глобальная фаза, а не часть stepTank.
+ * Расталкивание танков между собой и разбор тарана. Вызывается только на сервере,
+ * после того как все танки сделали свой шаг, — это глобальная фаза, а не часть
+ * stepTank. Возвращает столкновения, в которых была скорость: кому и сколько
+ * стоил удар, решает комната — здесь только физика.
  */
-export function resolveTankCollisions(tanks: TankState[]): void {
+export function resolveTankCollisions(tanks: TankState[], dt: number): RamHit[] {
   const minDist = TANK_RADIUS * 2;
+  const hits: RamHit[] = [];
+
   for (let i = 0; i < tanks.length; i++) {
     for (let j = i + 1; j < tanks.length; j++) {
       const a = tanks[i];
       const b = tanks[j];
       let dx = b.x - a.x;
       let dz = b.z - a.z;
-      let dist2 = dx * dx + dz * dz;
+      const dist2 = dx * dx + dz * dz;
       if (dist2 >= minDist * minDist) continue;
 
       let dist = Math.sqrt(dist2);
@@ -319,15 +382,43 @@ export function resolveTankCollisions(tanks: TankState[]): void {
         dz = 0;
         dist = 1;
       }
+      // Нормаль удара: от a к b.
+      const nx = dx / dist;
+      const nz = dz / dist;
+
       const overlap = (minDist - dist) / 2;
-      const nx = (dx / dist) * overlap;
-      const nz = (dz / dist) * overlap;
-      a.x -= nx;
-      a.z -= nz;
-      b.x += nx;
-      b.z += nz;
-      a.speed *= 0.6;
-      b.speed *= 0.6;
+      a.x -= nx * overlap;
+      a.z -= nz * overlap;
+      b.x += nx * overlap;
+      b.z += nz * overlap;
+
+      // Кто сколько привнёс в сближение. Отрицательное значит «уже уезжает» —
+      // такой танк в столкновении не виноват и в долю вины не идёт.
+      const intoA = Math.max(0, a.speed * (Math.sin(a.angle) * nx + Math.cos(a.angle) * nz));
+      const intoB = Math.max(0, -b.speed * (Math.sin(b.angle) * nx + Math.cos(b.angle) * nz));
+
+      // Борт о борт танки трутся весь бой, поэтому тормозим их тем же правилом,
+      // что и о стену: удар в лоб гасит ход, касание по касательной — почти нет.
+      scrape(a, Math.min(1, intoA / (Math.abs(a.speed) || 1)), dt);
+      scrape(b, Math.min(1, intoB / (Math.abs(b.speed) || 1)), dt);
+
+      const closing = intoA + intoB;
+      if (closing <= RAM_MIN_SPEED) continue;
+
+      const total =
+        RAM_DAMAGE *
+        clamp((closing - RAM_MIN_SPEED) / (RAM_FULL_SPEED - RAM_MIN_SPEED), 0, 1);
+      // Доля вины: наехал ты — платишь только RAM_SELF_SHARE, наехали на тебя —
+      // полную цену. В лобовом сближении вина пополам, и достаётся обоим поровну.
+      const blameA = intoA / closing;
+      hits.push({
+        a: i,
+        b: j,
+        closing,
+        damageA: total * (RAM_SELF_SHARE + (1 - RAM_SELF_SHARE) * (1 - blameA)),
+        damageB: total * (RAM_SELF_SHARE + (1 - RAM_SELF_SHARE) * blameA),
+      });
     }
   }
+  return hits;
 }

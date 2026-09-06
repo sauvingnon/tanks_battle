@@ -2,7 +2,6 @@
   BONUS_DAMAGE,
   BONUS_DAMAGE_MUL,
   BONUS_HEAL,
-  BONUS_HEAL_HP,
   BONUS_KINDS,
   BONUS_LIFETIME_S,
   BONUS_MAX,
@@ -27,6 +26,7 @@
   MAX_TIER,
   MODE_DM,
   MODE_PVE,
+  RAM_COOLDOWN_S,
   RELOAD_S,
   RESPAWN_S,
   SHELL_DAMAGE,
@@ -54,6 +54,7 @@ import {
   stepTank,
   sweepShell,
   sweepTank,
+  type RamHit,
 } from '../shared/sim.js';
 import {
   BOOM_GROUND,
@@ -79,6 +80,7 @@ import { botName, botSpawn, createBrain, think, type BotBrain } from './bot.js';
 /** Перезарядка и респавн считаются в тиках, чтобы жить в тех же часах, что и симуляция. */
 const RELOAD_TICKS = Math.round(RELOAD_S * TICK_HZ);
 const RESPAWN_TICKS = Math.round(RESPAWN_S * TICK_HZ);
+const RAM_COOLDOWN_TICKS = Math.round(RAM_COOLDOWN_S * TICK_HZ);
 
 /**
  * На сколько отрезков максимум режется путь снаряда за тик. Каждый отскок начинает
@@ -107,6 +109,8 @@ export interface Player {
   respawnAt: number;
   /** Тик, раньше которого выстрел не пройдёт. */
   readyAt: number;
+  /** Тик, раньше которого этот танк не получает и не наносит урон тараном. */
+  ramAt: number;
   kills: number;
   deaths: number;
   /** Очередь необработанных инпутов. */
@@ -243,6 +247,7 @@ export class Room {
       dead: false,
       respawnAt: 0,
       readyAt: 0,
+      ramAt: 0,
       kills: 0,
       deaths: 0,
       queue: [],
@@ -339,11 +344,45 @@ export class Room {
       }
     }
 
-    const alive: TankState[] = [];
-    for (const p of this.players.values()) if (!p.dead) alive.push(p.state);
-    resolveTankCollisions(alive);
+    const alive: Player[] = [];
+    for (const p of this.players.values()) if (!p.dead) alive.push(p);
+    this.applyRams(
+      alive,
+      resolveTankCollisions(
+        alive.map((p) => p.state),
+        DT,
+      ),
+    );
 
     this.updateShells();
+  }
+
+  /**
+   * Урон от таранов. Физика посчитана в resolveTankCollisions, комната решает,
+   * кому он вообще засчитывается.
+   *
+   * Боты друг друга не таранят. Они ходят стаей и постоянно трутся бортами,
+   * обходя цель, — с уроном волна выкашивала бы себя сама, и чем больше ботов,
+   * тем быстрее. Игроку это читалось бы как «волна кончилась сама собой».
+   */
+  private applyRams(alive: Player[], hits: RamHit[]): void {
+    for (const hit of hits) {
+      const a = alive[hit.a];
+      const b = alive[hit.b];
+      if (a.brain && b.brain) continue;
+      // Пауза общая на танк, а не на пару: иначе в свалке трое разом снимали бы
+      // с одного полный урон каждый тик, и таран решал бы бой без единого выстрела.
+      if (this.tick < a.ramAt || this.tick < b.ramAt) continue;
+      a.ramAt = this.tick + RAM_COOLDOWN_TICKS;
+      b.ramAt = this.tick + RAM_COOLDOWN_TICKS;
+
+      // Урон получают оба, даже если первый же удар кого-то убил: встречный
+      // таран — это размен, а не очередь. Имена берём заранее по той же причине.
+      const nameA = a.name;
+      const nameB = b.name;
+      this.hurt(a, hit.damageA, b.id, nameB);
+      this.hurt(b, hit.damageB, a.id, nameA);
+    }
   }
 
   /** Шаг бота: думает сам, дальше едет и стреляет по общим правилам. */
@@ -468,16 +507,29 @@ export class Room {
   }
 
   private damage(victim: Player, shell: ShellState): void {
-    // Стрелявший мог погибнуть или выйти, пока снаряд летел. На попадание это не
-    // влияет: урон снаряд принёс с собой, а имя для ленты найдётся среди ушедших.
-    const killer = this.players.get(shell.owner);
-    const killerName = killer?.name ?? this.ghosts.get(shell.owner) ?? 'Неизвестный';
+    if (this.hurt(victim, shell.dmg ?? SHELL_DAMAGE, shell.owner)) return;
+    this.booms.push({ x: shell.x, z: shell.z, k: BOOM_HIT, o: shell.owner });
+  }
 
-    victim.hp -= shell.dmg ?? SHELL_DAMAGE;
-    if (victim.hp > 0) {
-      this.booms.push({ x: shell.x, z: shell.z, k: BOOM_HIT, o: shell.owner });
-      return;
-    }
+  /**
+   * Снять здоровье и, если оно кончилось, провести смерть. Возвращает true, если
+   * танк подбит: вызывающая сторона по этому решает, показывать ли отметку
+   * попадания — взрыв гибели она уже поставила сама.
+   *
+   * Единая точка на выстрел и на таран. Разводить их нельзя: смерть тянет за
+   * собой фраг, ленту, сгорание бонусов, выбывание бота и ожидание волны, и
+   * второй экземпляр этого списка разошёлся бы с первым на первой же правке.
+   */
+  private hurt(victim: Player, amount: number, killerId: number, name?: string): boolean {
+    // Убивший мог погибнуть или выйти, пока летел снаряд. На попадание это не
+    // влияет: урон снаряд принёс с собой, а имя для ленты найдётся среди ушедших.
+    // Имя можно передать и явно — во встречном таране оба гибнут в одном тике,
+    // и второго из них искать в комнате уже поздно.
+    const killer = this.players.get(killerId);
+    const killerName = name ?? killer?.name ?? this.ghosts.get(killerId) ?? 'Неизвестный';
+
+    victim.hp -= amount;
+    if (victim.hp > 0) return false;
 
     victim.hp = 0;
     victim.dead = true;
@@ -487,21 +539,24 @@ export class Room {
     // Бонусы сгорают вместе с танком: копить усиления через смерть нельзя.
     victim.fx.fill(0);
     victim.stealth = false;
-    this.booms.push({ x: victim.state.x, z: victim.state.z, k: BOOM_KILL, o: shell.owner });
+    this.booms.push({ x: victim.state.x, z: victim.state.z, k: BOOM_KILL, o: killerId });
 
     // За смерть от собственного рикошета фраг не полагается — только запись в ленту.
     if (killer && killer !== victim) killer.kills++;
     this.kills.push({ killer: killerName, victim: victim.name });
 
     if (victim.brain) {
-      // Бот выбывает насовсем: волна кончится, когда карта опустеет.
+      // Бот выбывает насовсем: волна кончится, когда карта опустеет. Пометка
+      // killed нужна клиенту: без неё он стёр бы танк тем же кадром, и вместо
+      // горящего остова бот просто исчезал бы — то же событие, что и выход из игры.
       this.forget(victim);
       this.players.delete(victim.id);
-      this.emit({ t: 'left', id: victim.id });
+      this.emit({ t: 'left', id: victim.id, killed: true });
     } else if (this.mode === MODE_PVE) {
       // Жизнь одна на волну — в строй вернёт только её зачистка.
       victim.waiting = true;
     }
+    return true;
   }
 
   private respawn(player: Player): void {
@@ -553,7 +608,9 @@ export class Room {
 
   private applyBonus(player: Player, kind: number): void {
     if (kind === BONUS_HEAL) {
-      player.hp = Math.min(MAX_HP, player.hp + BONUS_HEAL_HP);
+      // Чиним полностью, а не на фиксированное число: максимум у бота свой,
+      // и прибавка в HP лечила бы его либо до потолка, либо мимо него.
+      player.hp = player.brain ? BOT_HP : MAX_HP;
     } else {
       // Второй ящик того же вида не складывается, а отсчитывает срок заново.
       player.fx[kind] = this.tick + Math.round(BONUS_DURATION_S[kind] * TICK_HZ);

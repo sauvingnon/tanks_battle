@@ -97,6 +97,13 @@ const snapshots: BufferedSnapshot[] = [];
  */
 const pendingBooms: Array<{ at: number; boom: Boom }> = [];
 
+/**
+ * Подбитые, которых сервер уже удалил из комнаты. Ждут той же задержки, что и
+ * взрывы: сообщение о гибели приходит на 100 мс раньше, чем картинка мира до
+ * этого момента доедет, и без очереди бот загорался бы до попадания по нему.
+ */
+const pendingWrecks: Array<{ at: number; id: number }> = [];
+
 /** id снарядов, которые мы уже видели: по новым рисуем вспышку выстрела. */
 const knownShells = new Set<number>();
 
@@ -215,7 +222,10 @@ function handleMessage(msg: ServerMessage): void {
       break;
     case 'left':
       players.delete(msg.id);
-      scene.removeTank(msg.id);
+      // Подбитый уходит со сцены не сразу: он ещё должен догореть, и попасть в
+      // тот же момент, что и его взрыв, — иначе остов вспыхивает раньше выстрела.
+      if (msg.killed) pendingWrecks.push({ at: performance.now() + INTERP_DELAY_MS, id: msg.id });
+      else scene.removeTank(msg.id);
       updateHud();
       break;
     case 'config':
@@ -415,8 +425,11 @@ function frame(now: number): void {
   updateBanner(now);
 }
 
-/** Взрывы, у которых подошло время. */
+/** Взрывы и остовы, у которых подошло время. */
 function playBooms(now: number): void {
+  while (pendingWrecks.length > 0 && pendingWrecks[0].at <= now) {
+    scene.removeTank(pendingWrecks.shift()!.id, true);
+  }
   while (pendingBooms.length > 0 && pendingBooms[0].at <= now) {
     const { boom } = pendingBooms.shift()!;
     scene.boom(boom.x, boom.z, boom.k);
@@ -970,10 +983,12 @@ function showOverlay(message: string, isError = false): void {
 }
 
 function resetWorld(): void {
-  for (const id of players.keys()) scene.removeTank(id);
+  // Именно clearTanks, а не обход players: догорающие остовы из комнаты уже вышли.
+  scene.clearTanks();
   players.clear();
   snapshots.length = 0;
   pendingBooms.length = 0;
+  pendingWrecks.length = 0;
   knownShells.clear();
   scene.clearShells();
   selfId = 0;
