@@ -11,13 +11,18 @@ import {
   BOT_HP,
   STANCE_COUNT,
   STANCE_NEUTRAL,
+  GUN_PITCH_MAX,
+  GUN_PITCH_MIN,
   MAX_BOUNCES,
   RELOAD_S,
+  SHELL_HEIGHT,
   SHELL_LIFETIME,
   SHELL_SPEED,
+  TANK_HEIGHT,
   TANK_RADIUS,
   TICK_HZ,
 } from '../shared/constants.js';
+import { heightAt, type Terrain } from '../shared/terrain.js';
 import {
   angleDiff,
   bounceShell,
@@ -212,6 +217,12 @@ export interface BotWorld {
   tanks: Iterable<BotTarget>;
   /** Манера боя комнаты; не задана — нейтральная. */
   stance?: number;
+  /**
+   * Рельеф карты; на плоских картах его нет. С ним линия огня перестаёт быть
+   * плоской: бот считает возвышение до цели и проверяет, не упрётся ли выстрел
+   * в гребень перед ним. Это тот же луч, которым потом будет считаться засвет.
+   */
+  terrain?: Terrain;
 }
 
 /** Раз в столько тиков бот пересматривает цель — полсекунды. */
@@ -282,7 +293,7 @@ export function think(self: BotSelf, world: BotWorld): Input {
   const aim = brain.bank ?? Math.atan2(brain.aimX - me.x, brain.aimZ - me.z);
   const turret = aim + brain.aimBias;
 
-  const shot = hasShot(me, target.state, world.cover);
+  const shot = hasShot(me, target.state, world.cover, world.terrain);
   const clear = shot || brain.bank !== null;
   // Порог наводки — угловой размер танка на этой дистанции, растянутый терпением тира.
   const gate = Math.atan2(TANK_RADIUS, Math.max(dist, TANK_RADIUS)) * tier.fireGate;
@@ -299,7 +310,13 @@ export function think(self: BotSelf, world: BotWorld): Input {
   const want = heading(self, target.state, dist, tier, world, retreat, shot);
   const drive = unstick(brain, me, world.tick, steerTo(me, want, world.obstacles));
 
-  return { seq: 0, throttle: drive.throttle, steer: drive.steer, turret, fire };
+  // Возвышение ствола на рельефе. У выстрела с отскоком его нет: тот считался
+  // горизонтальной траекторией, и задирать ствол значило бы стрелять не туда,
+  // где найден отскок.
+  const pitch =
+    world.terrain && brain.bank === null ? aimPitch(world.terrain, me, target.state, dist) : 0;
+
+  return { seq: 0, throttle: drive.throttle, steer: drive.steer, turret, pitch, fire };
 }
 
 /** Выбор цели: ближайший видимый противник, иначе просто ближайший. */
@@ -316,7 +333,7 @@ function retarget(self: BotSelf, world: BotWorld, tier: BotTier): void {
     // Замаскированного издали бот не видит вовсе; вплотную — уже да.
     if (tank.stealth && d > BONUS_STEALTH_RANGE) continue;
     // Видимую цель предпочитаем даже если она вдвое дальше укрытой.
-    const score = hasShot(me, tank.state, world.cover) ? d : d * 2.5 + 40;
+    const score = hasShot(me, tank.state, world.cover, world.terrain) ? d : d * 2.5 + 40;
     if (score < bestScore) {
       bestScore = score;
       best = tank;
@@ -351,8 +368,8 @@ function retarget(self: BotSelf, world: BotWorld, tier: BotTier): void {
 
   // Рикошет ищем только когда прямого выстрела нет — иначе он и не нужен.
   brain.bank =
-    tier.ricochet && !hasShot(me, best.state, world.cover)
-      ? findBankShot(me, best.state, world.cover)
+    tier.ricochet && !hasShot(me, best.state, world.cover, world.terrain)
+      ? findBankShot(me, best.state, world.cover, world.terrain)
       : null;
 
   if (world.tick > brain.orbitUntil) {
@@ -485,8 +502,15 @@ function free(x: number, z: number, angle: number, dist: number, obstacles: Box[
   return worst;
 }
 
-/** Свободна ли линия огня до цели. Считается по укрытиям, а не по всем блокам. */
-function hasShot(me: TankState, target: TankState, cover: Box[]): boolean {
+/**
+ * Свободна ли линия огня до цели. Считается по укрытиям, а не по всем блокам.
+ *
+ * С рельефом луч идёт в трёх измерениях: из своего дульного среза в середину
+ * силуэта цели, с тем же возвышением, с каким уйдёт снаряд. Поэтому «вижу» и
+ * «достану» здесь одно и то же — если между нами гребень, выстрела нет, даже
+ * когда цель видна поверх него.
+ */
+function hasShot(me: TankState, target: TankState, cover: Box[], terrain?: Terrain): boolean {
   const dx = target.x - me.x;
   const dz = target.z - me.z;
   const dist = Math.hypot(dx, dz);
@@ -495,38 +519,68 @@ function hasShot(me: TankState, target: TankState, cover: Box[]): boolean {
 
   // Останавливаемся у борта цели, а не в её центре, иначе сама цель считается стеной.
   const shorten = Math.max(0, dist - TANK_RADIUS) / dist;
-  const hit = sweepShell(ray(me.x, me.z, dx * shorten, dz * shorten), 1, cover);
-  return hit === null;
+  if (!terrain) {
+    return sweepShell(ray(me.x, me.z, dx * shorten, dz * shorten), 1, cover) === null;
+  }
+
+  const from = heightAt(terrain, me.x, me.z) + SHELL_HEIGHT;
+  const rise = Math.tan(aimPitch(terrain, me, target, dist)) * dist * shorten;
+  const probe = ray(me.x, me.z, dx * shorten, dz * shorten, from, rise);
+  return sweepShell(probe, 1, cover, terrain) === null;
+}
+
+/**
+ * Возвышение ствола до цели: из дульного среза в середину силуэта. Зажато
+ * пределами пушки — там же, где его зажимает комната у живого игрока, поэтому
+ * бот не достанет того, кого не достал бы человек с той же позиции.
+ */
+function aimPitch(terrain: Terrain, me: TankState, target: TankState, dist: number): number {
+  const from = heightAt(terrain, me.x, me.z) + SHELL_HEIGHT;
+  const to = heightAt(terrain, target.x, target.z) + TANK_HEIGHT * 0.5;
+  return clamp(Math.atan2(to - from, Math.max(dist, 1e-3)), GUN_PITCH_MIN, GUN_PITCH_MAX);
 }
 
 /**
  * Перебор углов в поисках выстрела с отскоком. Траектория считается тем же кодом,
  * что и настоящий полёт снаряда, поэтому найденный угол действительно сработает.
  */
-export function findBankShot(me: TankState, target: TankState, obstacles: Box[]): number | null {
+export function findBankShot(
+  me: TankState,
+  target: TankState,
+  obstacles: Box[],
+  terrain?: Terrain,
+): number | null {
   const direct = Math.atan2(target.x - me.x, target.z - me.z);
   // Шире 70 градусов от цели рикошет уже уводит снаряд за карту.
   for (let step = 1; step <= 12; step++) {
     for (const side of [1, -1]) {
       const angle = direct + side * step * 0.1;
-      if (bankHits(me, angle, target, obstacles)) return angle;
+      if (bankHits(me, angle, target, obstacles, terrain)) return angle;
     }
   }
   return null;
 }
 
 /** Прогон одного пробного выстрела до попадания, взрыва или конца жизни снаряда. */
-function bankHits(me: TankState, angle: number, target: TankState, obstacles: Box[]): boolean {
+function bankHits(
+  me: TankState,
+  angle: number,
+  target: TankState,
+  obstacles: Box[],
+  terrain?: Terrain,
+): boolean {
   const muzzle = createTankState(me.x, me.z, me.angle);
   muzzle.turret = angle;
-  const shell = spawnShell(0, -1, muzzle);
+  // Пробный выстрел идёт ровно тем же кодом, что настоящий, — включая землю под
+  // стрелком: на рельефе горизонтальный снаряд может уткнуться в свой же склон.
+  const shell = spawnShell(0, -1, muzzle, 0, terrain ? heightAt(terrain, me.x, me.z) : 0);
 
   let time = SHELL_LIFETIME;
   for (let segment = 0; segment < MAX_BOUNCES + 2 && time > 1e-4; segment++) {
-    const wall = sweepShell(shell, time, obstacles);
+    const wall = sweepShell(shell, time, obstacles, terrain);
     const limit = wall ? wall.t : 1;
 
-    const hit = sweepTank(shell, time, target);
+    const hit = sweepTank(shell, time, target, terrain);
     // Прямое попадание засчитываем только после отскока: без него это не рикошет.
     if (hit !== null && hit <= limit) return shell.bounces > 0;
 
@@ -596,9 +650,19 @@ function unstick(
   return drive;
 }
 
-/** Одноразовый «снаряд» для свипа: dt = 1, поэтому смещение равно (dx, dz). */
-function ray(x: number, z: number, dx: number, dz: number): ShellState {
-  return { id: 0, owner: -1, x, z, vx: dx, vz: dz, life: 1, bounces: 0 };
+/**
+ * Одноразовый «снаряд» для свипа: dt = 1, поэтому смещение равно (dx, dz, dy).
+ * Без высоты это прежний плоский щуп — им бот и щупает объезд.
+ */
+function ray(
+  x: number,
+  z: number,
+  dx: number,
+  dz: number,
+  y = SHELL_HEIGHT,
+  dy = 0,
+): ShellState {
+  return { id: 0, owner: -1, x, z, y, vx: dx, vz: dz, vy: dy, life: 1, bounces: 0 };
 }
 
 /**

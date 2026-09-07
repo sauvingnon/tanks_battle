@@ -77,6 +77,9 @@ export class Net {
       th: round(input.throttle),
       st: round(input.steer),
       tu: round(input.turret),
+      // Возвышение — только когда оно есть: на плоских картах его нет вовсе, и
+      // трафик инпутов там остаётся ровно прежним.
+      ...(input.pitch ? { pi: round(input.pitch) } : {}),
       // Поле шлём только в тик выстрела: оно бывает раз в полторы секунды.
       ...(input.fire ? { f: 1 as const } : {}),
     });

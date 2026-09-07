@@ -3,6 +3,7 @@ import {
   BRAKE,
   BUMP_DECEL,
   BUMP_GRAZE,
+  clamp,
   FRICTION,
   MAP_HALF,
   MAX_BOUNCES,
@@ -15,19 +16,22 @@ import {
   RAM_SELF_SHARE,
   RICOCHET_MAX_COS,
   RICOCHET_SPEED_KEEP,
+  SHELL_HEIGHT,
   SHELL_LIFETIME,
   SHELL_RADIUS,
   SHELL_SPEED,
+  TANK_HEIGHT,
   TANK_RADIUS,
   TURN_RATE_FULL,
   TURN_RATE_STILL,
   TURRET_RATE,
 } from './constants.js';
+import { groundHit, heightAt, type Terrain } from './terrain.js';
 import type { Box, Input, ShellState, TankState } from './types.js';
 
-export function clamp(v: number, lo: number, hi: number): number {
-  return v < lo ? lo : v > hi ? hi : v;
-}
+// Живёт в constants.ts, чтобы рельеф мог им пользоваться, не замыкая импорты
+// на симуляцию. Половина проекта берёт clamp отсюда, поэтому здесь он и остаётся.
+export { clamp };
 
 /** Приводит угол к диапазону (-PI, PI]. */
 export function wrapAngle(a: number): number {
@@ -185,25 +189,49 @@ function resolveObstacles(state: TankState, obstacles: Box[]): number {
 
 // --- Снаряды ---
 
-/** Снаряд, вылетающий из башни танка. Скорость танка не добавляется — так проще целиться. */
-export function spawnShell(id: number, owner: number, state: TankState): ShellState {
+/**
+ * Снаряд, вылетающий из башни танка. Скорость танка не добавляется — так проще целиться.
+ *
+ * pitch — вертикальная наводка, рад: вверх положительная. На аркадных картах она
+ * всегда ноль, и тогда всё это в точности прежний горизонтальный выстрел.
+ * ground — высота земли под танком: снаряд летит на SHELL_HEIGHT над ней.
+ */
+export function spawnShell(
+  id: number,
+  owner: number,
+  state: TankState,
+  pitch = 0,
+  ground = 0,
+): ShellState {
   const a = state.turret;
+  const flat = Math.cos(pitch);
+  const rise = Math.sin(pitch);
   return {
     id,
     owner,
-    x: state.x + Math.sin(a) * MUZZLE_OFFSET,
-    z: state.z + Math.cos(a) * MUZZLE_OFFSET,
-    vx: Math.sin(a) * SHELL_SPEED,
-    vz: Math.cos(a) * SHELL_SPEED,
+    x: state.x + Math.sin(a) * MUZZLE_OFFSET * flat,
+    z: state.z + Math.cos(a) * MUZZLE_OFFSET * flat,
+    y: ground + SHELL_HEIGHT + rise * MUZZLE_OFFSET,
+    vx: Math.sin(a) * SHELL_SPEED * flat,
+    vz: Math.cos(a) * SHELL_SPEED * flat,
+    vy: rise * SHELL_SPEED,
     life: SHELL_LIFETIME,
     bounces: 0,
   };
 }
 
-/** Один шаг снаряда по свободному участку: прямая, без гравитации. */
+/**
+ * Один шаг снаряда по свободному участку: прямая, без гравитации.
+ *
+ * Гравитации не будет и дальше. При 62 м/с снаряд на двухстах метрах падал бы на
+ * полсотни: честная баллистика требует поднять скорость до реальных, а тогда
+ * исчезает упреждение — то, на чём держится вся стрельба по движущимся. Высоту и
+ * вертикальную наводку рельеф требует, падение снаряда — нет.
+ */
 export function stepShell(shell: ShellState, dt: number): void {
   shell.x += shell.vx * dt;
   shell.z += shell.vz * dt;
+  shell.y += shell.vy * dt;
   shell.life -= dt;
 }
 
@@ -216,29 +244,68 @@ export interface ShellHit {
   nz: number;
   /** Снаряд начал шаг внутри геометрии — отражать не от чего, только взрыв. */
   stuck: boolean;
+  /**
+   * Задета земля или крыша блока, а не боковая грань. Рикошета отсюда нет: все
+   * вертикальные грани на карте выровнены по осям, и отскок от них считается
+   * точно, а склон — поверхность произвольного наклона, от которой честно
+   * отражать нечем. Снаряд, воткнувшийся в землю, взрывается.
+   */
+  ground: boolean;
 }
 
 /**
- * Ближайшее препятствие или стена карты на пути снаряда за время dt; null — путь свободен.
+ * Ближайшее препятствие, земля или стена карты на пути снаряда за время dt;
+ * null — путь свободен.
  *
  * Прямоугольники раздуты на радиус снаряда, поэтому сам снаряд считается точкой,
  * и задача сводится к пересечению отрезка с AABB методом слэбов. Заодно это
  * избавляет от подшагов: касание находится точно, сквозь тонкий блок не проскочить.
+ *
+ * terrain задаёт, считать ли высоту. Без него свип двумерный, ровно как был: на
+ * аркадных картах снаряд идёт на постоянной высоте, все укрытия выше неё, и
+ * лишняя ось стоила бы работы, не меняя ни одного ответа. С рельефом добавляются
+ * третий слэб у блоков (можно перелететь через крышу) и марш по земле.
  */
-export function sweepShell(shell: ShellState, dt: number, obstacles: Box[]): ShellHit | null {
+export function sweepShell(
+  shell: ShellState,
+  dt: number,
+  obstacles: Box[],
+  terrain?: Terrain,
+): ShellHit | null {
   const dx = shell.vx * dt;
   const dz = shell.vz * dt;
+  const dy = shell.vy * dt;
 
   let best = sweepBounds(shell.x, shell.z, dx, dz);
   for (const box of obstacles) {
-    const hit = sweepBox(shell.x, shell.z, dx, dz, box);
+    const hit = sweepBox(shell.x, shell.z, shell.y, dx, dz, dy, box, terrain !== undefined);
     if (hit && (best === null || hit.t < best.t)) best = hit;
+  }
+
+  if (terrain) {
+    const t = groundHit(terrain, shell.x, shell.z, shell.y, dx, dz, dy);
+    if (t !== null && (best === null || t < best.t)) {
+      best = { t, nx: 0, nz: 0, stuck: t === 0, ground: true };
+    }
   }
   return best;
 }
 
-/** Раздутый прямоугольник препятствия. */
-function sweepBox(px: number, pz: number, dx: number, dz: number, box: Box): ShellHit | null {
+/**
+ * Раздутый прямоугольник препятствия. vertical включает третий слэб по высоте:
+ * блок стоит на своём основании box.y и кончается на box.y + box.h, и снаряд с
+ * вертикальной наводкой может пройти над ним.
+ */
+function sweepBox(
+  px: number,
+  pz: number,
+  py: number,
+  dx: number,
+  dz: number,
+  dy: number,
+  box: Box,
+  vertical: boolean,
+): ShellHit | null {
   const hw = box.w / 2 + SHELL_RADIUS;
   const hd = box.d / 2 + SHELL_RADIUS;
 
@@ -247,21 +314,36 @@ function sweepBox(px: number, pz: number, dx: number, dz: number, box: Box): She
   const sz = slab(pz, dz, box.z - hd, box.z + hd);
   if (sz === null) return null;
 
-  const enter = Math.max(sx.enter, sz.enter);
-  const exit = Math.min(sx.exit, sz.exit);
+  let enter = Math.max(sx.enter, sz.enter);
+  let exit = Math.min(sx.exit, sz.exit);
+  let roof = false;
+
+  if (vertical) {
+    const base = box.y ?? 0;
+    const sy = slab(py, dy, base - SHELL_RADIUS, base + box.h + SHELL_RADIUS);
+    if (sy === null) return null;
+    roof = sy.enter > enter;
+    enter = Math.max(enter, sy.enter);
+    exit = Math.min(exit, sy.exit);
+  }
+
   if (enter > exit || exit < 0 || enter > 1) return null;
 
   // Танк может прижаться к стене вплотную, и тогда снаряд рождается уже внутри блока.
-  if (enter < 0) return { t: 0, nx: 0, nz: 0, stuck: true };
+  if (enter < 0) return { t: 0, nx: 0, nz: 0, stuck: true, ground: false };
 
-  // В прямоугольник входят по той оси, в чей слэб попали последней.
+  // Вошли по той оси, в чей слэб попали последней. Крыша — та же земля: от неё
+  // не рикошетят, потому что снаряд пришёл в неё сверху и почти отвесно.
+  if (roof) return { t: enter, nx: 0, nz: 0, stuck: false, ground: true };
   return sx.enter > sz.enter ? faceHit(enter, dx, true) : faceHit(enter, dz, false);
 }
 
 /** Стена по периметру карты: снаряд летит внутри квадрата и упирается в него изнутри. */
 function sweepBounds(px: number, pz: number, dx: number, dz: number): ShellHit | null {
   const limit = MAP_HALF - SHELL_RADIUS;
-  if (Math.abs(px) > limit || Math.abs(pz) > limit) return { t: 0, nx: 0, nz: 0, stuck: true };
+  if (Math.abs(px) > limit || Math.abs(pz) > limit) {
+    return { t: 0, nx: 0, nz: 0, stuck: true, ground: false };
+  }
 
   const tx = dx === 0 ? Infinity : ((dx > 0 ? limit : -limit) - px) / dx;
   const tz = dz === 0 ? Infinity : ((dz > 0 ? limit : -limit) - pz) / dz;
@@ -273,7 +355,7 @@ function sweepBounds(px: number, pz: number, dx: number, dz: number): ShellHit |
 /** Нормаль всегда смотрит навстречу снаряду. */
 function faceHit(t: number, d: number, alongX: boolean): ShellHit {
   const n = d > 0 ? -1 : 1;
-  return { t, nx: alongX ? n : 0, nz: alongX ? 0 : n, stuck: false };
+  return { t, nx: alongX ? n : 0, nz: alongX ? 0 : n, stuck: false, ground: false };
 }
 
 /** Пересечение луча с полосой [min, max] по одной оси; null — луч идёт мимо полосы. */
@@ -295,8 +377,17 @@ function slab(
 /**
  * Доля шага до попадания в танк, или null. Танк — круг, снаряд — точка с радиусом,
  * то есть это пересечение отрезка с окружностью суммарного радиуса.
+ *
+ * С рельефом круг становится цилиндром высотой TANK_HEIGHT, стоящим на своей
+ * земле: снаряд с вертикальной наводкой проходит над целью или бьёт в склон
+ * перед ней. Без terrain — прежняя двумерная задача, где высота одна на всех.
  */
-export function sweepTank(shell: ShellState, dt: number, tank: TankState): number | null {
+export function sweepTank(
+  shell: ShellState,
+  dt: number,
+  tank: TankState,
+  terrain?: Terrain,
+): number | null {
   const dx = shell.vx * dt;
   const dz = shell.vz * dt;
   const px = shell.x - tank.x;
@@ -307,19 +398,34 @@ export function sweepTank(shell: ShellState, dt: number, tank: TankState): numbe
   if (a < 1e-12) return null;
 
   const c = px * px + pz * pz - r * r;
-  if (c <= 0) return 0; // снаряд уже внутри круга
-
   const b = 2 * (px * dx + pz * dz);
   const disc = b * b - 4 * a * c;
   if (disc < 0) return null;
 
-  const t = (-b - Math.sqrt(disc)) / (2 * a);
-  return t >= 0 && t <= 1 ? t : null;
+  const root = Math.sqrt(disc);
+  // Снаряд уже внутри круга — считаем, что он был там с начала отрезка.
+  let from = c <= 0 ? 0 : (-b - root) / (2 * a);
+  const till = (-b + root) / (2 * a);
+  if (till < 0 || from > 1) return null;
+  from = Math.max(from, 0);
+
+  if (!terrain) return from;
+
+  // Высотный слэб цилиндра. Земля берётся под центром танка: наклон корпуса на
+  // склоне меняет силуэт на десяток сантиметров, а стоит выборки в каждом свипе.
+  const base = heightAt(terrain, tank.x, tank.z);
+  const sy = slab(shell.y, shell.vy * dt, base - SHELL_RADIUS, base + TANK_HEIGHT + SHELL_RADIUS);
+  if (sy === null) return null;
+
+  const enter = Math.max(from, sy.enter);
+  const exit = Math.min(till, sy.exit);
+  if (enter > exit || enter > 1) return null;
+  return Math.max(enter, 0);
 }
 
 /** Достаточно ли полого снаряд задел грань, чтобы отскочить, а не взорваться. */
 export function canRicochet(shell: ShellState, hit: ShellHit): boolean {
-  if (hit.stuck || shell.bounces >= MAX_BOUNCES) return false;
+  if (hit.stuck || hit.ground || shell.bounces >= MAX_BOUNCES) return false;
 
   const speed = Math.hypot(shell.vx, shell.vz);
   if (speed < 1e-6) return false;

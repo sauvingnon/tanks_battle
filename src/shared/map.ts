@@ -1,4 +1,5 @@
 import { MAP_HALF, SHELL_HEIGHT } from './constants.js';
+import { buildTerrain, FLAT, settleBoxes, type Terrain, type TerrainDef } from './terrain.js';
 import type { Box } from './types.js';
 
 /**
@@ -19,6 +20,11 @@ export interface MapDef {
   build: () => Box[];
   /** Точки появления танков; лицом к центру карты. */
   spawns: Array<[number, number]>;
+  /**
+   * Рельеф. Нет описания — карта плоская, и вся высотная арифметика уходит по
+   * короткому пути: аркадные семь карт остаются ровно теми же, что были.
+   */
+  terrain?: TerrainDef;
 }
 
 /** Двенадцать точек по кругу — исторический спавн первой карты. */
@@ -296,6 +302,39 @@ function buildDunes(): Box[] {
   return boxes;
 }
 
+/**
+ * «Холмы»: первая карта с рельефом. Блоков на ней мало и стоят они редко —
+ * укрытием работает сама земля. Гребень в паре метров над тобой закрывает
+ * выстрел так же честно, как стена, но, в отличие от стены, из-за него можно
+ * выглянуть, не выезжая целиком: «вижу» и «достану» разъезжаются не по высоте
+ * блока, а по тому, кто выше стоит.
+ *
+ * Низкие гряды здесь работают как на «Дюнах» — мешают ехать, а не стрелять, —
+ * и держат бой в складках вместо того, чтобы гонять его по прямой.
+ */
+function buildHills(): Box[] {
+  const boxes: Box[] = [];
+  const rock = (x: number, z: number, w: number, d: number, h: number) => {
+    boxes.push({ x, z, w, d, h });
+  };
+
+  // Скалы: единственное, что держит снаряд независимо от того, кто где стоит.
+  rock(0, 0, 10, 10, 5);
+  for (const [sx, sz] of CORNERS) rock(sx * 30, sz * 30, 8, 8, 4.5);
+  rock(0, 44, 14, 6, 4);
+  rock(0, -44, 14, 6, 4);
+  rock(46, 0, 6, 14, 4);
+  rock(-46, 0, 6, 14, 4);
+
+  // Каменные гряды ниже высоты полёта: ехать мешают, стрелять — нет.
+  for (const [sx, sz] of CORNERS) {
+    rock(sx * 46, sz * 24, 6, 16, LOW);
+    rock(sx * 24, sz * 46, 16, 6, LOW);
+  }
+
+  return boxes;
+}
+
 export const MAPS: MapDef[] = [
   { name: 'Кремль', build: buildKremlin, spawns: ring(MAP_HALF - 10) },
   { name: 'Форт', build: buildFort, spawns: perimeter(60) },
@@ -304,6 +343,20 @@ export const MAPS: MapDef[] = [
   { name: 'Окопы', build: buildTrenches, spawns: TRENCH_SPAWNS },
   { name: 'Автопарк', build: buildDepot, spawns: perimeter(63) },
   { name: 'Дюны', build: buildDunes, spawns: ring(MAP_HALF - 8) },
+  {
+    name: 'Холмы',
+    build: buildHills,
+    spawns: ring(MAP_HALF - 8),
+    // Сид — просто метка: одно и то же число всегда даёт один и тот же рельеф,
+    // поэтому карта опознаётся игроками так же, как расстановка блоков.
+    //
+    // Размах и поперечник холма подобраны не на глаз, а по доле перекрытых
+    // рельефом линий огня: на 60 м гребни съедают треть выстрелов, на 30 м —
+    // почти ничего. Дальний бой становится вопросом позиции, ближний остаётся
+    // прежним. Дальше поднимать нельзя: склоны круче четверти уже читаются как
+    // обрыв, а танк на них едет ровно так же, как по ровному.
+    terrain: { seed: 20260907, amp: 4.5, feature: 34 },
+  },
 ];
 
 export const MAP_NAMES = MAPS.map((m) => m.name);
@@ -318,6 +371,25 @@ export function buildMap(id = 0): Box[] {
   return MAPS[isMapId(id) ? id : 0].build();
 }
 
+/** Карта целиком: блоки и земля под ними. */
+export interface MapScene {
+  obstacles: Box[];
+  terrain: Terrain;
+}
+
+/**
+ * Собрать карту. Блоки и рельеф выдаются вместе и только так: рельеф ровняет
+ * землю под блоками и проставляет им основание, поэтому геометрия без него
+ * недостроена. Плоские карты проходят тот же путь и получают основание 0.
+ */
+export function buildScene(id = 0): MapScene {
+  const obstacles = buildMap(id);
+  const def = MAPS[isMapId(id) ? id : 0].terrain;
+  const terrain = def ? buildTerrain(def, MAP_HALF) : FLAT;
+  settleBoxes(terrain, obstacles);
+  return { obstacles, terrain };
+}
+
 /** Точка респавна по кругу спавнов карты, лицом к центру. */
 export function spawnPoint(index: number, id = 0): { x: number; z: number; angle: number } {
   const spawns = MAPS[isMapId(id) ? id : 0].spawns;
@@ -327,13 +399,18 @@ export function spawnPoint(index: number, id = 0): { x: number; z: number; angle
 }
 
 /**
- * Блоки, которые останавливают снаряд. Всё, что ниже высоты полёта, снаряд
- * проходит насквозь: низкое укрытие мешает ехать, но не стрелять. Список
- * считается один раз на смену карты — фильтровать его в каждом свипе было бы
- * самой дорогой строчкой сервера.
+ * Блоки, по которым свип ведёт снаряд. На плоскости это только те, что выше
+ * высоты полёта: всё, что ниже, снаряд проходит насквозь — низкое укрытие мешает
+ * ехать, но не стрелять. Список считается один раз на смену карты, фильтровать
+ * его в каждом свипе было бы самой дорогой строчкой сервера.
+ *
+ * С рельефом отбирать заранее нечего: высота полёта перестала быть одной на всю
+ * карту. Снаряд, пущенный с гребня, идёт над контейнером в низине, а тот же
+ * снаряд снизу — упирается в него. Поэтому там в свип уходят все блоки, а
+ * высоту он проверяет сам третьим слэбом.
  */
-export function coverBoxes(obstacles: Box[]): Box[] {
-  return obstacles.filter((box) => box.h >= SHELL_HEIGHT);
+export function coverBoxes(obstacles: Box[], terrain: Terrain = FLAT): Box[] {
+  return terrain.flat ? obstacles.filter((box) => box.h >= SHELL_HEIGHT) : obstacles;
 }
 
 export function spawnCount(id = 0): number {

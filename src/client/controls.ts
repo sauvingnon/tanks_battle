@@ -1,9 +1,12 @@
+import { GUN_PITCH_MAX, GUN_PITCH_MIN } from '../shared/constants.js';
 import { clamp } from '../shared/sim.js';
 import { aimAngle } from './topview.js';
 
 const LOOK_SENSITIVITY = 0.0026;
 const PITCH_MIN = -0.15;
 const PITCH_MAX = 1.05;
+/** Обычное положение камеры: чуть выше танка. Ему отвечает горизонтальный ствол. */
+const PITCH_REST = 0.42;
 const STICK_RADIUS = 56;
 
 /**
@@ -34,7 +37,7 @@ const ZOOM_PER_PIXEL = 0.02;
 export class Controls {
   /** Куда смотрит камера. Башня доворачивается к этому углу. */
   yaw = 0;
-  pitch = 0.42;
+  pitch = PITCH_REST;
   /** Насколько камера отнесена от танка, м. Крутится колесом и щипком. */
   distance = ZOOM_DEFAULT;
 
@@ -44,6 +47,27 @@ export class Controls {
   fire = false;
 
   readonly isTouch = matchMedia('(hover: none) and (pointer: coarse)').matches;
+
+  /**
+   * Вертикальная наводка, рад. Ею правит та же мышь, что и высотой камеры:
+   * ведёшь взгляд выше — ствол идёт выше.
+   *
+   * Отдельной оси для ствола взять неоткуда, а «луч камеры» на прицел не годится:
+   * камера здесь смотрит на свой же танк, и её центр всегда упирается в землю
+   * рядом с ним. Поэтому наводка считается прямо из положения камеры: обычное её
+   * положение (PITCH_REST) — это горизонтальный ствол, а до упоров вверх и вниз
+   * ствол разворачивается на весь свой ход. Обе половины считаются отдельно,
+   * иначе ноль ушёл бы с обычного положения и ствол смотрел бы в землю по
+   * умолчанию.
+   *
+   * На картах без рельефа наводка серверу не отправляется вовсе — там её нет.
+   */
+  get gunPitch(): number {
+    if (this.pitch <= PITCH_REST) {
+      return (GUN_PITCH_MAX * (PITCH_REST - this.pitch)) / (PITCH_REST - PITCH_MIN);
+    }
+    return (GUN_PITCH_MIN * (this.pitch - PITCH_REST)) / (PITCH_MAX - PITCH_REST);
+  }
 
   /**
    * Вид сверху. Обзора как такового в нём нет: yaw — это не «куда смотрит

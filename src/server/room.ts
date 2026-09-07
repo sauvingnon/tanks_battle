@@ -15,6 +15,8 @@
   BONUS_STEALTH,
   BONUS_DURATION_S,
   DT,
+  GUN_PITCH_MAX,
+  GUN_PITCH_MIN,
   MAP_HALF,
   MAX_BOUNCES,
   BOT_HP,
@@ -46,7 +48,8 @@
   type GameMode,
   type Ruleset,
 } from '../shared/constants.js';
-import { buildMap, coverBoxes, isMapId, spawnPoint } from '../shared/map.js';
+import { buildScene, coverBoxes, isMapId, spawnPoint } from '../shared/map.js';
+import { heightAt, terrainNet, type Terrain } from '../shared/terrain.js';
 import type { RoomConfig, ServerMessage, WavePhase, WaveState } from '../shared/protocol.js';
 import {
   bounceShell,
@@ -70,6 +73,7 @@ import {
   createTankState,
   type BonusState,
   type Boom,
+  type BoomKind,
   type Box,
   type Input,
   type PlayerInfo,
@@ -143,10 +147,16 @@ const NO_SEND = (): void => {};
  * переключает хост — первый вошедший игрок.
  */
 export class Room {
+  private scene = buildScene(0);
   /** Геометрия текущей карты. Меняется целиком при смене карты. */
-  obstacles: Box[] = buildMap(0);
-  /** Из них — только те, что останавливают снаряд. Пересобирается со сменой карты. */
-  cover: Box[] = coverBoxes(this.obstacles);
+  obstacles: Box[] = this.scene.obstacles;
+  /**
+   * Земля текущей карты. На семи аркадных картах это FLAT, и вся высотная
+   * арифметика уходит по короткому пути.
+   */
+  terrain: Terrain = this.scene.terrain;
+  /** Блоки, по которым свип ведёт снаряд. Пересобирается со сменой карты. */
+  cover: Box[] = coverBoxes(this.obstacles, this.terrain);
   readonly players = new Map<number, Player>();
 
   /** Индекс карты в MAPS. */
@@ -424,6 +434,7 @@ export class Room {
         cover: this.cover,
         tanks: this.tanks,
         stance: this.stance,
+        terrain: this.relief,
       },
     );
     stepTank(bot.state, bot.last, DT, this.obstacles);
@@ -438,13 +449,40 @@ export class Room {
     const rush = player.fx[BONUS_RELOAD] > this.tick ? BONUS_RELOAD_MUL : 1;
     player.readyAt = this.tick + Math.max(1, Math.round(RELOAD_TICKS * rush));
 
-    const shell = spawnShell(this.nextShellId++, player.id, player.state);
+    const shell = spawnShell(
+      this.nextShellId++,
+      player.id,
+      player.state,
+      this.aimPitch(player),
+      heightAt(this.terrain, player.state.x, player.state.z),
+    );
     // Урон считаем здесь, а не при попадании: снаряд после выстрела живёт сам по себе.
     const power = player.fx[BONUS_DAMAGE] > this.tick ? BONUS_DAMAGE_MUL : 1;
     shell.dmg = Math.round(SHELL_DAMAGE * power);
     this.shells.push(shell);
     // Переполнение возможно только при явном флуде — жертвуем самым старым снарядом.
     if (this.shells.length > MAX_SHELLS) this.shells.shift();
+  }
+
+  /**
+   * Рельеф для свипов — или undefined, если карта плоская. Именно undefined, а не
+   * FLAT: без него свип двумерный и в точности такой, каким был до рельефа, и
+   * семь аркадных карт не платят за высоту ни одной выборкой.
+   */
+  private get relief(): Terrain | undefined {
+    return this.terrain.flat ? undefined : this.terrain;
+  }
+
+  /**
+   * Вертикальная наводка, с которой уйдёт снаряд. Приходит от клиента, поэтому
+   * зажимается пределами пушки здесь: на плоской карте — жёстко в ноль, чтобы
+   * аркада не зависела от того, что прислал клиент.
+   */
+  private aimPitch(player: Player): number {
+    if (this.terrain.flat) return 0;
+    const want = player.last.pitch;
+    if (typeof want !== 'number' || !Number.isFinite(want)) return 0;
+    return clamp(want, GUN_PITCH_MIN, GUN_PITCH_MAX);
   }
 
   private updateShells(): void {
@@ -474,8 +512,9 @@ export class Room {
    */
   private flyShell(shell: ShellState, dt: number): boolean {
     for (let segment = 0; segment < MAX_SEGMENTS; segment++) {
-      // Именно cover: низкое укрытие снаряд проходит насквозь.
-      const wall = sweepShell(shell, dt, this.cover);
+      // Именно cover: на плоской карте низкое укрытие снаряд проходит насквозь.
+      // На рельефе там все блоки, а заодно и сама земля — свип решает по высоте.
+      const wall = sweepShell(shell, dt, this.cover, this.relief);
 
       // Танк на отрезке важнее стены за ним, поэтому ищем его только до касания.
       const victim = this.firstVictim(shell, dt, wall ? wall.t : 1);
@@ -495,12 +534,12 @@ export class Room {
       dt -= travel;
 
       if (!canRicochet(shell, wall)) {
-        this.booms.push({ x: shell.x, z: shell.z, k: BOOM_GROUND, o: shell.owner });
+        this.boom(shell, BOOM_GROUND);
         return true;
       }
 
       bounceShell(shell, wall);
-      this.booms.push({ x: shell.x, z: shell.z, k: BOOM_RICOCHET, o: shell.owner });
+      this.boom(shell, BOOM_RICOCHET);
       if (shell.life <= 0) return true;
     }
 
@@ -520,7 +559,7 @@ export class Room {
       // В себя можно попасть только рикошетом: иначе снаряд убивал бы стрелка на вылете.
       if (target.id === shell.owner && shell.bounces === 0) continue;
 
-      const t = sweepTank(shell, dt, target.state);
+      const t = sweepTank(shell, dt, target.state, this.relief);
       if (t === null || t > limit) continue;
       if (best === null || t < best.t) best = { player: target, t };
     }
@@ -529,7 +568,21 @@ export class Room {
 
   private damage(victim: Player, shell: ShellState): void {
     if (this.hurt(victim, shell.dmg ?? SHELL_DAMAGE, shell.owner)) return;
-    this.booms.push({ x: shell.x, z: shell.z, k: BOOM_HIT, o: shell.owner });
+    this.boom(shell, BOOM_HIT);
+  }
+
+  /**
+   * Взрыв там, где снаряд остановился. Высоту шлём только с рельефом: на
+   * плоскости она всегда одна и та же, и клиент знает её без сети.
+   */
+  private boom(shell: ShellState, kind: BoomKind): void {
+    this.booms.push({
+      x: shell.x,
+      z: shell.z,
+      k: kind,
+      o: shell.owner,
+      ...(this.terrain.flat ? {} : { y: round(shell.y) }),
+    });
   }
 
   /**
@@ -726,11 +779,20 @@ export class Room {
     const newMap = isMapId(map) && map !== this.mapId;
     if (newMap) {
       this.mapId = map;
-      this.obstacles = buildMap(this.mapId);
-      this.cover = coverBoxes(this.obstacles);
+      this.scene = buildScene(this.mapId);
+      this.obstacles = this.scene.obstacles;
+      this.terrain = this.scene.terrain;
+      this.cover = coverBoxes(this.obstacles, this.terrain);
       // Геометрию клиент не строит сам — шлём её раньше рестарта, чтобы к первому
-      // же снапшоту нового мира у него была правильная карта.
-      this.emit({ t: 'map', id: this.mapId, half: MAP_HALF, obstacles: this.obstacles });
+      // же снапшоту нового мира у него была правильная карта. Землю тем же
+      // сообщением и по той же причине.
+      this.emit({
+        t: 'map',
+        id: this.mapId,
+        half: MAP_HALF,
+        obstacles: this.obstacles,
+        terrain: terrainNet(this.terrain),
+      });
     }
 
     const newMode = mode !== undefined && mode !== this.mode;
@@ -967,7 +1029,10 @@ export class Room {
       o: s.owner,
       x: round(s.x),
       z: round(s.z),
+      y: round(s.y),
       a: round(Math.atan2(s.vx, s.vz)),
+      // Наклон нужен только мешу и только когда он не нулевой, то есть на рельефе.
+      ...(s.vy === 0 ? {} : { p: round(Math.atan2(s.vy, Math.hypot(s.vx, s.vz))) }),
       b: s.bounces,
     }));
   }

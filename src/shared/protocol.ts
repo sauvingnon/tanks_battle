@@ -1,4 +1,5 @@
 import type { GameMode, Ruleset } from './constants.js';
+import type { TerrainNet } from './terrain.js';
 import type {
   Boom,
   Box,
@@ -54,7 +55,8 @@ export interface RoomConfig {
 /** Клиент -> сервер. */
 export type ClientMessage =
   | { t: 'join'; name: string }
-  | { t: 'input'; seq: number; th: number; st: number; tu: number; f?: 1 }
+  /** pi — вертикальная наводка; её нет на плоских картах, поэтому поле необязательное. */
+  | { t: 'input'; seq: number; th: number; st: number; tu: number; pi?: number; f?: 1 }
   | { t: 'ping'; id: number }
   /** Настройка комнаты; принимается только от хоста. */
   | {
@@ -74,7 +76,7 @@ export type ServerMessage =
       id: number;
       you: PlayerInfo;
       tickHz: number;
-      map: { half: number; obstacles: Box[] };
+      map: { half: number; obstacles: Box[]; terrain?: TerrainNet };
       players: PlayerInfo[];
       wave: WaveState;
     } & RoomConfig)
@@ -88,8 +90,14 @@ export type ServerMessage =
   | { t: 'left'; id: number; killed?: boolean }
   /** Хост сменил настройки, либо хост сменился сам. */
   | ({ t: 'config' } & RoomConfig)
-  /** Сменилась карта: клиент пересобирает мир по этой геометрии. */
-  | { t: 'map'; id: number; half: number; obstacles: Box[] }
+  /**
+   * Сменилась карта: клиент пересобирает мир по этой геометрии. Рельеф приходит
+   * готовым массивом высот, а не сидом генератора: землю клиент не строит сам по
+   * той же причине, по какой не строит блоки, — расхождение в арифметике дало бы
+   * тихий рассинхрон предсказания вместо громкой ошибки. Плоские карты поля не
+   * шлют вовсе, поэтому семь аркадных карт не стали тяжелее ни на байт.
+   */
+  | { t: 'map'; id: number; half: number; obstacles: Box[]; terrain?: TerrainNet }
   /** Кто-то поднял ящик: клиент показывает это в ленте и вспышкой. */
   | { t: 'pickup'; id: number; kind: number }
   | ({ t: 'wave' } & WaveState)

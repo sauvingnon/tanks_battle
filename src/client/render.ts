@@ -6,6 +6,7 @@ import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPa
 
 import { MAX_HP, SHELL_HEIGHT } from '../shared/constants.js';
 import { wrapAngle } from '../shared/sim.js';
+import { FLAT, heightAt, slopeAt, TERRAIN_STEP, type Terrain } from '../shared/terrain.js';
 import {
   bodyKick,
   bodyLean,
@@ -73,8 +74,18 @@ const BONUS_HOVER = 1.7;
 const GROUND_TILE = 9;
 const BLOCK_TILE = 4;
 
+/**
+ * Насколько блок утоплен в свою площадку на карте с рельефом. Землю под блоком
+ * выравнивают, но по краю площадка сходит на нет за пару клеток, и у самой грани
+ * грунт уже чуть ниже. Полметра запаса — и щели под стеной не видно.
+ * Столкновениям это ничего не меняет: верх блока остаётся там же, где был.
+ */
+const SINK = 0.5;
+
 const CAMERA_DISTANCE = 15;
 const CAMERA_BASE_HEIGHT = 3.4;
+/** Минимальный просвет между камерой и землёй под ней: на рельефе она за холмом. */
+const CAMERA_CLEARANCE = 2;
 
 
 /** Высота, на которой висит ник над центром танка. */
@@ -348,6 +359,9 @@ export class Scene3D {
   /** Геометрия танка: общая на всех, разница между танками только в цвете. */
   private readonly tankGeo: TankGeometry = buildTankGeometry();
 
+  /** Земля карты. FLAT на аркадных семи; ставится setTerrain перед buildWorld. */
+  private terrain: Terrain = FLAT;
+
   private readonly renderer: THREE.WebGLRenderer;
   private readonly tanks = new Map<number, TankHandle>();
   private readonly shells = new Map<number, ShellHandle>();
@@ -528,6 +542,41 @@ export class Scene3D {
   }
 
   /**
+   * Земля карты. Ставится до buildWorld: по ней строится сам меш земли, по ней
+   * же садятся на грунт танки, следы, взрывы и ящики. Плоская карта — FLAT, и
+   * тогда все выборки стоят одно сравнение.
+   */
+  setTerrain(terrain: Terrain): void {
+    this.terrain = terrain;
+  }
+
+  /** Высота земли под точкой. Один вызов на месте десятка нулей в аркаде. */
+  private groundY(x: number, z: number): number {
+    return heightAt(this.terrain, x, z);
+  }
+
+  /** Та же выборка функцией: её просят те, кто про рельеф ничего не знает. */
+  private readonly groundSampler = (x: number, z: number): number => this.groundY(x, z);
+
+  /**
+   * Наклон корпуса на склоне в осях самого корпуса. Положительный rotation.x
+   * опускает нос, положительный rotation.z поднимает левый борт — отсюда знаки.
+   */
+  private groundTilt(
+    x: number,
+    z: number,
+    forwardX: number,
+    forwardZ: number,
+  ): { pitch: number; roll: number } {
+    if (this.terrain.flat) return { pitch: 0, roll: 0 };
+    const slope = slopeAt(this.terrain, x, z);
+    return {
+      pitch: -Math.atan(slope.dx * forwardX + slope.dz * forwardZ),
+      roll: Math.atan(slope.dx * forwardZ - slope.dz * forwardX),
+    };
+  }
+
+  /**
    * Строит землю, стены по периметру и препятствия, присланные сервером.
    * Вызывается заново при смене карты, поэтому вся геометрия мира живёт в одной
    * группе: старую снимаем целиком и освобождаем её буферы, иначе смена карты
@@ -541,33 +590,39 @@ export class Scene3D {
     this.debris.clear();
 
     const groundSize = half * 6;
+    // Текстура повторяется клеткой в GROUND_TILE метров: у плоскости развёртка
+    // одна на всю ширину, и без повтора крупа растянулась бы на 840 м в пятно.
+    this.groundMap.repeat.set(groundSize / GROUND_TILE, groundSize / GROUND_TILE);
     const ground = new THREE.Mesh(
-      new THREE.PlaneGeometry(groundSize, groundSize),
+      this.groundGeometry(groundSize),
       new THREE.MeshStandardMaterial({
         color: COLOR_GROUND,
         roughness: 1,
         map: this.groundMap,
       }),
     );
-    // Текстура повторяется клеткой в GROUND_TILE метров: у плоскости развёртка
-    // одна на всю ширину, и без повтора крупа растянулась бы на 840 м в пятно.
-    this.groundMap.repeat.set(groundSize / GROUND_TILE, groundSize / GROUND_TILE);
     ground.rotation.x = -Math.PI / 2;
     ground.receiveShadow = true;
     this.world.add(ground);
 
-    const grid = new THREE.GridHelper(half * 2, half / 2.5, 0x5c6b52, 0x475040);
-    grid.position.y = 0.02;
-    (grid.material as THREE.Material).transparent = true;
-    (grid.material as THREE.Material).opacity = 0.35;
-    this.world.add(grid);
+    // Сетка лежит в одной плоскости и на рельефе висела бы над низинами.
+    if (this.terrain.flat) {
+      const grid = new THREE.GridHelper(half * 2, half / 2.5, 0x5c6b52, 0x475040);
+      grid.position.y = 0.02;
+      (grid.material as THREE.Material).transparent = true;
+      (grid.material as THREE.Material).opacity = 0.35;
+      this.world.add(grid);
+    }
 
     const wallMaterial = new THREE.MeshStandardMaterial({
       color: COLOR_WALL,
       roughness: 0.9,
       map: this.concreteMap,
     });
-    const wallHeight = 4;
+    // Стена должна перекрывать край карты на любой высоте, поэтому на рельефе она
+    // начинается ниже самой глубокой низины и кончается выше самого высокого холма.
+    const range = this.terrainRange();
+    const wallHeight = 4 + (range.max - range.min);
     const thickness = 2;
     const span = half * 2 + thickness * 2;
     const walls: Array<[number, number, number, number]> = [
@@ -580,7 +635,7 @@ export class Scene3D {
       const geometry = new THREE.BoxGeometry(w, wallHeight, d);
       scaleBoxUv(geometry, w, wallHeight, d, BLOCK_TILE);
       const wall = new THREE.Mesh(geometry, wallMaterial);
-      wall.position.set(x, wallHeight / 2, z);
+      wall.position.set(x, range.min + wallHeight / 2, z);
       wall.castShadow = true;
       wall.receiveShadow = true;
       this.world.add(wall);
@@ -600,16 +655,54 @@ export class Scene3D {
     });
     for (const box of obstacles) {
       const material = box.h >= SHELL_HEIGHT ? boxMaterial : lowMaterial;
-      const geometry = new THREE.BoxGeometry(box.w, box.h, box.d);
+      // На рельефе блок уходит основанием в свою площадку: землю под ним
+      // выровняли, но по краю она сходит на нет, и зазора под гранью быть не должно.
+      const sink = this.terrain.flat ? 0 : SINK;
+      const height = box.h + sink;
+      const geometry = new THREE.BoxGeometry(box.w, height, box.d);
       // Развёртка правится на геометрии, а не отдельным материалом на блок:
       // блоков на карте под сотню, и сотня материалов — это сотня шейдеров.
-      scaleBoxUv(geometry, box.w, box.h, box.d, BLOCK_TILE);
+      scaleBoxUv(geometry, box.w, height, box.d, BLOCK_TILE);
       const mesh = new THREE.Mesh(geometry, material);
-      mesh.position.set(box.x, box.h / 2, box.z);
+      mesh.position.set(box.x, (box.y ?? 0) + box.h / 2 - sink / 2, box.z);
       mesh.castShadow = true;
       mesh.receiveShadow = true;
       this.world.add(mesh);
     }
+  }
+
+  /**
+   * Земля. На плоской карте это по-прежнему одна плоскость в два треугольника;
+   * на рельефе — сетка с шагом поля, растянутая далеко за карту: за стенами
+   * видно продолжение той же земли, а не обрыв. Высоты берутся выборкой, и за
+   * краем поля она держит высоту ближайшего его края — горизонт получается
+   * ровным продолжением карты.
+   */
+  private groundGeometry(size: number): THREE.PlaneGeometry {
+    if (this.terrain.flat) return new THREE.PlaneGeometry(size, size);
+
+    const segments = Math.round(size / TERRAIN_STEP);
+    const geometry = new THREE.PlaneGeometry(size, size, segments, segments);
+    const position = geometry.attributes.position as THREE.BufferAttribute;
+    // Плоскость лежит в XY и разворачивается в мир поворотом на -90° вокруг X,
+    // поэтому её Y — это мировой Z с обратным знаком, а высота идёт в Z.
+    for (let i = 0; i < position.count; i++) {
+      position.setZ(i, this.groundY(position.getX(i), -position.getY(i)));
+    }
+    geometry.computeVertexNormals();
+    return geometry;
+  }
+
+  /** Самая глубокая низина и самый высокий холм карты, м. */
+  private terrainRange(): { min: number; max: number } {
+    if (this.terrain.flat) return { min: 0, max: 0 };
+    let min = Infinity;
+    let max = -Infinity;
+    for (const d of this.terrain.d) {
+      if (d < min) min = d;
+      if (d > max) max = d;
+    }
+    return { min: min * 0.1, max: max * 0.1 };
   }
 
   /** Снимает прошлую карту вместе с её буферами. */
@@ -792,7 +885,7 @@ export class Scene3D {
       const outward = 3 + Math.random() * 7;
       this.debris.emit(
         x + (Math.random() - 0.5) * 2,
-        1.4,
+        this.groundY(x, z) + 1.4,
         z + (Math.random() - 0.5) * 2,
         Math.sin(course) * outward,
         5 + Math.random() * 6,
@@ -907,10 +1000,19 @@ export class Scene3D {
     const handle = this.tanks.get(id);
     if (!handle) return;
     if (handle.alive) handle.everSeen = true;
-    handle.root.position.set(x, 0, z);
+    // Высоту берём из поля, а не из сети: земля у клиента ровно та же, что у
+    // сервера, и гнать её ещё и в каждом снапшоте было бы платой ни за что.
+    handle.root.position.set(x, this.groundY(x, z), z);
     handle.root.rotation.y = angle;
     // Башня хранится в мировых углах, а её узел — потомок корпуса.
     handle.turret.rotation.y = turret - angle;
+  }
+
+  /** Возвышение своего ствола: на рельефе игрок целится и по высоте тоже. */
+  setGunPitch(id: number, pitch: number): void {
+    const handle = this.tanks.get(id);
+    // Ствол — потомок башни и ходит вокруг её оси X; вверх это отрицательный угол.
+    if (handle) handle.barrel.rotation.x = -pitch;
   }
 
   /** Камера летит за танком: позиция задаётся углами обзора, а не поворотом корпуса. */
@@ -923,7 +1025,8 @@ export class Scene3D {
     zoom = CAMERA_DISTANCE,
   ): void {
     const distance = zoom * Math.cos(pitch) + 2;
-    const height = CAMERA_BASE_HEIGHT + Math.sin(pitch) * zoom;
+    const base = this.groundY(x, z);
+    const height = base + CAMERA_BASE_HEIGHT + Math.sin(pitch) * zoom;
 
     const desiredX = x - Math.sin(yaw) * distance;
     const desiredZ = z - Math.cos(yaw) * distance;
@@ -938,11 +1041,14 @@ export class Scene3D {
     // По горизонтали камера жёстко привязана к танку: позиция танка уже
     // интерполирована и сглажена, а второй слой догонялки поверх первого давал
     // качание влево-вправо на скорости.
-    this.camera.position.set(desiredX, this.cameraHeight, desiredZ);
+    // На рельефе камера не ныряет в холм за спиной: если земля под ней выше
+    // расчётной высоты, поднимаемся над этой землёй.
+    const floor = this.groundY(desiredX, desiredZ) + CAMERA_CLEARANCE;
+    this.camera.position.set(desiredX, Math.max(this.cameraHeight, floor), desiredZ);
 
     // Цель взгляда не трясётся вместе с камерой: смещаем только точку съёмки,
     // и толчок выходит поворотом кадра, а не сползанием прицела с танка.
-    this.cameraTarget.set(x, 2.2, z);
+    this.cameraTarget.set(x, base + 2.2, z);
     this.applyShake(dt);
     this.camera.lookAt(this.cameraTarget);
   }
@@ -963,10 +1069,13 @@ export class Scene3D {
       this.syncParticleScale();
     }
 
-    this.topCamera.position.set(x, TOP_HEIGHT, z);
+    // Камера висит над своим танком, а не над нулевой отметкой: на рельефе он
+    // сам ездит по высоте, и кадр обязан ездить вместе с ним.
+    const base = this.groundY(x, z);
+    this.topCamera.position.set(x, base + TOP_HEIGHT, z);
     // Разворот считаем до тряски: у ортокамеры наклон не качает кадр, а сдвигает
     // всю картинку вбок целиком, и толчок читался бы как рывок карты.
-    this.topCamera.lookAt(x, 0, z);
+    this.topCamera.lookAt(x, base, z);
     this.applyShake(dt);
   }
 
@@ -1041,13 +1150,16 @@ export class Scene3D {
     };
   }
 
+
   // --- Снаряды ---
 
   /**
    * Ставит меши по списку из снапшота. Снаряды живут по id: те, кого в списке нет,
    * уже взорвались — их меш уходит в пул, а взрыв прилетает отдельным событием.
    */
-  syncShells(list: Array<{ id: number; x: number; z: number; angle: number }>): void {
+  syncShells(
+    list: Array<{ id: number; x: number; z: number; y?: number; angle: number; pitch?: number }>,
+  ): void {
     for (const handle of this.shells.values()) handle.seen = false;
 
     for (const shell of list) {
@@ -1059,9 +1171,12 @@ export class Scene3D {
         this.shells.set(shell.id, handle);
       }
       handle.seen = true;
-      handle.group.position.set(shell.x, SHELL_HEIGHT, shell.z);
+      handle.group.position.set(shell.x, shell.y ?? SHELL_HEIGHT, shell.z);
       // Группа собрана вдоль своего +Z, а угол 0 в игре смотрит в мировой +Z.
       handle.group.rotation.y = shell.angle;
+      // Наклон траектории: без него трассер на рельефе лежит горизонтально, а
+      // снаряд уходит вверх, и хвост торчит из него вбок.
+      handle.group.rotation.x = -(shell.pitch ?? 0);
     }
 
     for (const [id, handle] of this.shells) {
@@ -1075,6 +1190,10 @@ export class Scene3D {
   /** Снаряд: светящееся тело и трассер, вытянутый назад по ходу полёта. */
   private createShell(): THREE.Group {
     const group = new THREE.Group();
+    // Сначала разворот по курсу, потом наклон вокруг уже развёрнутой оси:
+    // при обычном XYZ наклон шёл бы вокруг мировой оси X и на курсах, отличных
+    // от нуля, заваливал бы трассер набок.
+    group.rotation.order = 'YXZ';
 
     const core = new THREE.Mesh(this.geo.shell, this.shellMaterial);
     core.rotation.x = Math.PI / 2; // капсула стоит вдоль Y — кладём её вдоль полёта
@@ -1114,7 +1233,7 @@ export class Scene3D {
         this.bonuses.set(bonus.i, handle);
       }
       handle.seen = true;
-      handle.mesh.position.set(bonus.x, BONUS_HOVER, bonus.z);
+      handle.mesh.position.set(bonus.x, this.groundY(bonus.x, bonus.z) + BONUS_HOVER, bonus.z);
     }
 
     for (const [id, handle] of this.bonuses) {
@@ -1136,14 +1255,24 @@ export class Scene3D {
     for (const handle of this.bonuses.values()) {
       handle.mesh.rotation.y = this.bonusSpin * 1.1;
       handle.mesh.rotation.x = this.bonusSpin * 0.5;
-      handle.mesh.position.y = BONUS_HOVER + bob;
+      const { x, z } = handle.mesh.position;
+      handle.mesh.position.y = this.groundY(x, z) + BONUS_HOVER + bob;
     }
   }
 
   // --- Взрывы ---
 
-  boom(x: number, z: number, kind: BoomKind): void {
-    this.spawnEffect(x, BOOM_HEIGHT[kind], z, BOOM_PRESETS[kind]);
+  /**
+   * y — высота, на которой снаряд остановился; её присылает сервер только с
+   * рельефом. Нет её — взрыв садится на землю под собой, а на плоскости это
+   * тот же ноль, что и был.
+   */
+  boom(x: number, z: number, kind: BoomKind, y?: number): void {
+    // Попадание в танк рисуем по его корпусу, то есть от земли под ним. Разрыв о
+    // стену — там, где снаряд встал: на рельефе это может быть и высоко на склоне.
+    const byTank = kind === BOOM_HIT || kind === BOOM_KILL;
+    const at = byTank || y === undefined ? this.groundY(x, z) + BOOM_HEIGHT[kind] : y;
+    this.spawnEffect(x, at, z, BOOM_PRESETS[kind]);
     if (kind === BOOM_HIT) this.tankHit(x, z);
   }
 
@@ -1221,7 +1350,7 @@ export class Scene3D {
 
   /** Запасная вспышка по координатам: танк ещё не доехал до клиента сообщением. */
   muzzleFlash(x: number, z: number, angle: number): void {
-    this.spawnEffect(x, SHELL_HEIGHT, z, MUZZLE_PRESET, angle);
+    this.spawnEffect(x, this.groundY(x, z) + SHELL_HEIGHT, z, MUZZLE_PRESET, angle);
   }
 
   private spawnEffect(x: number, y: number, z: number, preset: EffectPreset, angle = 0): void {
@@ -1244,7 +1373,7 @@ export class Scene3D {
     }
     fx.ring.visible = preset.ring === true;
     // Кольцо стелется по земле независимо от того, на какой высоте рвануло.
-    fx.ring.position.y = 0.15 - y;
+    fx.ring.position.y = this.groundY(x, z) + 0.15 - y;
 
     fx.cone.visible = preset.cone !== undefined;
     if (preset.cone !== undefined) {
@@ -1385,8 +1514,14 @@ export class Scene3D {
       const lean = bodyLean(yawDelta / dt, speed, accel);
       handle.roll += (lean.roll - handle.roll) * k;
       handle.pitch += (lean.pitch - handle.pitch) * k;
-      handle.body.rotation.z = handle.roll + handle.kickRoll;
-      handle.body.rotation.x = handle.pitch + handle.kickPitch;
+
+      // Наклон по склону кладётся поверх ходового крена: крен — это положение
+      // корпуса на подвеске, склон — положение самой подвески на земле. Уклон
+      // раскладывается по осям корпуса: вдоль курса он задирает нос, поперёк —
+      // кренит на борт.
+      const tilt = this.groundTilt(x, z, forwardX, forwardZ);
+      handle.body.rotation.z = handle.roll + handle.kickRoll + tilt.roll;
+      handle.body.rotation.x = handle.pitch + handle.kickPitch + tilt.pitch;
 
       // Замаскированный не должен выдавать себя ни следом, ни облаком пыли.
       if (handle.cloaked || step === 0) continue;
@@ -1401,12 +1536,14 @@ export class Scene3D {
 
       for (const side of [-1, 1]) {
         const at = trackAnchor(x, z, yaw, side);
-        if (laysTrack) this.tracks.emit(at.x, at.z, yaw, this.clock);
+        // Отпечаток кладётся по земле: на склоне его углы стоят на разной высоте,
+        // иначе квадрат следа торчал бы из грунта одним краем.
+        if (laysTrack) this.tracks.emit(at.x, at.z, yaw, this.clock, this.groundSampler);
         if (!raisesDust) continue;
         // Пыль выбрасывает назад из-под трака и подбрасывает вверх.
         this.dust.emit(
           at.x,
-          0.25,
+          this.groundY(at.x, at.z) + 0.25,
           at.z,
           -forwardX * 1.3 + (Math.random() - 0.5) * 1.4,
           0.9 + Math.random() * 0.9,

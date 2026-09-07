@@ -21,6 +21,8 @@ import {
   STANCE_NEUTRAL,
   MODE_DM,
   MODE_PVE,
+  GUN_PITCH_MAX,
+  GUN_PITCH_MIN,
   MUZZLE_OFFSET,
   RELOAD_S,
   RESPAWN_S,
@@ -32,6 +34,7 @@ import {
 } from '../shared/constants.js';
 import { coverBoxes, MAP_NAMES } from '../shared/map.js';
 import { clamp, lerpAngle, sweepShell } from '../shared/sim.js';
+import { FLAT, heightAt, terrainFrom, type Terrain } from '../shared/terrain.js';
 import type { RoomConfig, ServerMessage, WaveState } from '../shared/protocol.js';
 import {
   BOOM_GROUND,
@@ -92,6 +95,12 @@ const players = new Map<number, PlayerInfo>();
 const self = new SelfPrediction();
 /** Блоки, которые держат снаряд: нужны метке прицела. Пересобираются со сменой карты. */
 let cover: Box[] = [];
+/**
+ * Земля текущей карты. На аркадных семи это FLAT, и весь высотный счёт уходит по
+ * короткому пути; на карте с рельефом — то же самое поле, что у сервера, слово
+ * в слово: он прислал готовые высоты, а не сид генератора.
+ */
+let terrain: Terrain = FLAT;
 
 interface BufferedSnapshot {
   time: number;
@@ -223,8 +232,11 @@ function handleMessage(msg: ServerMessage): void {
     case 'welcome': {
       selfId = msg.id;
       self.obstacles = msg.map.obstacles;
-      cover = coverBoxes(msg.map.obstacles);
+      terrain = terrainFrom(msg.map.terrain);
+      cover = coverBoxes(msg.map.obstacles, terrain);
       if (!worldBuilt) {
+        // Земля ставится до сборки мира: по ней строится её же меш.
+        scene.setTerrain(terrain);
         scene.buildWorld(msg.map.half, msg.map.obstacles);
         worldBuilt = true;
       }
@@ -236,9 +248,11 @@ function handleMessage(msg: ServerMessage): void {
     }
     case 'map':
       // Карту строит сервер, клиент только пересобирает по ней сцену и свои
-      // препятствия для предсказания.
+      // препятствия для предсказания. Землю — тем же порядком.
       self.obstacles = msg.obstacles;
-      cover = coverBoxes(msg.obstacles);
+      terrain = terrainFrom(msg.terrain);
+      cover = coverBoxes(msg.obstacles, terrain);
+      scene.setTerrain(terrain);
       scene.buildWorld(msg.half, msg.obstacles);
       worldBuilt = true;
       break;
@@ -464,7 +478,13 @@ function frame(now: number): void {
         scene.addShake(SELF_SHOT_SHAKE);
       }
 
-      const input = self.step(controls.throttle, controls.steer, controls.yaw, wantFire);
+      const input = self.step(
+        controls.throttle,
+        controls.steer,
+        controls.yaw,
+        gunPitch,
+        wantFire,
+      );
       if (input) net.sendInput(input);
     }
     if (steps === 5) stepAccumulator = 0;
@@ -489,7 +509,7 @@ function playBooms(now: number): void {
   }
   while (pendingBooms.length > 0 && pendingBooms[0].at <= now) {
     const { boom } = pendingBooms.shift()!;
-    scene.boom(boom.x, boom.z, boom.k);
+    scene.boom(boom.x, boom.z, boom.k, boom.y);
 
     const distance = Math.hypot(boom.x - selfX, boom.z - selfZ);
     const near = 1 - distance / SHAKE_RANGE;
@@ -514,7 +534,10 @@ function drawSelf(dt: number): void {
   scene.updateTank(selfId, state.x, state.z, state.angle, state.turret);
   if (topView) scene.updateTopCamera(state.x, state.z, controls.distance, dt);
   else scene.updateCamera(state.x, state.z, controls.yaw, controls.pitch, dt, controls.distance);
+  // Порядок важен: наводка считается по камере этого кадра, а ствол поднимается
+  // на её результат. Иначе метка и ствол расходились бы на кадр при довороте.
   drawAim(state.x, state.z, state.turret);
+  scene.setGunPitch(selfId, gunPitch);
 }
 
 /** Своё последнее нарисованное положение: по нему считается дальность маскировки. */
@@ -525,10 +548,23 @@ let selfZ = 0;
 const AIM_RANGE = 140;
 
 /**
+ * Возвышение своего ствола, рад. Считается каждый кадр из наводки и уходит
+ * серверу в инпуте; на плоской карте всегда ноль — там этой оси нет.
+ */
+let gunPitch = 0;
+
+/**
  * Метка встаёт туда, куда смотрит ствол, а не в центр экрана. Башня доворачивается
  * с задержкой и стреляет от дульного среза, поэтому центр кадра — это не точка
  * попадания, и целиться по нему нельзя. Луч считается тем же свипом, что и снаряд,
  * так что метка садится ровно на то препятствие, в которое упрётся выстрел.
+ *
+ * На рельефе к этому добавляется высота. Сначала ищется точка, на которую смотрит
+ * игрок: луч камеры через центр кадра до земли или укрытия. Потом ствол ведётся
+ * в эту точку — насколько хватает углов наводки. И только потом считается сам
+ * выстрел: метка стоит там, где снаряд действительно закончит полёт. Поэтому в
+ * упор по гребню метка садится на гребень, а не на цель за ним, — видно сразу,
+ * что отсюда не достанешь.
  */
 function drawAim(x: number, z: number, turret: number): void {
   if (myDead) {
@@ -536,32 +572,62 @@ function drawAim(x: number, z: number, turret: number): void {
     return;
   }
 
-  const dx = Math.sin(turret);
-  const dz = Math.cos(turret);
+  const ground = heightAt(terrain, x, z);
+  gunPitch = terrain.flat ? 0 : aimPitch(x, z, ground, turret);
+
+  const flat = Math.cos(gunPitch);
+  const dx = Math.sin(turret) * flat;
+  const dz = Math.cos(turret) * flat;
   const probe: ShellState = {
     id: 0,
     owner: selfId,
     x: x + dx * MUZZLE_OFFSET,
     z: z + dz * MUZZLE_OFFSET,
+    y: ground + SHELL_HEIGHT + Math.sin(gunPitch) * MUZZLE_OFFSET,
     vx: dx * AIM_RANGE,
     vz: dz * AIM_RANGE,
+    vy: Math.sin(gunPitch) * AIM_RANGE,
     life: 1,
     bounces: 0,
   };
   // dt = 1, поэтому свип разбирает ровно отрезок длиной AIM_RANGE.
   // Метка прицела упирается в укрытия, а не во всё подряд: низкий блок она проходит.
-  const wall = sweepShell(probe, 1, cover);
+  const wall = sweepShell(probe, 1, cover, terrain.flat ? undefined : terrain);
   const travel = wall ? wall.t : 1;
 
   const point = scene.project(
     probe.x + probe.vx * travel,
-    SHELL_HEIGHT,
+    probe.y + probe.vy * travel,
     probe.z + probe.vz * travel,
   );
   crosshair.hidden = point === null;
   if (point) {
     crosshair.style.transform = `translate(${Math.round(point.x)}px, ${Math.round(point.y)}px)`;
   }
+}
+
+/** Дистанция, по земле на которой ствол сам ложится в виде сверху, м. */
+const TOP_AIM_RANGE = 60;
+
+/**
+ * Куда навести ствол по высоте.
+ *
+ * В виде сзади это дело игрока: наводку ведёт мышь, та же, что двигает камеру
+ * по высоте, — см. Controls.gunPitch. В виде сверху вести её нечем: пальцев на
+ * экране два, и оба заняты. Поэтому там ствол сам ложится на землю в шестидесяти
+ * метрах по курсу — то есть примерно туда, где идёт бой; вверх по склону выстрел
+ * при этом задирается, вниз — опускается, и стрелять с горки становится можно
+ * не только по горизонту.
+ *
+ * Угол в обоих случаях зажат пределами пушки — теми же, что стоят на сервере.
+ */
+function aimPitch(x: number, z: number, ground: number, turret: number): number {
+  if (!topView) return controls.gunPitch;
+
+  const atX = x + Math.sin(turret) * TOP_AIM_RANGE;
+  const atZ = z + Math.cos(turret) * TOP_AIM_RANGE;
+  const rise = heightAt(terrain, atX, atZ) - (ground + SHELL_HEIGHT);
+  return clamp(Math.atan2(rise, TOP_AIM_RANGE), GUN_PITCH_MIN, GUN_PITCH_MAX);
 }
 
 function drawOthers(renderTime: number): void {
@@ -629,18 +695,20 @@ function drawShells(from: BufferedSnapshot, to: BufferedSnapshot, t: number): vo
           );
         }
       }
-      return { id: shell.i, x: shell.x, z: shell.z, angle: shell.a };
+      return { id: shell.i, x: shell.x, z: shell.z, y: shell.y, angle: shell.a, pitch: shell.p };
     }
     // Между снапшотами был отскок: прямая от старой точки к новой срезала бы угол,
     // и снаряд на кадр-другой ушёл бы в стену. Показываем сразу новое положение.
     if (start.b !== shell.b) {
-      return { id: shell.i, x: shell.x, z: shell.z, angle: shell.a };
+      return { id: shell.i, x: shell.x, z: shell.z, y: shell.y, angle: shell.a, pitch: shell.p };
     }
     return {
       id: shell.i,
       x: start.x + (shell.x - start.x) * t,
       z: start.z + (shell.z - start.z) * t,
+      y: start.y + (shell.y - start.y) * t,
       angle: shell.a,
+      pitch: shell.p,
     };
   });
 

@@ -71,8 +71,14 @@ export class SelfPrediction {
     this.previous = { ...state };
   }
 
-  /** Один шаг предсказания. Возвращает инпут, который надо отправить серверу. */
-  step(throttle: number, steer: number, turret: number, fire = false): Input | null {
+  /**
+   * Один шаг предсказания. Возвращает инпут, который надо отправить серверу.
+   *
+   * pitch едет с инпутом, но в шаг не входит: вертикальная наводка не двигает
+   * танк, она нужна только в момент выстрела. Поэтому переигровка неподтверждённых
+   * инпутов её не касается, и предсказание от рельефа не зависит вовсе.
+   */
+  step(throttle: number, steer: number, turret: number, pitch = 0, fire = false): Input | null {
     if (!this.predicted) return null;
 
     // Подбитый танк не едет — точно так же, как его считает сервер, иначе
@@ -84,7 +90,7 @@ export class SelfPrediction {
       fire = false;
     }
 
-    const input: Input = { seq: ++this.seq, throttle, steer, turret, fire };
+    const input: Input = { seq: ++this.seq, throttle, steer, turret, pitch, fire };
     this.pending.push(input);
     this.previous = { ...this.predicted };
     stepTank(this.predicted, input, DT, this.obstacles, this.boost);

@@ -213,8 +213,20 @@ export class TrackMarks {
     this.mesh.renderOrder = -1; // под всеми прозрачными эффектами
   }
 
-  /** Кладёт один отпечаток центром в (x, z), развёрнутый по ходу танка. */
-  emit(x: number, z: number, angle: number, time: number): void {
+  /**
+   * Кладёт один отпечаток центром в (x, z), развёрнутый по ходу танка.
+   *
+   * groundAt — высота земли в точке; без неё след ложится на нулевую отметку,
+   * как было до рельефа. Каждый угол опрашивается отдельно: отпечаток полтора
+   * метра длиной, и на склоне разница между его концами уже заметна.
+   */
+  emit(
+    x: number,
+    z: number,
+    angle: number,
+    time: number,
+    groundAt?: (x: number, z: number) => number,
+  ): void {
     const fx = Math.sin(angle);
     const fz = Math.cos(angle);
     // Правый борт: forward x up. При angle = 0 это -X.
@@ -236,9 +248,11 @@ export class TrackMarks {
     for (let i = 0; i < 4; i++) {
       const [side, along] = corners[i];
       const at = (base + i) * 3;
-      points[at] = x + rx * side + fx * along;
-      points[at + 1] = TRACK_Y;
-      points[at + 2] = z + rz * side + fz * along;
+      const px = x + rx * side + fx * along;
+      const pz = z + rz * side + fz * along;
+      points[at] = px;
+      points[at + 1] = (groundAt ? groundAt(px, pz) : 0) + TRACK_Y;
+      points[at + 2] = pz;
     }
 
     const born = this.birth.array as Float32Array;
