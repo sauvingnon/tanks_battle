@@ -1,4 +1,4 @@
-import type { GameMode } from '../shared/constants.js';
+import type { GameMode, Ruleset } from '../shared/constants.js';
 import { decode, encode, type ClientMessage, type ServerMessage } from '../shared/protocol.js';
 import type { Input } from '../shared/types.js';
 
@@ -61,6 +61,7 @@ export class Net {
   /** Настройка комнаты. Сервер примет её только от хоста. */
   sendSetup(setup: {
     mode?: GameMode;
+    rules?: Ruleset;
     diff?: number;
     bonuses?: boolean;
     map?: number;

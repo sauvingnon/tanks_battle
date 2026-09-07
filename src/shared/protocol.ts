@@ -1,4 +1,4 @@
-import type { GameMode } from './constants.js';
+import type { GameMode, Ruleset } from './constants.js';
 import type {
   Boom,
   Box,
@@ -32,6 +32,11 @@ export interface RoomConfig {
   /** Индекс карты. Геометрия приходит отдельным сообщением map. */
   mapId: number;
   mode: GameMode;
+  /**
+   * Аркада или реализм. Ось, независимая от mode: она задаёт не с кем драться,
+   * а что игроку показывают про противника.
+   */
+  rules: Ruleset;
   /** Выбор хоста. */
   difficulty: number;
   /**
@@ -52,7 +57,15 @@ export type ClientMessage =
   | { t: 'input'; seq: number; th: number; st: number; tu: number; f?: 1 }
   | { t: 'ping'; id: number }
   /** Настройка комнаты; принимается только от хоста. */
-  | { t: 'setup'; mode?: GameMode; diff?: number; bonuses?: boolean; map?: number; stance?: number };
+  | {
+      t: 'setup';
+      mode?: GameMode;
+      rules?: Ruleset;
+      diff?: number;
+      bonuses?: boolean;
+      map?: number;
+      stance?: number;
+    };
 
 /** Сервер -> клиент. */
 export type ServerMessage =

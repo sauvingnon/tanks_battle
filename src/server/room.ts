@@ -41,7 +41,10 @@
   waveElite,
   waveQuota,
   waveTier,
+  isRuleset,
+  RULES_ARCADE,
   type GameMode,
+  type Ruleset,
 } from '../shared/constants.js';
 import { buildMap, coverBoxes, isMapId, spawnPoint } from '../shared/map.js';
 import type { RoomConfig, ServerMessage, WavePhase, WaveState } from '../shared/protocol.js';
@@ -149,6 +152,13 @@ export class Room {
   /** Индекс карты в MAPS. */
   mapId = 0;
   mode: GameMode = MODE_DM;
+  /**
+   * Аркада или реализм. Сейчас правила целиком клиентские — сервер шлёт всем
+   * одно и то же, а подписи снимает клиент, — но настройка комнатная, а не
+   * личная: одни в комнате с ником над головой, другие без, — это не разные
+   * вкусы, а разные игры.
+   */
+  rules: Ruleset = RULES_ARCADE;
   /** Выбор хоста: стартовый тир ботов, 0..MAX_TIER. Дальше волны поднимают его сами. */
   difficulty = 1;
   /**
@@ -701,6 +711,7 @@ export class Room {
     bonuses: boolean | undefined,
     map?: number,
     stance?: number,
+    rules?: Ruleset,
   ): void {
     if (typeof difficulty === 'number' && Number.isFinite(difficulty)) {
       this.difficulty = clamp(Math.round(difficulty), 0, MAX_TIER);
@@ -724,7 +735,14 @@ export class Room {
 
     const newMode = mode !== undefined && mode !== this.mode;
     if (newMode) this.mode = mode;
-    if (newMap || newMode) this.restart();
+
+    // Смена правил перезапускает бой по той же причине, что и смена режима: это
+    // не настройка внутри боя, а другой бой. Заодно снимает неприятность, когда
+    // подписи гаснут посреди перестрелки.
+    const newRules = isRuleset(rules) && rules !== this.rules;
+    if (newRules) this.rules = rules;
+
+    if (newMap || newMode || newRules) this.restart();
 
     this.emitConfig();
   }
@@ -899,6 +917,7 @@ export class Room {
     return {
       mapId: this.mapId,
       mode: this.mode,
+      rules: this.rules,
       difficulty: this.difficulty,
       // Что реально в силе прямо сейчас: в бою это может отставать от выбора хоста.
       active: this.mode === MODE_PVE && this.phase === 'fight' ? this.runDifficulty : this.difficulty,

@@ -276,6 +276,12 @@ export interface TankHandle {
   labelHalfWidth: number;
   labelHeight: number;
   labelVisible: boolean;
+  /**
+   * Разрешает ли подпись сам режим боя. В аркаде подписаны все, в реалистичных
+   * правилах — только товарищи. Флаг ставит main.ts, потому что «товарищ» —
+   * это про команды и режим комнаты, а рендер про них ничего не знает.
+   */
+  plated: boolean;
   /** Подбитый танк не рисуется и не подписывается. */
   alive: boolean;
   /** Под «Маскировкой» и достаточно далеко: корпус и подпись не рисуются. */
@@ -720,6 +726,7 @@ export class Scene3D {
       labelHalfWidth: Math.round(label.offsetWidth / 2),
       labelHeight: label.offsetHeight,
       labelVisible: true,
+      plated: true,
       alive: true,
       cloaked: false,
       hp: MAX_HP,
@@ -847,6 +854,19 @@ export class Scene3D {
     // Горящий остов ещё не «жив», но виден: без этой оговорки любое обновление
     // маскировки в кадре гибели гасило бы его на полуслове.
     handle.root.visible = (handle.alive || handle.dying >= 0) && !cloaked;
+  }
+
+  /**
+   * Разрешена ли танку подпись. В аркаде подписаны все, в реалистичных правилах
+   * — только товарищи, поэтому решение принимает main.ts: рендер не знает ни про
+   * команды, ни про режим комнаты.
+   *
+   * Гасить подпись руками не нужно — updateLabels каждый кадр решает это заново
+   * и снимет её сам, ровно как делает «Маскировка».
+   */
+  setNameplate(id: number, on: boolean): void {
+    const handle = this.tanks.get(id);
+    if (handle) handle.plated = on;
   }
 
   /**
@@ -1450,6 +1470,7 @@ export class Scene3D {
 
       // z вне [-1, 1] значит «за камерой или за дальней плоскостью».
       const visible =
+        handle.plated &&
         handle.alive &&
         !handle.cloaked &&
         distance < LABEL_MAX_DISTANCE &&

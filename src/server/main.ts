@@ -4,7 +4,7 @@ import { extname, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer, type WebSocket } from 'ws';
 
-import { DT, SNAPSHOT_EVERY, TICK_HZ, MAP_HALF, isMode } from '../shared/constants.js';
+import { DT, SNAPSHOT_EVERY, TICK_HZ, MAP_HALF, isMode, isRuleset } from '../shared/constants.js';
 import { decode, encode, type ClientMessage, type ServerMessage } from '../shared/protocol.js';
 import { Room, type Player } from './room.js';
 
@@ -141,6 +141,7 @@ wss.on('connection', (ws) => {
         typeof msg.bonuses === 'boolean' ? msg.bonuses : undefined,
         msg.map,
         msg.stance,
+        isRuleset(msg.rules) ? msg.rules : undefined,
       );
       return;
     }

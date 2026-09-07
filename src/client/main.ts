@@ -1,4 +1,5 @@
 import {
+  alliedTeams,
   BONUS_DAMAGE,
   BONUS_DURATION_S,
   BONUS_HEAL,
@@ -23,8 +24,11 @@ import {
   MUZZLE_OFFSET,
   RELOAD_S,
   RESPAWN_S,
+  RULES_ARCADE,
+  RULES_REAL,
   SHELL_HEIGHT,
   type GameMode,
+  type Ruleset,
 } from '../shared/constants.js';
 import { coverBoxes, MAP_NAMES } from '../shared/map.js';
 import { clamp, lerpAngle, sweepShell } from '../shared/sim.js';
@@ -142,6 +146,7 @@ let respawnAt = 0;
 
 let mapId = 0;
 let mode: GameMode = MODE_DM;
+let rules: Ruleset = RULES_ARCADE;
 /** Выбор хоста. */
 let difficulty = 1;
 /** Сложность, по которой идёт бой сейчас: посреди волны отстаёт от выбранной. */
@@ -173,6 +178,19 @@ const STANCE_HINTS = [
 const MODE_NAMES: Record<GameMode, string> = {
   [MODE_DM]: 'Все против всех',
   [MODE_PVE]: 'Против ботов',
+};
+
+const RULES_NAMES: Record<Ruleset, string> = {
+  [RULES_ARCADE]: 'Аркада',
+  [RULES_REAL]: 'Реализм',
+};
+
+/** Что меняют правила — подпись под выбором. */
+const RULES_HINTS: Record<Ruleset, string> = {
+  [RULES_ARCADE]:
+    'Срабатывает сразу: бой начинается заново. Над каждым танком ник и полоска HP — видно всех, кто попал в кадр.',
+  [RULES_REAL]:
+    'Срабатывает сразу: бой начинается заново. Подписей нет: ни ников, ни полосок HP, ни своей. Противника ищешь глазами; в бою против ботов подписаны только товарищи.',
 };
 
 /** Маска бонусов, действующих на мой танк; приходит в снапшоте. */
@@ -259,12 +277,38 @@ function handleMessage(msg: ServerMessage): void {
 function addPlayer(info: PlayerInfo): void {
   players.set(info.id, info);
   scene.addTank(info.id, info.name, info.color, info.id === selfId, info.bot === 1);
+  scene.setNameplate(info.id, plated(info));
   updateHud();
+}
+
+/**
+ * Подписан ли этот танк при нынешних правилах. В аркаде — все, в реализме
+ * только товарищ: чужой танк надо разглядеть, а не прочитать.
+ *
+ * Своя подпись в реализме гаснет тоже. Здоровье и так висит в HUD, а ник с
+ * полоской над собственной башней — самое аркадное, что есть на экране, и
+ * висит он в кадре постоянно.
+ */
+function plated(info: PlayerInfo): boolean {
+  if (rules === RULES_ARCADE) return true;
+  if (info.id === selfId) return false;
+  const me = players.get(selfId);
+  return me !== undefined && alliedTeams(mode, me.team, info.team);
+}
+
+/**
+ * Раздать подписи заново. Нужно после смены правил и после смены режима: в
+ * «Все против всех» товарищей нет, и та же самая команда союзником быть
+ * перестаёт.
+ */
+function applyPlates(): void {
+  for (const info of players.values()) scene.setNameplate(info.id, plated(info));
 }
 
 function applyConfig(next: RoomConfig): void {
   const first = !configKnown;
   const wasMode = mode;
+  const wasRules = rules;
   const wasDifficulty = difficulty;
   const wasBonuses = bonusesOn;
   const wasStance = stance;
@@ -274,6 +318,7 @@ function applyConfig(next: RoomConfig): void {
   configKnown = true;
   mapId = next.mapId;
   mode = next.mode;
+  rules = next.rules;
   difficulty = next.difficulty;
   activeDifficulty = next.active;
   bonusesOn = next.bonuses;
@@ -286,6 +331,8 @@ function applyConfig(next: RoomConfig): void {
   }
   // Смена режима перезапускает мир на сервере — старую плашку волны держать незачем.
   if (mode !== wasMode) bannerHideAt = 0;
+  // Подписи зависят и от правил, и от режима: в «Все против всех» товарищей нет.
+  if (first || rules !== wasRules || mode !== wasMode) applyPlates();
 
   // О смене настроек говорим всем в ленте: панель открыта не у каждого, а знать,
   // что именно поменялось и когда это сработает, надо обоим.
@@ -295,6 +342,9 @@ function applyConfig(next: RoomConfig): void {
     }
     if (mode !== wasMode) {
       pushFeed(`Режим: ${MODE_NAMES[mode]} · бой начат заново`, 'is-setup');
+    }
+    if (rules !== wasRules) {
+      pushFeed(`Правила: ${RULES_NAMES[rules]} · бой начат заново`, 'is-setup');
     }
     if (difficulty !== wasDifficulty) {
       pushFeed(`Сложность: ${DIFFICULTY_NAMES[difficulty]} · ${whenDifficulty()}`, 'is-setup');
@@ -625,6 +675,7 @@ const setupToggle = el<HTMLButtonElement>('setup-toggle');
 const setupOwner = el('setup-owner');
 const setupMaps = el('setup-maps');
 const setupModes = el('setup-modes');
+const setupRules = el('setup-rules');
 const setupDiffs = el('setup-diffs');
 const setupStances = el('setup-stances');
 const setupBonuses = el<HTMLInputElement>('setup-bonuses');
@@ -635,6 +686,7 @@ const hintTopView = el('hint-top');
 const aimStick = el('aim');
 const hintMap = el('hint-map');
 const hintMode = el('hint-mode');
+const hintRules = el('hint-rules');
 const hintDiff = el('hint-diff');
 const hintStance = el('hint-stance');
 const hintBonuses = el('hint-bonuses');
@@ -651,7 +703,10 @@ function updateHud(): void {
 // --- Волны ---
 
 function updateModeChip(): void {
-  const map = MAP_NAMES[mapId] ?? '';
+  // Правила пишем в чип, только когда они не аркадные: слово «аркада» ничего
+  // не сообщает — так игра выглядела всегда, — а места в чипе немного.
+  const map =
+    (rules === RULES_REAL ? `${RULES_NAMES[rules]} · ` : '') + (MAP_NAMES[mapId] ?? '');
   if (mode === MODE_DM) {
     hudMode.textContent = `${map} · все против всех`;
     return;
@@ -723,6 +778,15 @@ for (const [value, label] of [
   button.dataset.mode = value;
   button.addEventListener('click', () => net.sendSetup({ mode: value }));
   setupModes.appendChild(button);
+}
+
+for (const value of [RULES_ARCADE, RULES_REAL] as Ruleset[]) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.textContent = RULES_NAMES[value];
+  button.dataset.rules = value;
+  button.addEventListener('click', () => net.sendSetup({ rules: value }));
+  setupRules.appendChild(button);
 }
 
 DIFFICULTY_NAMES.forEach((label, index) => {
@@ -818,6 +882,10 @@ function renderSetup(): void {
     button.classList.toggle('is-on', button.dataset.mode === mode);
     button.disabled = !isHost;
   }
+  for (const button of setupRules.querySelectorAll('button')) {
+    button.classList.toggle('is-on', button.dataset.rules === rules);
+    button.disabled = !isHost;
+  }
   const pending = mode === MODE_PVE && activeDifficulty !== difficulty;
   for (const button of setupDiffs.querySelectorAll('button')) {
     const tier = Number(button.dataset.diff);
@@ -837,6 +905,7 @@ function renderSetup(): void {
   // Главное, чего не хватало: когда настройка сработает.
   hintMap.textContent = MAP_HINTS[mapId];
   hintMode.textContent = 'Срабатывает сразу: бой начинается заново, счёт обнуляется.';
+  hintRules.textContent = RULES_HINTS[rules];
   hintBonuses.textContent = bonusesOn
     ? 'Срабатывает сразу: выключение уберёт ящики и снимет действующие усиления.'
     : 'Срабатывает сразу: ящики начнут появляться на карте.';

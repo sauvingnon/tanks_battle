@@ -20,6 +20,9 @@ import {
   MODE_DM,
   MODE_PVE,
   RESPAWN_S,
+  RULES_ARCADE,
+  RULES_REAL,
+  alliedTeams,
   SHELL_DAMAGE,
   SHELL_LIFETIME,
   SHELL_SPEED,
@@ -31,7 +34,7 @@ import {
 } from '../src/shared/constants.js';
 import { buildMap, MAP_NAMES, spawnPoint } from '../src/shared/map.js';
 import { sweepShell } from '../src/shared/sim.js';
-import { createTankState, type ShellState } from '../src/shared/types.js';
+import { createTankState, TEAM_BOTS, TEAM_PLAYERS, type ShellState } from '../src/shared/types.js';
 import { createBrain, findBankShot, think } from '../src/server/bot.js';
 import { Room, type Player } from '../src/server/room.js';
 
@@ -642,6 +645,47 @@ function holdDistance(stance: number): number {
   check('манера доезжает до настроек комнаты', room.config().stance === 2);
   room.setup(undefined, undefined, undefined, undefined, 0);
   check('манера переключается отдельно от сложности', room.config().stance === 0 && room.config().difficulty === 1);
+}
+
+// --- Правила боя: аркада против реализма ---
+
+/**
+ * Сами подписи живут в DOM и сюда не доедут. Проверяем то, от чего они зависят:
+ * что настройка доходит до комнаты, что смена правил перезапускает бой, и что
+ * «товарищ» считается так, как задумано, — в «Все против всех» товарищей нет,
+ * хотя номер команды у людей там один и тот же.
+ */
+{
+  const room = new Room();
+  room.add('Игрок', noop);
+  check('комната по умолчанию аркадная', room.config().rules === RULES_ARCADE);
+
+  room.setup(MODE_PVE, 1, false);
+  run(room, Math.round(5 * TICK_HZ));
+  const before = bots(room).length;
+  check('в аркадном бою против ботов кто-то вышел', before > 0);
+
+  room.setup(undefined, undefined, undefined, undefined, undefined, RULES_REAL);
+  check('правила доехали до настроек комнаты', room.config().rules === RULES_REAL);
+  check('смена правил перезапустила бой', bots(room).length === 0 && room.waveState().wave === 0);
+
+  // Повторная установка тех же правил боем не считается и мир не трогает.
+  run(room, Math.round(5 * TICK_HZ));
+  const running = bots(room).length;
+  room.setup(undefined, undefined, undefined, undefined, undefined, RULES_REAL);
+  check('те же правила бой не перезапускают', bots(room).length === running && running > 0);
+}
+
+{
+  check(
+    'в бою против ботов человек человеку товарищ',
+    alliedTeams(MODE_PVE, TEAM_PLAYERS, TEAM_PLAYERS),
+  );
+  check('бот человеку не товарищ', !alliedTeams(MODE_PVE, TEAM_PLAYERS, TEAM_BOTS));
+  check(
+    'в «Все против всех» товарищей нет даже в одной команде',
+    !alliedTeams(MODE_DM, TEAM_PLAYERS, TEAM_PLAYERS),
+  );
 }
 
 // --- Цена тика с полной картой ботов ---
