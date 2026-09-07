@@ -17,7 +17,6 @@
   DT,
   GUN_PITCH_MAX,
   GUN_PITCH_MIN,
-  MAP_HALF,
   MAX_BOUNCES,
   BOT_HP,
   MAX_HP,
@@ -155,6 +154,12 @@ export class Room {
    * арифметика уходит по короткому пути.
    */
   terrain: Terrain = this.scene.terrain;
+  /**
+   * Половина стороны текущей карты, м. У больших карт она вчетверо больше
+   * площадью, поэтому размер ходит вместе с геометрией, а не берётся из
+   * константы: иначе стена стояла бы там, где её никто не рисовал.
+   */
+  half: number = this.scene.half;
   /** Блоки, по которым свип ведёт снаряд. Пересобирается со сменой карты. */
   cover: Box[] = coverBoxes(this.obstacles, this.terrain);
   readonly players = new Map<number, Player>();
@@ -355,6 +360,7 @@ export class Room {
           DT,
           this.obstacles,
           this.boost(player),
+          this.half,
         );
         if (player.last.fire) {
           // Флаг срабатывает ровно один раз на инпут. Иначе last повторялся бы
@@ -435,9 +441,10 @@ export class Room {
         tanks: this.tanks,
         stance: this.stance,
         terrain: this.relief,
+        half: this.half,
       },
     );
-    stepTank(bot.state, bot.last, DT, this.obstacles);
+    stepTank(bot.state, bot.last, DT, this.obstacles, 1, this.half);
     if (bot.last.fire) {
       bot.last.fire = false;
       this.tryFire(bot);
@@ -514,7 +521,7 @@ export class Room {
     for (let segment = 0; segment < MAX_SEGMENTS; segment++) {
       // Именно cover: на плоской карте низкое укрытие снаряд проходит насквозь.
       // На рельефе там все блоки, а заодно и сама земля — свип решает по высоте.
-      const wall = sweepShell(shell, dt, this.cover, this.relief);
+      const wall = sweepShell(shell, dt, this.cover, this.relief, this.half);
 
       // Танк на отрезке важнее стены за ним, поэтому ищем его только до касания.
       const victim = this.firstVictim(shell, dt, wall ? wall.t : 1);
@@ -707,7 +714,7 @@ export class Room {
 
   /** Свободная точка под ящик: не в блоке, не у стены и не вплотную к другому ящику. */
   private freeSpot(): { x: number; z: number } | null {
-    const limit = MAP_HALF - 8;
+    const limit = this.half - 8;
     const pad = BONUS_RADIUS + TANK_RADIUS;
 
     for (let attempt = 0; attempt < 24; attempt++) {
@@ -782,6 +789,7 @@ export class Room {
       this.scene = buildScene(this.mapId);
       this.obstacles = this.scene.obstacles;
       this.terrain = this.scene.terrain;
+      this.half = this.scene.half;
       this.cover = coverBoxes(this.obstacles, this.terrain);
       // Геометрию клиент не строит сам — шлём её раньше рестарта, чтобы к первому
       // же снапшоту нового мира у него была правильная карта. Землю тем же
@@ -789,7 +797,7 @@ export class Room {
       this.emit({
         t: 'map',
         id: this.mapId,
-        half: MAP_HALF,
+        half: this.half,
         obstacles: this.obstacles,
         terrain: terrainNet(this.terrain),
       });

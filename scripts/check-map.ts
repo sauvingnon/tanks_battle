@@ -4,8 +4,8 @@
  * то есть до любого закутка можно доехать.
  * Запуск: npm run check:map
  */
-import { MAP_HALF, SHELL_HEIGHT, TANK_RADIUS } from '../src/shared/constants.js';
-import { coverBoxes, MAPS, spawnCount, spawnPoint } from '../src/shared/map.js';
+import { SHELL_HEIGHT, TANK_RADIUS } from '../src/shared/constants.js';
+import { coverBoxes, MAPS, mapHalf, spawnCount, spawnPoint } from '../src/shared/map.js';
 import type { Box } from '../src/shared/types.js';
 
 /** Запас поверх радиуса танка: впритык он заезжает, но выехать уже не может. */
@@ -33,11 +33,15 @@ function gap(x: number, z: number, boxes: Box[]): number {
  * не задевает блок и не выходит за стены. Если после заливки остались
  * недостижимые проездные клетки — на карте есть отрезанный карман.
  */
-function reachability(boxes: Box[], from: { x: number; z: number }): {
+function reachability(
+  boxes: Box[],
+  from: { x: number; z: number },
+  half: number,
+): {
   free: number;
   reached: number;
 } {
-  const limit = MAP_HALF - TANK_RADIUS;
+  const limit = half - TANK_RADIUS;
   const size = Math.floor((limit * 2) / STEP) + 1;
   const index = (ix: number, iz: number) => iz * size + ix;
   const toWorld = (i: number) => -limit + i * STEP;
@@ -85,9 +89,11 @@ function reachability(boxes: Box[], from: { x: number; z: number }): {
 for (let id = 0; id < MAPS.length; id++) {
   const boxes = MAPS[id].build();
   const count = spawnCount(id);
+  const half = mapHalf(id);
   const low = boxes.length - coverBoxes(boxes).length;
   console.log(
-    `\n=== ${MAPS[id].name} (${boxes.length} блоков, из них низких ${low}, ${count} спавнов) ===`,
+    `\n=== ${MAPS[id].name} (${half * 2}×${half * 2}, ${boxes.length} блоков, ` +
+      `из них низких ${low}, ${count} спавнов) ===`,
   );
 
   // Блок ровно на высоте полёта — это не низкое укрытие и не стена, а лотерея
@@ -98,11 +104,21 @@ for (let id = 0; id < MAPS.length; id++) {
     console.log(`  ${ambiguous.length} блоков стоят на самой высоте полёта — ДВУСМЫСЛЕННО`);
   }
 
+  // Блок за стеной — это не укрытие, а кусок геометрии, до которого не доехать
+  // и в который снаряд не попадёт: свип гасит его о стену раньше.
+  const outside = boxes.filter(
+    (b) => Math.abs(b.x) + b.w / 2 > half || Math.abs(b.z) + b.d / 2 > half,
+  );
+  if (outside.length > 0) {
+    bad++;
+    console.log(`  ${outside.length} блоков вылезли за стену карты — ЗА ПРЕДЕЛАМИ`);
+  }
+
   let worst = Infinity;
   for (let i = 0; i < count; i++) {
     const spawn = spawnPoint(i, id);
     const toBox = gap(spawn.x, spawn.z, boxes);
-    const toWall = MAP_HALF - Math.max(Math.abs(spawn.x), Math.abs(spawn.z));
+    const toWall = half - Math.max(Math.abs(spawn.x), Math.abs(spawn.z));
     const ok = toBox >= CLEARANCE && toWall >= CLEARANCE;
     if (!ok) {
       bad++;
@@ -115,7 +131,7 @@ for (let id = 0; id < MAPS.length; id++) {
   }
   console.log(`  спавны: минимальный зазор ${worst.toFixed(2)} м (нужно ${CLEARANCE.toFixed(1)})`);
 
-  const { free, reached } = reachability(boxes, spawnPoint(0, id));
+  const { free, reached } = reachability(boxes, spawnPoint(0, id), half);
   const share = (reached / free) * 100;
   if (reached !== free) bad++;
   console.log(

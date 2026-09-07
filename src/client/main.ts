@@ -23,6 +23,7 @@ import {
   MODE_PVE,
   GUN_PITCH_MAX,
   GUN_PITCH_MIN,
+  MAP_HALF,
   MUZZLE_OFFSET,
   RELOAD_S,
   RESPAWN_S,
@@ -101,6 +102,8 @@ let cover: Box[] = [];
  * в слово: он прислал готовые высоты, а не сид генератора.
  */
 let terrain: Terrain = FLAT;
+/** Половина стороны текущей карты, м: метка прицела упирается в ту же стену, что снаряд. */
+let mapHalf = MAP_HALF;
 
 interface BufferedSnapshot {
   time: number;
@@ -232,6 +235,8 @@ function handleMessage(msg: ServerMessage): void {
     case 'welcome': {
       selfId = msg.id;
       self.obstacles = msg.map.obstacles;
+      self.half = msg.map.half;
+      mapHalf = msg.map.half;
       terrain = terrainFrom(msg.map.terrain);
       cover = coverBoxes(msg.map.obstacles, terrain);
       if (!worldBuilt) {
@@ -250,6 +255,8 @@ function handleMessage(msg: ServerMessage): void {
       // Карту строит сервер, клиент только пересобирает по ней сцену и свои
       // препятствия для предсказания. Землю — тем же порядком.
       self.obstacles = msg.obstacles;
+      self.half = msg.half;
+      mapHalf = msg.half;
       terrain = terrainFrom(msg.terrain);
       cover = coverBoxes(msg.obstacles, terrain);
       scene.setTerrain(terrain);
@@ -592,7 +599,7 @@ function drawAim(x: number, z: number, turret: number): void {
   };
   // dt = 1, поэтому свип разбирает ровно отрезок длиной AIM_RANGE.
   // Метка прицела упирается в укрытия, а не во всё подряд: низкий блок она проходит.
-  const wall = sweepShell(probe, 1, cover, terrain.flat ? undefined : terrain);
+  const wall = sweepShell(probe, 1, cover, terrain.flat ? undefined : terrain, mapHalf);
   const travel = wall ? wall.t : 1;
 
   const point = scene.project(

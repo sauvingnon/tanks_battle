@@ -17,8 +17,8 @@ import {
   SHELL_SPEED,
   TANK_HEIGHT,
 } from '../src/shared/constants.js';
-import { buildScene, coverBoxes, MAPS } from '../src/shared/map.js';
-import { spawnShell, sweepShell, sweepTank } from '../src/shared/sim.js';
+import { buildScene, coverBoxes, mapHalf, MAP_NAMES, MAPS } from '../src/shared/map.js';
+import { spawnShell, stepTank, sweepShell, sweepTank } from '../src/shared/sim.js';
 import {
   buildTerrain,
   FLAT,
@@ -54,6 +54,10 @@ function ray(
 
 const field = buildTerrain({ seed: 7, amp: 4, feature: 30 }, MAP_HALF);
 
+/** Сколько карт нарисовано под аркаду. Все они плоские и все размера 140×140. */
+const ARCADE_MAPS = 7;
+const HILLS = MAP_NAMES.indexOf('Холмы');
+
 // --- Плоскость: аркада ---
 
 console.log('\n=== Плоскость ===');
@@ -68,16 +72,24 @@ console.log('\n=== Плоскость ===');
 
   let flatMaps = 0;
   let settled = 0;
+  let firstSeven = 0;
   for (let id = 0; id < MAPS.length; id++) {
     const scene = buildScene(id);
     if (!scene.terrain.flat) continue;
     flatMaps++;
+    if (id < ARCADE_MAPS) firstSeven++;
     if (scene.obstacles.every((box) => box.y === 0)) settled++;
     // Тот же отбор укрытий, что был до рельефа: только блоки выше высоты полёта.
     const cover = coverBoxes(scene.obstacles, scene.terrain);
     if (cover.some((box) => box.h < SHELL_HEIGHT)) bad++;
   }
-  check('аркадные карты остались плоскими', flatMaps === MAPS.length - 1, `${flatMaps} карт`);
+  // Плоские — ровно первые семь: ни одна новая карта не должна оказаться аркадной
+  // по недосмотру, и ни одна старая не должна вдруг получить рельеф.
+  check(
+    'аркадные карты остались плоскими',
+    flatMaps === ARCADE_MAPS && firstSeven === ARCADE_MAPS,
+    `${flatMaps} карт`,
+  );
   check('на плоской карте все блоки стоят на нуле', settled === flatMaps);
 }
 
@@ -175,7 +187,7 @@ console.log('\n=== Блоки на рельефе ===');
   check('основание проставлено', boxes.every((box) => typeof box.y === 'number'));
 
   // Карта «Холмы» собирается целиком тем же путём, что в бою.
-  const hills = buildScene(MAPS.length - 1);
+  const hills = buildScene(HILLS);
   check('у «Холмов» есть рельеф', !hills.terrain.flat);
   check('блоки «Холмов» получили основание', hills.obstacles.every((b) => typeof b.y === 'number'));
   check(
@@ -281,6 +293,48 @@ console.log('\n=== Пределы пушки ===');
     'горизонтальная скорость при этом почти не теряется',
     Math.hypot(raised.vx, raised.vz) > SHELL_SPEED * 0.94,
   );
+}
+
+// --- Размер карты ---
+
+/**
+ * Размер перестал быть общей константой и стал свойством карты. Ошибка тут молчит
+ * громче всех остальных: с чужим размером танк упирается в невидимую стену, снаряд
+ * гаснет в чистом поле, а поле высот кончается там, где карта ещё идёт, — и ни одна
+ * из этих бед не пишет ни строчки в лог.
+ */
+console.log('\n=== Размер карты ===');
+{
+  const big = MAP_NAMES.indexOf('Долина');
+  check('аркадные карты остались 140×140', [...Array(ARCADE_MAPS)].every((_, id) => mapHalf(id) === MAP_HALF));
+  check('«Холмы» тоже 140×140', mapHalf(HILLS) === MAP_HALF);
+  check('«Долина» и «Промзона» вчетверо больше', mapHalf(big) === 140 && mapHalf(big + 1) === 140);
+
+  // Поле высот строится под размер своей карты, а не под общий.
+  const scene = buildScene(big);
+  check(
+    'поле высот покрывает всю большую карту',
+    scene.terrain.half === 140 && scene.terrain.n === (140 * 2) / TERRAIN_STEP + 1,
+    `${scene.terrain.n}×${scene.terrain.n} узлов`,
+  );
+  check(
+    'блоки большой карты стоят внутри её стен',
+    scene.obstacles.every((b) => Math.abs(b.x) + b.w / 2 <= 140 && Math.abs(b.z) + b.d / 2 <= 140),
+  );
+
+  // Стена по периметру: та же точка на маленькой карте за стеной, на большой — нет.
+  const drive = (half: number) => {
+    const tank = createTankState(0, 100, 0);
+    stepTank(tank, { seq: 0, throttle: 0, steer: 0, turret: 0 }, 0.1, [], 1, half);
+    return tank.z;
+  };
+  check('на карте 140×140 стена держит танк на сотне метров', drive(MAP_HALF) < 68);
+  check('на карте 280×280 в той же точке чистое поле', drive(140) === 100);
+
+  // Снаряд — тем же порядком: свип упирается в стену своей карты.
+  const shot = () => ray(0, 100, SHELL_HEIGHT, 0, 30, 0);
+  check('снаряд гаснет о стену маленькой карты', sweepShell(shot(), 1, [], undefined, MAP_HALF) !== null);
+  check('и летит дальше на большой', sweepShell(shot(), 1, [], undefined, 140) === null);
 }
 
 console.log(bad === 0 ? '\nРельеф сходится' : `\nПроблем: ${bad}`);

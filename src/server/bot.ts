@@ -223,6 +223,12 @@ export interface BotWorld {
    * в гребень перед ним. Это тот же луч, которым потом будет считаться засвет.
    */
   terrain?: Terrain;
+  /**
+   * Половина стороны карты, м. Не задана — исторические 140×140. Щупы объезда
+   * упираются в ту же стену, что и танк, поэтому размер им обязателен: с чужим
+   * бот на большой карте видел бы стену там, где чистое поле, и уезжал в сторону.
+   */
+  half?: number;
 }
 
 /** Раз в столько тиков бот пересматривает цель — полсекунды. */
@@ -293,7 +299,7 @@ export function think(self: BotSelf, world: BotWorld): Input {
   const aim = brain.bank ?? Math.atan2(brain.aimX - me.x, brain.aimZ - me.z);
   const turret = aim + brain.aimBias;
 
-  const shot = hasShot(me, target.state, world.cover, world.terrain);
+  const shot = hasShot(me, target.state, world.cover, world.terrain, world.half);
   const clear = shot || brain.bank !== null;
   // Порог наводки — угловой размер танка на этой дистанции, растянутый терпением тира.
   const gate = Math.atan2(TANK_RADIUS, Math.max(dist, TANK_RADIUS)) * tier.fireGate;
@@ -308,7 +314,7 @@ export function think(self: BotSelf, world: BotWorld): Input {
   // На низком HP разрывает дистанцию: подставляться под добивание невыгодно.
   const retreat = tier.cover && self.hp <= BOT_HP * 0.35;
   const want = heading(self, target.state, dist, tier, world, retreat, shot);
-  const drive = unstick(brain, me, world.tick, steerTo(me, want, world.obstacles));
+  const drive = unstick(brain, me, world.tick, steerTo(me, want, world.obstacles, world.half));
 
   // Возвышение ствола на рельефе. У выстрела с отскоком его нет: тот считался
   // горизонтальной траекторией, и задирать ствол значило бы стрелять не туда,
@@ -333,7 +339,7 @@ function retarget(self: BotSelf, world: BotWorld, tier: BotTier): void {
     // Замаскированного издали бот не видит вовсе; вплотную — уже да.
     if (tank.stealth && d > BONUS_STEALTH_RANGE) continue;
     // Видимую цель предпочитаем даже если она вдвое дальше укрытой.
-    const score = hasShot(me, tank.state, world.cover, world.terrain) ? d : d * 2.5 + 40;
+    const score = hasShot(me, tank.state, world.cover, world.terrain, world.half) ? d : d * 2.5 + 40;
     if (score < bestScore) {
       bestScore = score;
       best = tank;
@@ -368,8 +374,8 @@ function retarget(self: BotSelf, world: BotWorld, tier: BotTier): void {
 
   // Рикошет ищем только когда прямого выстрела нет — иначе он и не нужен.
   brain.bank =
-    tier.ricochet && !hasShot(me, best.state, world.cover, world.terrain)
-      ? findBankShot(me, best.state, world.cover, world.terrain)
+    tier.ricochet && !hasShot(me, best.state, world.cover, world.terrain, world.half)
+      ? findBankShot(me, best.state, world.cover, world.terrain, world.half)
       : null;
 
   if (world.tick > brain.orbitUntil) {
@@ -438,14 +444,14 @@ function heading(
     vz += (dz / gap) * push;
   }
 
-  return avoid(me, Math.atan2(vx, vz), world.obstacles);
+  return avoid(me, Math.atan2(vx, vz), world.obstacles, world.half);
 }
 
 /** Если цели нет — едем к центру карты, объезжая блоки. */
 function patrol(self: BotSelf, world: BotWorld): Input {
   const me = self.state;
-  const want = avoid(me, Math.atan2(-me.x, -me.z), world.obstacles);
-  const drive = steerTo(me, want, world.obstacles);
+  const want = avoid(me, Math.atan2(-me.x, -me.z), world.obstacles, world.half);
+  const drive = steerTo(me, want, world.obstacles, world.half);
   // Газ убавлен, но выезд из упора идёт на полном: иначе бот так и останется в блоке.
   const move = unstick(self.brain, me, world.tick, {
     throttle: drive.throttle * 0.6,
@@ -466,8 +472,8 @@ const AVOID_FAN = [0, 0.4, -0.4, 0.8, -0.8, 1.25, -1.25];
  * всего, со штрафом за отклонение от нужного курса. Прямой путь свободен —
  * никаких лишних щупов, это самый частый случай.
  */
-function avoid(me: TankState, want: number, obstacles: Box[]): number {
-  const ahead = free(me.x, me.z, want, FEELER, obstacles);
+function avoid(me: TankState, want: number, obstacles: Box[], half?: number): number {
+  const ahead = free(me.x, me.z, want, FEELER, obstacles, half);
   if (ahead > 0.85) return want;
 
   let bestAngle = want;
@@ -476,7 +482,7 @@ function avoid(me: TankState, want: number, obstacles: Box[]): number {
     if (offset === 0) continue;
     const angle = want + offset;
     // Отклонение штрафуем, иначе бот уезжает вбок при малейшем камешке.
-    const score = free(me.x, me.z, angle, FEELER, obstacles) - Math.abs(offset) * 0.2;
+    const score = free(me.x, me.z, angle, FEELER, obstacles, half) - Math.abs(offset) * 0.2;
     if (score > bestScore) {
       bestScore = score;
       bestAngle = angle;
@@ -489,14 +495,21 @@ function avoid(me: TankState, want: number, obstacles: Box[]): number {
  * Доля пути до преграды по направлению angle, 0..1. Используется тот же свип,
  * что и для снарядов; щуп сдвинут на радиус танка, чтобы не цеплять углы бортом.
  */
-function free(x: number, z: number, angle: number, dist: number, obstacles: Box[]): number {
+function free(
+  x: number,
+  z: number,
+  angle: number,
+  dist: number,
+  obstacles: Box[],
+  half?: number,
+): number {
   const dx = Math.sin(angle);
   const dz = Math.cos(angle);
   // Смещаем начало щупа вбок на пол-корпуса поочерёдно: узкую щель бот не примет за проезд.
   let worst = 1;
   for (const side of [-TANK_RADIUS * 0.9, TANK_RADIUS * 0.9]) {
     const probe = ray(x - dz * side, z + dx * side, dx * dist, dz * dist);
-    const hit = sweepShell(probe, 1, obstacles);
+    const hit = sweepShell(probe, 1, obstacles, undefined, half);
     if (hit) worst = Math.min(worst, hit.stuck ? 0 : hit.t);
   }
   return worst;
@@ -510,7 +523,13 @@ function free(x: number, z: number, angle: number, dist: number, obstacles: Box[
  * «достану» здесь одно и то же — если между нами гребень, выстрела нет, даже
  * когда цель видна поверх него.
  */
-function hasShot(me: TankState, target: TankState, cover: Box[], terrain?: Terrain): boolean {
+function hasShot(
+  me: TankState,
+  target: TankState,
+  cover: Box[],
+  terrain?: Terrain,
+  half?: number,
+): boolean {
   const dx = target.x - me.x;
   const dz = target.z - me.z;
   const dist = Math.hypot(dx, dz);
@@ -520,13 +539,14 @@ function hasShot(me: TankState, target: TankState, cover: Box[], terrain?: Terra
   // Останавливаемся у борта цели, а не в её центре, иначе сама цель считается стеной.
   const shorten = Math.max(0, dist - TANK_RADIUS) / dist;
   if (!terrain) {
-    return sweepShell(ray(me.x, me.z, dx * shorten, dz * shorten), 1, cover) === null;
+    const probe = ray(me.x, me.z, dx * shorten, dz * shorten);
+    return sweepShell(probe, 1, cover, undefined, half) === null;
   }
 
   const from = heightAt(terrain, me.x, me.z) + SHELL_HEIGHT;
   const rise = Math.tan(aimPitch(terrain, me, target, dist)) * dist * shorten;
   const probe = ray(me.x, me.z, dx * shorten, dz * shorten, from, rise);
-  return sweepShell(probe, 1, cover, terrain) === null;
+  return sweepShell(probe, 1, cover, terrain, half) === null;
 }
 
 /**
@@ -549,13 +569,14 @@ export function findBankShot(
   target: TankState,
   obstacles: Box[],
   terrain?: Terrain,
+  half?: number,
 ): number | null {
   const direct = Math.atan2(target.x - me.x, target.z - me.z);
   // Шире 70 градусов от цели рикошет уже уводит снаряд за карту.
   for (let step = 1; step <= 12; step++) {
     for (const side of [1, -1]) {
       const angle = direct + side * step * 0.1;
-      if (bankHits(me, angle, target, obstacles, terrain)) return angle;
+      if (bankHits(me, angle, target, obstacles, terrain, half)) return angle;
     }
   }
   return null;
@@ -568,6 +589,7 @@ function bankHits(
   target: TankState,
   obstacles: Box[],
   terrain?: Terrain,
+  half?: number,
 ): boolean {
   const muzzle = createTankState(me.x, me.z, me.angle);
   muzzle.turret = angle;
@@ -577,7 +599,7 @@ function bankHits(
 
   let time = SHELL_LIFETIME;
   for (let segment = 0; segment < MAX_BOUNCES + 2 && time > 1e-4; segment++) {
-    const wall = sweepShell(shell, time, obstacles, terrain);
+    const wall = sweepShell(shell, time, obstacles, terrain, half);
     const limit = wall ? wall.t : 1;
 
     const hit = sweepTank(shell, time, target, terrain);
@@ -603,16 +625,23 @@ function bankHits(
  * описывает дугу и срезает угол блока. Вторая — стена по курсу: подъезжать к ней
  * на полной скорости незачем, удар всё равно погасит 75% хода.
  */
-function steerTo(me: TankState, want: number, obstacles: Box[]): { throttle: number; steer: number } {
+function steerTo(
+  me: TankState,
+  want: number,
+  obstacles: Box[],
+  half?: number,
+): { throttle: number; steer: number } {
   const err = angleDiff(me.angle, want);
   if (Math.abs(err) > 2.2) {
     // Цель почти за кормой: сдавать назад быстрее, чем разворачиваться на месте.
+    // Руль на задней передаче инвертирован (см. stepTank), поэтому знак здесь
+    // прямой: нос всё так же доворачивается к want, пока танк пятится.
     const back = angleDiff(me.angle + Math.PI, want);
-    return { throttle: -0.9, steer: clamp(-back * 2, -1, 1) };
+    return { throttle: -0.9, steer: clamp(back * 2, -1, 1) };
   }
 
   // Щуп берём по курсу корпуса, а не по желаемому: едет танк всё-таки туда, куда смотрит.
-  const room = free(me.x, me.z, me.angle, FEELER, obstacles);
+  const room = free(me.x, me.z, me.angle, FEELER, obstacles, half);
   const byWall = 0.4 + room * 0.6;
   const byTurn = Math.max(0.35, 1 - Math.abs(err) * 0.45);
   return {
@@ -645,7 +674,8 @@ function unstick(
     brain.stuckFor = 0;
     brain.unstickUntil = tick + UNSTICK_TICKS;
     // Руль в сторону обхода: назад по своей же колее — снова в тот же угол.
-    brain.unstickSteer = brain.orbit;
+    // Минус — та же инверсия заднего хода: корпус должен довернуться как раньше.
+    brain.unstickSteer = -brain.orbit;
   }
   return drive;
 }

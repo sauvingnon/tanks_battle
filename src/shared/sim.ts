@@ -63,6 +63,11 @@ export function stepTank(
   obstacles: Box[],
   /** Множитель хода от бонуса «Ход». Клиент обязан подставлять то же, что и сервер. */
   boost = 1,
+  /**
+   * Половина стороны карты: у разных карт она разная. По умолчанию — исторические
+   * 140×140, на которых нарисованы аркадные карты и написаны все проверки.
+   */
+  half = MAP_HALF,
 ): void {
   const throttle = clamp(input.throttle, -1, 1);
   const steer = clamp(input.steer, -1, 1);
@@ -81,7 +86,13 @@ export function stepTank(
   // Поворот корпуса: на месте вертится бодро, на скорости — вяло.
   const speedFrac = Math.min(Math.abs(state.speed) / maxSpeed, 1);
   const turnRate = TURN_RATE_STILL + (TURN_RATE_FULL - TURN_RATE_STILL) * speedFrac;
-  state.angle = wrapAngle(state.angle + steer * turnRate * dt);
+  // Задним ходом руль работает наоборот — как у машины: корма уходит туда, куда
+  // отклонён руль, а нос в противоположную сторону. Знак берётся у скорости, а не
+  // у газа: пока танк по инерции ещё катится вперёд, руль тоже работает вперёд.
+  // На нуле (speed === 0) инверсии нет, иначе разворот на месте менял бы сторону
+  // от того, с какой стороны нуля танк остановился.
+  const wheel = state.speed < 0 ? -steer : steer;
+  state.angle = wrapAngle(state.angle + wheel * turnRate * dt);
 
   // Перемещение. Угол 0 смотрит в +Z, что совпадает с rotation.y в three.js.
   state.x += Math.sin(state.angle) * state.speed * dt;
@@ -96,7 +107,7 @@ export function stepTank(
   // Оба выталкивания копят «насколько удар лобовой» и тормозят один раз: у стены
   // из блоков танк касается сразу двух прямоугольников, и торможение за каждый
   // отдельно останавливало бы вдвое резче, чем у такой же сплошной стены.
-  const hit = Math.max(resolveObstacles(state, obstacles), resolveBounds(state));
+  const hit = Math.max(resolveObstacles(state, obstacles), resolveBounds(state, half));
   if (hit > 0) scrape(state, hit, dt);
 }
 
@@ -129,8 +140,8 @@ function scrape(state: TankState, frac: number, dt: number): void {
 }
 
 /** Стена по периметру карты. Возвращает, насколько удар лобовой; 0 — контакта нет. */
-function resolveBounds(state: TankState): number {
-  const limit = MAP_HALF - TANK_RADIUS;
+function resolveBounds(state: TankState, half: number): number {
+  const limit = half - TANK_RADIUS;
   const cx = clamp(state.x, -limit, limit);
   const cz = clamp(state.z, -limit, limit);
   if (cx === state.x && cz === state.z) return 0;
@@ -271,12 +282,14 @@ export function sweepShell(
   dt: number,
   obstacles: Box[],
   terrain?: Terrain,
+  /** Половина стороны карты. По умолчанию — исторические 140×140. */
+  half = MAP_HALF,
 ): ShellHit | null {
   const dx = shell.vx * dt;
   const dz = shell.vz * dt;
   const dy = shell.vy * dt;
 
-  let best = sweepBounds(shell.x, shell.z, dx, dz);
+  let best = sweepBounds(shell.x, shell.z, dx, dz, half);
   for (const box of obstacles) {
     const hit = sweepBox(shell.x, shell.z, shell.y, dx, dz, dy, box, terrain !== undefined);
     if (hit && (best === null || hit.t < best.t)) best = hit;
@@ -339,8 +352,14 @@ function sweepBox(
 }
 
 /** Стена по периметру карты: снаряд летит внутри квадрата и упирается в него изнутри. */
-function sweepBounds(px: number, pz: number, dx: number, dz: number): ShellHit | null {
-  const limit = MAP_HALF - SHELL_RADIUS;
+function sweepBounds(
+  px: number,
+  pz: number,
+  dx: number,
+  dz: number,
+  half: number,
+): ShellHit | null {
+  const limit = half - SHELL_RADIUS;
   if (Math.abs(px) > limit || Math.abs(pz) > limit) {
     return { t: 0, nx: 0, nz: 0, stuck: true, ground: false };
   }

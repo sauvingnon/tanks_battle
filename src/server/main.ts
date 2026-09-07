@@ -4,7 +4,7 @@ import { extname, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer, type WebSocket } from 'ws';
 
-import { DT, SNAPSHOT_EVERY, TICK_HZ, MAP_HALF, isMode, isRuleset } from '../shared/constants.js';
+import { DT, SNAPSHOT_EVERY, TICK_HZ, isMode, isRuleset } from '../shared/constants.js';
 import { decode, encode, type ClientMessage, type ServerMessage } from '../shared/protocol.js';
 import { terrainNet } from '../shared/terrain.js';
 import { Room, type Player } from './room.js';
@@ -123,7 +123,7 @@ wss.on('connection', (ws) => {
         id: player.id,
         you: room.info(player),
         tickHz: TICK_HZ,
-        map: { half: MAP_HALF, obstacles: room.obstacles, terrain: terrainNet(room.terrain) },
+        map: { half: room.half, obstacles: room.obstacles, terrain: terrainNet(room.terrain) },
         players: room.allInfo(),
         ...room.config(),
         wave: room.waveState(),
