@@ -5,10 +5,6 @@ import {
   BUMP_GRAZE,
   clamp,
   FRICTION,
-  GRAVITY,
-  GROUND_EPS,
-  LANDING_DRAG,
-  LANDING_SOFT,
   MAP_HALF,
   MAX_BOUNCES,
   MAX_REVERSE,
@@ -20,19 +16,14 @@ import {
   RAM_SELF_SHARE,
   RICOCHET_MAX_COS,
   RICOCHET_SPEED_KEEP,
-  SHELL_HEIGHT,
   SHELL_LIFETIME,
   SHELL_RADIUS,
   SHELL_SPEED,
-  SLOPE_HOLD_MAX,
-  SLOPE_HOLD_MIN,
-  TANK_HEIGHT,
   TANK_RADIUS,
   TURN_RATE_FULL,
   TURN_RATE_STILL,
   TURRET_RATE,
 } from './constants.js';
-import { groundHit, heightAt, slopeAt, type Terrain } from './terrain.js';
 import type { Box, Input, ShellState, TankState } from './types.js';
 
 // Живёт в constants.ts, чтобы рельеф мог им пользоваться, не замыкая импорты
@@ -74,54 +65,20 @@ export function stepTank(
    * 140×140, на которых нарисованы аркадные карты и написаны все проверки.
    */
   half = MAP_HALF,
-  /**
-   * Земля под гусеницами. Не задана или плоская — тяжести вдоль курса нет, и вся
-   * ходовая считается ровно так же, как считалась до рельефа.
-   */
-  terrain?: Terrain,
 ): void {
-  const ground = terrain && !terrain.flat ? terrain : undefined;
-
-  /**
-   * Гусеницы не касаются земли. В воздухе танк не рулит, не газует и не
-   * тормозит: ни мотору, ни накату не за что зацепиться. Отсюда само собой
-   * выходит, что прыжок — решение, принятое до отрыва, а не в полёте.
-   */
-  const flying = ground !== undefined && state.y > heightAt(ground, state.x, state.z) + GROUND_EPS;
-
-  const throttle = flying ? 0 : clamp(input.throttle, -1, 1);
-  const steer = flying ? 0 : clamp(input.steer, -1, 1);
+  const throttle = clamp(input.throttle, -1, 1);
+  const steer = clamp(input.steer, -1, 1);
   const maxSpeed = MAX_SPEED * boost;
 
-  if (!flying) {
-    /**
-     * Тяжесть вдоль курса, м/с². Отрицательная — нос смотрит в гору. На плоскости
-     * ноль, и всё, что ниже, обращается в тождество.
-     *
-     * Считается до газа намеренно: иначе на склоне без газа тяжесть добавлялась бы
-     * уже после того, как накат обнулил ход, и стоящий танк каждый тик уползал бы
-     * вниз на миллиметр. В этом порядке накат гасит её сам и работает стояночным
-     * тормозом — ровно до тех пор, пока склон не круче него.
-     */
-    const pull = ground ? slopePull(state, ground) : 0;
-    state.speed += pull * dt;
-
-    // Продольная динамика: газ против движения тормозит сильнее, чем разгоняет.
-    if (throttle !== 0) {
-      const braking = state.speed !== 0 && Math.sign(throttle) !== Math.sign(state.speed);
-      state.speed += throttle * (braking ? BRAKE : ACCEL * boost) * dt;
-    } else {
-      const drop = FRICTION * dt;
-      state.speed = Math.abs(state.speed) <= drop ? 0 : state.speed - Math.sign(state.speed) * drop;
-    }
-    // Потолок хода тоже держит склон, и это как раз то, чего не хватало: одной
-    // поправки к разгону мало, потому что упирается танк не в разгон, а в потолок,
-    // и в горку он всё равно выходил бы на полные 47 км/ч, только позже.
-    //
-    // Задний ход считается с обратным знаком: под горку смотрит нос, а не корма,
-    // поэтому пятиться в гору должно быть так же тяжело, как ехать в неё передом.
-    state.speed = clamp(state.speed, -MAX_REVERSE * boost * hold(-pull), maxSpeed * hold(pull));
+  // Продольная динамика: газ против движения тормозит сильнее, чем разгоняет.
+  if (throttle !== 0) {
+    const braking = state.speed !== 0 && Math.sign(throttle) !== Math.sign(state.speed);
+    state.speed += throttle * (braking ? BRAKE : ACCEL * boost) * dt;
+  } else {
+    const drop = FRICTION * dt;
+    state.speed = Math.abs(state.speed) <= drop ? 0 : state.speed - Math.sign(state.speed) * drop;
   }
+  state.speed = clamp(state.speed, -MAX_REVERSE * boost, maxSpeed);
 
   // Поворот корпуса: на месте вертится бодро, на скорости — вяло.
   const speedFrac = Math.min(Math.abs(state.speed) / maxSpeed, 1);
@@ -135,10 +92,6 @@ export function stepTank(
   state.angle = wrapAngle(state.angle + wheel * turnRate * dt);
 
   // Перемещение. Угол 0 смотрит в +Z, что совпадает с rotation.y в three.js.
-  // Точку до шага запоминаем для вертикали: по ней считается, насколько земля
-  // изогнулась под гусеницами за этот шаг.
-  const fromX = state.x;
-  const fromZ = state.z;
   state.x += Math.sin(state.angle) * state.speed * dt;
   state.z += Math.cos(state.angle) * state.speed * dt;
 
@@ -153,97 +106,6 @@ export function stepTank(
   // отдельно останавливало бы вдвое резче, чем у такой же сплошной стены.
   const hit = Math.max(resolveObstacles(state, obstacles), resolveBounds(state, half));
   if (hit > 0) scrape(state, hit, dt);
-
-  // Вертикаль считается последней: положение по горизонтали к этому моменту уже
-  // улажено выталкиванием, и земля берётся ровно там, где танк в итоге оказался.
-  if (ground) stepHeight(state, ground, dt, fromX, fromZ, !flying);
-}
-
-/**
- * Высота танка: держится земли, пока может, и летит, когда не может.
- *
- * Ключевое здесь — критерий отрыва, и он не «крутой склон». На постоянном скате,
- * хоть на самом отвесном, следовать земле не требует никакого вертикального
- * ускорения: танк едет по прямой, просто наклонной. Подбрасывает только
- * выпуклость — гребень, за которым земля отворачивается вниз. Танк остаётся на
- * земле, пока удержание на ней не требует падать быстрее тяжести.
- *
- * И вот тонкость, на которой легко ошибиться. Скорость подъёма меняется по двум
- * причинам сразу: земля под гусеницами изогнулась — и танк просто разогнался на
- * том же уклоне. Вторая к отрыву отношения не имеет вовсе: газ на длинном скате
- * не подбрасывает. Поэтому сравниваются два подъёма при одной и той же скорости,
- * взятые в начале и в конце шага, — так в критерий попадает только форма земли.
- */
-function stepHeight(
-  state: TankState,
-  terrain: Terrain,
-  dt: number,
-  fromX: number,
-  fromZ: number,
-  /**
-   * Касались ли гусеницы земли в начале шага. Именно в начале: собственную
-   * высоту танк к этому моменту ещё не пересчитал, и сравнивать её с землёй под
-   * новым положением нельзя — на любом спуске старая высота выше новой земли, и
-   * танк выглядел бы взлетевшим просто оттого, что съехал вниз.
-   */
-  grounded: boolean,
-): void {
-  const level = heightAt(terrain, state.x, state.z);
-  const sin = Math.sin(state.angle);
-  const cos = Math.cos(state.angle);
-  /** Скорость подъёма, которую задаёт склон под гусеницами. */
-  const rise = (x: number, z: number): number => {
-    const slope = slopeAt(terrain, x, z);
-    return (slope.dx * sin + slope.dz * cos) * state.speed;
-  };
-  const climb = rise(state.x, state.z);
-
-  if (grounded) {
-    // Только изгиб земли, без вклада разгона: обе точки берутся с текущей скоростью.
-    const needed = (climb - rise(fromX, fromZ)) / dt;
-    if (needed >= -GRAVITY) {
-      state.y = level;
-      state.vy = climb;
-      return;
-    }
-    // Земля ушла из-под гусениц быстрее, чем танк способен за ней падать.
-  }
-
-  state.vy -= GRAVITY * dt;
-  state.y += state.vy * dt;
-  if (state.y > level) return;
-
-  // Приземление. Удар съедает ход: без этого гребни превращались бы в трамплины,
-  // по которым выгодно гонять, и вся тяжесть, добытая склоном, пропадала бы даром.
-  const impact = Math.max(0, -state.vy - LANDING_SOFT);
-  state.y = level;
-  state.vy = climb;
-  if (impact <= 0) return;
-  const drop = impact * LANDING_DRAG;
-  state.speed = Math.abs(state.speed) <= drop ? 0 : state.speed - Math.sign(state.speed) * drop;
-}
-
-/**
- * Ускорение тяжести вдоль курса, м/с². Знак: отрицательное — нос в гору.
- *
- * grade — прирост высоты на метр пути вдоль курса, то есть тангенс наклона;
- * вдоль склона тянет g·sin, поэтому делим на длину гипотенузы, а не берём
- * тангенс как есть. Разница заметна как раз на крутом: на 43° «Долины» тангенс
- * завысил бы тягу почти в полтора раза.
- */
-function slopePull(state: TankState, terrain: Terrain): number {
-  const slope = slopeAt(terrain, state.x, state.z);
-  const grade = slope.dx * Math.sin(state.angle) + slope.dz * Math.cos(state.angle);
-  return (-GRAVITY * grade) / Math.hypot(1, grade);
-}
-
-/**
- * Во сколько раз склон меняет потолок хода. along — тяжесть вдоль направления
- * движения; делим на разгон мотора, потому что множитель и означает «сколько
- * мотора осталось после подъёма». На ровном along = 0 и множитель ровно 1.
- */
-function hold(along: number): number {
-  return clamp(1 + along / ACCEL, SLOPE_HOLD_MIN, SLOPE_HOLD_MAX);
 }
 
 /**
@@ -335,49 +197,25 @@ function resolveObstacles(state: TankState, obstacles: Box[]): number {
 
 // --- Снаряды ---
 
-/**
- * Снаряд, вылетающий из башни танка. Скорость танка не добавляется — так проще целиться.
- *
- * pitch — вертикальная наводка, рад: вверх положительная. На аркадных картах она
- * всегда ноль, и тогда всё это в точности прежний горизонтальный выстрел.
- * ground — высота земли под танком: снаряд летит на SHELL_HEIGHT над ней.
- */
-export function spawnShell(
-  id: number,
-  owner: number,
-  state: TankState,
-  pitch = 0,
-  ground = 0,
-): ShellState {
+/** Снаряд, вылетающий из башни танка. Скорость танка не добавляется — так проще целиться. */
+export function spawnShell(id: number, owner: number, state: TankState): ShellState {
   const a = state.turret;
-  const flat = Math.cos(pitch);
-  const rise = Math.sin(pitch);
   return {
     id,
     owner,
-    x: state.x + Math.sin(a) * MUZZLE_OFFSET * flat,
-    z: state.z + Math.cos(a) * MUZZLE_OFFSET * flat,
-    y: ground + SHELL_HEIGHT + rise * MUZZLE_OFFSET,
-    vx: Math.sin(a) * SHELL_SPEED * flat,
-    vz: Math.cos(a) * SHELL_SPEED * flat,
-    vy: rise * SHELL_SPEED,
+    x: state.x + Math.sin(a) * MUZZLE_OFFSET,
+    z: state.z + Math.cos(a) * MUZZLE_OFFSET,
+    vx: Math.sin(a) * SHELL_SPEED,
+    vz: Math.cos(a) * SHELL_SPEED,
     life: SHELL_LIFETIME,
     bounces: 0,
   };
 }
 
-/**
- * Один шаг снаряда по свободному участку: прямая, без гравитации.
- *
- * Гравитации не будет и дальше. При 62 м/с снаряд на двухстах метрах падал бы на
- * полсотни: честная баллистика требует поднять скорость до реальных, а тогда
- * исчезает упреждение — то, на чём держится вся стрельба по движущимся. Высоту и
- * вертикальную наводку рельеф требует, падение снаряда — нет.
- */
+/** Один шаг снаряда по свободному участку: прямая, без гравитации. */
 export function stepShell(shell: ShellState, dt: number): void {
   shell.x += shell.vx * dt;
   shell.z += shell.vz * dt;
-  shell.y += shell.vy * dt;
   shell.life -= dt;
 }
 
@@ -390,70 +228,35 @@ export interface ShellHit {
   nz: number;
   /** Снаряд начал шаг внутри геометрии — отражать не от чего, только взрыв. */
   stuck: boolean;
-  /**
-   * Задета земля или крыша блока, а не боковая грань. Рикошета отсюда нет: все
-   * вертикальные грани на карте выровнены по осям, и отскок от них считается
-   * точно, а склон — поверхность произвольного наклона, от которой честно
-   * отражать нечем. Снаряд, воткнувшийся в землю, взрывается.
-   */
-  ground: boolean;
 }
 
 /**
- * Ближайшее препятствие, земля или стена карты на пути снаряда за время dt;
- * null — путь свободен.
+ * Ближайшее препятствие или стена карты на пути снаряда за время dt; null — путь свободен.
  *
  * Прямоугольники раздуты на радиус снаряда, поэтому сам снаряд считается точкой,
  * и задача сводится к пересечению отрезка с AABB методом слэбов. Заодно это
  * избавляет от подшагов: касание находится точно, сквозь тонкий блок не проскочить.
- *
- * terrain задаёт, считать ли высоту. Без него свип двумерный, ровно как был: на
- * аркадных картах снаряд идёт на постоянной высоте, все укрытия выше неё, и
- * лишняя ось стоила бы работы, не меняя ни одного ответа. С рельефом добавляются
- * третий слэб у блоков (можно перелететь через крышу) и марш по земле.
  */
 export function sweepShell(
   shell: ShellState,
   dt: number,
   obstacles: Box[],
-  terrain?: Terrain,
   /** Половина стороны карты. По умолчанию — исторические 140×140. */
   half = MAP_HALF,
 ): ShellHit | null {
   const dx = shell.vx * dt;
   const dz = shell.vz * dt;
-  const dy = shell.vy * dt;
 
   let best = sweepBounds(shell.x, shell.z, dx, dz, half);
   for (const box of obstacles) {
-    const hit = sweepBox(shell.x, shell.z, shell.y, dx, dz, dy, box, terrain !== undefined);
+    const hit = sweepBox(shell.x, shell.z, dx, dz, box);
     if (hit && (best === null || hit.t < best.t)) best = hit;
-  }
-
-  if (terrain) {
-    const t = groundHit(terrain, shell.x, shell.z, shell.y, dx, dz, dy);
-    if (t !== null && (best === null || t < best.t)) {
-      best = { t, nx: 0, nz: 0, stuck: t === 0, ground: true };
-    }
   }
   return best;
 }
 
-/**
- * Раздутый прямоугольник препятствия. vertical включает третий слэб по высоте:
- * блок стоит на своём основании box.y и кончается на box.y + box.h, и снаряд с
- * вертикальной наводкой может пройти над ним.
- */
-function sweepBox(
-  px: number,
-  pz: number,
-  py: number,
-  dx: number,
-  dz: number,
-  dy: number,
-  box: Box,
-  vertical: boolean,
-): ShellHit | null {
+/** Раздутый прямоугольник препятствия. */
+function sweepBox(px: number, pz: number, dx: number, dz: number, box: Box): ShellHit | null {
   const hw = box.w / 2 + SHELL_RADIUS;
   const hd = box.d / 2 + SHELL_RADIUS;
 
@@ -462,41 +265,22 @@ function sweepBox(
   const sz = slab(pz, dz, box.z - hd, box.z + hd);
   if (sz === null) return null;
 
-  let enter = Math.max(sx.enter, sz.enter);
-  let exit = Math.min(sx.exit, sz.exit);
-  let roof = false;
-
-  if (vertical) {
-    const base = box.y ?? 0;
-    const sy = slab(py, dy, base - SHELL_RADIUS, base + box.h + SHELL_RADIUS);
-    if (sy === null) return null;
-    roof = sy.enter > enter;
-    enter = Math.max(enter, sy.enter);
-    exit = Math.min(exit, sy.exit);
-  }
-
+  const enter = Math.max(sx.enter, sz.enter);
+  const exit = Math.min(sx.exit, sz.exit);
   if (enter > exit || exit < 0 || enter > 1) return null;
 
   // Танк может прижаться к стене вплотную, и тогда снаряд рождается уже внутри блока.
-  if (enter < 0) return { t: 0, nx: 0, nz: 0, stuck: true, ground: false };
+  if (enter < 0) return { t: 0, nx: 0, nz: 0, stuck: true };
 
-  // Вошли по той оси, в чей слэб попали последней. Крыша — та же земля: от неё
-  // не рикошетят, потому что снаряд пришёл в неё сверху и почти отвесно.
-  if (roof) return { t: enter, nx: 0, nz: 0, stuck: false, ground: true };
+  // Вошли по той оси, в чей слэб попали последней.
   return sx.enter > sz.enter ? faceHit(enter, dx, true) : faceHit(enter, dz, false);
 }
 
 /** Стена по периметру карты: снаряд летит внутри квадрата и упирается в него изнутри. */
-function sweepBounds(
-  px: number,
-  pz: number,
-  dx: number,
-  dz: number,
-  half: number,
-): ShellHit | null {
+function sweepBounds(px: number, pz: number, dx: number, dz: number, half: number): ShellHit | null {
   const limit = half - SHELL_RADIUS;
   if (Math.abs(px) > limit || Math.abs(pz) > limit) {
-    return { t: 0, nx: 0, nz: 0, stuck: true, ground: false };
+    return { t: 0, nx: 0, nz: 0, stuck: true };
   }
 
   const tx = dx === 0 ? Infinity : ((dx > 0 ? limit : -limit) - px) / dx;
@@ -509,7 +293,7 @@ function sweepBounds(
 /** Нормаль всегда смотрит навстречу снаряду. */
 function faceHit(t: number, d: number, alongX: boolean): ShellHit {
   const n = d > 0 ? -1 : 1;
-  return { t, nx: alongX ? n : 0, nz: alongX ? 0 : n, stuck: false, ground: false };
+  return { t, nx: alongX ? n : 0, nz: alongX ? 0 : n, stuck: false };
 }
 
 /** Пересечение луча с полосой [min, max] по одной оси; null — луч идёт мимо полосы. */
@@ -531,17 +315,8 @@ function slab(
 /**
  * Доля шага до попадания в танк, или null. Танк — круг, снаряд — точка с радиусом,
  * то есть это пересечение отрезка с окружностью суммарного радиуса.
- *
- * С рельефом круг становится цилиндром высотой TANK_HEIGHT, стоящим на своей
- * земле: снаряд с вертикальной наводкой проходит над целью или бьёт в склон
- * перед ней. Без terrain — прежняя двумерная задача, где высота одна на всех.
  */
-export function sweepTank(
-  shell: ShellState,
-  dt: number,
-  tank: TankState,
-  terrain?: Terrain,
-): number | null {
+export function sweepTank(shell: ShellState, dt: number, tank: TankState): number | null {
   const dx = shell.vx * dt;
   const dz = shell.vz * dt;
   const px = shell.x - tank.x;
@@ -562,25 +337,12 @@ export function sweepTank(
   const till = (-b + root) / (2 * a);
   if (till < 0 || from > 1) return null;
   from = Math.max(from, 0);
-
-  if (!terrain) return from;
-
-  // Высотный слэб цилиндра. Основание берём у самого танка, а не выборкой поля:
-  // теперь он умеет отрываться от земли, и в прыжке выборка показала бы силуэт
-  // там, где танка уже нет. Заодно это на одну выборку в свипе дешевле.
-  const base = tank.y;
-  const sy = slab(shell.y, shell.vy * dt, base - SHELL_RADIUS, base + TANK_HEIGHT + SHELL_RADIUS);
-  if (sy === null) return null;
-
-  const enter = Math.max(from, sy.enter);
-  const exit = Math.min(till, sy.exit);
-  if (enter > exit || enter > 1) return null;
-  return Math.max(enter, 0);
+  return from;
 }
 
 /** Достаточно ли полого снаряд задел грань, чтобы отскочить, а не взорваться. */
 export function canRicochet(shell: ShellState, hit: ShellHit): boolean {
-  if (hit.stuck || hit.ground || shell.bounces >= MAX_BOUNCES) return false;
+  if (hit.stuck || shell.bounces >= MAX_BOUNCES) return false;
 
   const speed = Math.hypot(shell.vx, shell.vz);
   if (speed < 1e-6) return false;
@@ -635,10 +397,6 @@ export function resolveTankCollisions(tanks: TankState[], dt: number): RamHit[] 
       let dz = b.z - a.z;
       const dist2 = dx * dx + dz * dz;
       if (dist2 >= minDist * minDist) continue;
-      // Один из них в прыжке над другим: корпуса разошлись по высоте и в плане
-      // пересекаются только на виде сверху. На плоских картах y у всех нулевой,
-      // и это сравнение не отсекает ничего.
-      if (Math.abs(a.y - b.y) >= TANK_HEIGHT) continue;
 
       let dist = Math.sqrt(dist2);
       if (dist < 1e-6) {

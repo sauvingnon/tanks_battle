@@ -15,13 +15,11 @@
     "start": "tsx src/server/main.ts",
     "typecheck": "tsc --noEmit",
     "check:map": "tsx scripts/check-map.ts",
-    "check:terrain": "tsx scripts/check-terrain.ts",
     "check:smoothness": "tsx scripts/check-smoothness.ts",
     "check:combat": "tsx scripts/check-combat.ts",
     "check:bots": "tsx scripts/check-bots.ts",
     "check:effects": "tsx scripts/check-effects.ts",
     "check:view": "tsx scripts/check-view.ts",
-    "check:aim": "tsx scripts/check-aim.ts",
     "bench:pve": "tsx scripts/bench-pve.ts",
     "smoke": "node scripts/smoke.mjs"
   },
