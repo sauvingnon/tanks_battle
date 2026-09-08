@@ -13,6 +13,8 @@ export interface RenderState {
   z: number;
   angle: number;
   turret: number;
+  /** Высота, м. На плоских картах всегда 0. */
+  y: number;
 }
 
 /**
@@ -114,6 +116,11 @@ export class SelfPrediction {
     return input;
   }
 
+  /** Своя вертикальная скорость: её сервер не присылает, и берём мы её у себя. */
+  get verticalSpeed(): number {
+    return this.predicted?.vy ?? 0;
+  }
+
   /** Поправка от сервера: ставим его состояние и переигрываем неподтверждённое. */
   reconcile(server: TankState, ack: number): void {
     if (!this.predicted) {
@@ -130,6 +137,11 @@ export class SelfPrediction {
     this.predicted.angle = server.angle;
     this.predicted.speed = server.speed;
     this.predicted.turret = server.turret;
+    this.predicted.y = server.y;
+    // vy сервер не присылает: на земле её каждый тик заново задаёт склон, и уже
+    // первый переигранный шаг делает её точной. В воздухе за время пути пакета
+    // она разойдётся от силы на метр в секунду — это сантиметры дуги, и на
+    // приземлении расхождение всё равно обнуляется.
 
     while (this.pending.length > 0 && this.pending[0].seq <= ack) this.pending.shift();
     for (const input of this.pending) {
@@ -185,6 +197,9 @@ export class SelfPrediction {
       z: from.z + (this.predicted.z - from.z) * t + this.error.z,
       angle: wrapAngle(lerpAngle(from.angle, this.predicted.angle, t) + this.error.angle),
       turret: wrapAngle(lerpAngle(from.turret, this.predicted.turret, t) + this.error.turret),
+      // Своей поправки у высоты нет: она и так непрерывна, а сглаживать её
+      // отдельно значило бы отвязать танк от земли, по которой он едет.
+      y: from.y + (this.predicted.y - from.y) * t,
     };
   }
 }

@@ -6,6 +6,9 @@ import {
   clamp,
   FRICTION,
   GRAVITY,
+  GROUND_EPS,
+  LANDING_DRAG,
+  LANDING_SOFT,
   MAP_HALF,
   MAX_BOUNCES,
   MAX_REVERSE,
@@ -77,37 +80,48 @@ export function stepTank(
    */
   terrain?: Terrain,
 ): void {
-  const throttle = clamp(input.throttle, -1, 1);
-  const steer = clamp(input.steer, -1, 1);
-  const maxSpeed = MAX_SPEED * boost;
+  const ground = terrain && !terrain.flat ? terrain : undefined;
 
   /**
-   * Тяжесть вдоль курса, м/с². Отрицательная — нос смотрит в гору. На плоскости
-   * ноль, и всё, что ниже, обращается в тождество.
-   *
-   * Считается до газа намеренно: иначе на склоне без газа тяжесть добавлялась бы
-   * уже после того, как накат обнулил ход, и стоящий танк каждый тик уползал бы
-   * вниз на миллиметр. В этом порядке накат гасит её сам и работает стояночным
-   * тормозом — ровно до тех пор, пока склон не круче него.
+   * Гусеницы не касаются земли. В воздухе танк не рулит, не газует и не
+   * тормозит: ни мотору, ни накату не за что зацепиться. Отсюда само собой
+   * выходит, что прыжок — решение, принятое до отрыва, а не в полёте.
    */
-  const pull = terrain && !terrain.flat ? slopePull(state, terrain) : 0;
-  state.speed += pull * dt;
+  const flying = ground !== undefined && state.y > heightAt(ground, state.x, state.z) + GROUND_EPS;
 
-  // Продольная динамика: газ против движения тормозит сильнее, чем разгоняет.
-  if (throttle !== 0) {
-    const braking = state.speed !== 0 && Math.sign(throttle) !== Math.sign(state.speed);
-    state.speed += throttle * (braking ? BRAKE : ACCEL * boost) * dt;
-  } else {
-    const drop = FRICTION * dt;
-    state.speed = Math.abs(state.speed) <= drop ? 0 : state.speed - Math.sign(state.speed) * drop;
+  const throttle = flying ? 0 : clamp(input.throttle, -1, 1);
+  const steer = flying ? 0 : clamp(input.steer, -1, 1);
+  const maxSpeed = MAX_SPEED * boost;
+
+  if (!flying) {
+    /**
+     * Тяжесть вдоль курса, м/с². Отрицательная — нос смотрит в гору. На плоскости
+     * ноль, и всё, что ниже, обращается в тождество.
+     *
+     * Считается до газа намеренно: иначе на склоне без газа тяжесть добавлялась бы
+     * уже после того, как накат обнулил ход, и стоящий танк каждый тик уползал бы
+     * вниз на миллиметр. В этом порядке накат гасит её сам и работает стояночным
+     * тормозом — ровно до тех пор, пока склон не круче него.
+     */
+    const pull = ground ? slopePull(state, ground) : 0;
+    state.speed += pull * dt;
+
+    // Продольная динамика: газ против движения тормозит сильнее, чем разгоняет.
+    if (throttle !== 0) {
+      const braking = state.speed !== 0 && Math.sign(throttle) !== Math.sign(state.speed);
+      state.speed += throttle * (braking ? BRAKE : ACCEL * boost) * dt;
+    } else {
+      const drop = FRICTION * dt;
+      state.speed = Math.abs(state.speed) <= drop ? 0 : state.speed - Math.sign(state.speed) * drop;
+    }
+    // Потолок хода тоже держит склон, и это как раз то, чего не хватало: одной
+    // поправки к разгону мало, потому что упирается танк не в разгон, а в потолок,
+    // и в горку он всё равно выходил бы на полные 47 км/ч, только позже.
+    //
+    // Задний ход считается с обратным знаком: под горку смотрит нос, а не корма,
+    // поэтому пятиться в гору должно быть так же тяжело, как ехать в неё передом.
+    state.speed = clamp(state.speed, -MAX_REVERSE * boost * hold(-pull), maxSpeed * hold(pull));
   }
-  // Потолок хода тоже держит склон, и это как раз то, чего не хватало: одной
-  // поправки к разгону мало, потому что упирается танк не в разгон, а в потолок,
-  // и в горку он всё равно выходил бы на полные 47 км/ч, только позже.
-  //
-  // Задний ход считается с обратным знаком: под горку смотрит нос, а не корма,
-  // поэтому пятиться в гору должно быть так же тяжело, как ехать в неё передом.
-  state.speed = clamp(state.speed, -MAX_REVERSE * boost * hold(-pull), maxSpeed * hold(pull));
 
   // Поворот корпуса: на месте вертится бодро, на скорости — вяло.
   const speedFrac = Math.min(Math.abs(state.speed) / maxSpeed, 1);
@@ -121,6 +135,10 @@ export function stepTank(
   state.angle = wrapAngle(state.angle + wheel * turnRate * dt);
 
   // Перемещение. Угол 0 смотрит в +Z, что совпадает с rotation.y в three.js.
+  // Точку до шага запоминаем для вертикали: по ней считается, насколько земля
+  // изогнулась под гусеницами за этот шаг.
+  const fromX = state.x;
+  const fromZ = state.z;
   state.x += Math.sin(state.angle) * state.speed * dt;
   state.z += Math.cos(state.angle) * state.speed * dt;
 
@@ -135,6 +153,74 @@ export function stepTank(
   // отдельно останавливало бы вдвое резче, чем у такой же сплошной стены.
   const hit = Math.max(resolveObstacles(state, obstacles), resolveBounds(state, half));
   if (hit > 0) scrape(state, hit, dt);
+
+  // Вертикаль считается последней: положение по горизонтали к этому моменту уже
+  // улажено выталкиванием, и земля берётся ровно там, где танк в итоге оказался.
+  if (ground) stepHeight(state, ground, dt, fromX, fromZ, !flying);
+}
+
+/**
+ * Высота танка: держится земли, пока может, и летит, когда не может.
+ *
+ * Ключевое здесь — критерий отрыва, и он не «крутой склон». На постоянном скате,
+ * хоть на самом отвесном, следовать земле не требует никакого вертикального
+ * ускорения: танк едет по прямой, просто наклонной. Подбрасывает только
+ * выпуклость — гребень, за которым земля отворачивается вниз. Танк остаётся на
+ * земле, пока удержание на ней не требует падать быстрее тяжести.
+ *
+ * И вот тонкость, на которой легко ошибиться. Скорость подъёма меняется по двум
+ * причинам сразу: земля под гусеницами изогнулась — и танк просто разогнался на
+ * том же уклоне. Вторая к отрыву отношения не имеет вовсе: газ на длинном скате
+ * не подбрасывает. Поэтому сравниваются два подъёма при одной и той же скорости,
+ * взятые в начале и в конце шага, — так в критерий попадает только форма земли.
+ */
+function stepHeight(
+  state: TankState,
+  terrain: Terrain,
+  dt: number,
+  fromX: number,
+  fromZ: number,
+  /**
+   * Касались ли гусеницы земли в начале шага. Именно в начале: собственную
+   * высоту танк к этому моменту ещё не пересчитал, и сравнивать её с землёй под
+   * новым положением нельзя — на любом спуске старая высота выше новой земли, и
+   * танк выглядел бы взлетевшим просто оттого, что съехал вниз.
+   */
+  grounded: boolean,
+): void {
+  const level = heightAt(terrain, state.x, state.z);
+  const sin = Math.sin(state.angle);
+  const cos = Math.cos(state.angle);
+  /** Скорость подъёма, которую задаёт склон под гусеницами. */
+  const rise = (x: number, z: number): number => {
+    const slope = slopeAt(terrain, x, z);
+    return (slope.dx * sin + slope.dz * cos) * state.speed;
+  };
+  const climb = rise(state.x, state.z);
+
+  if (grounded) {
+    // Только изгиб земли, без вклада разгона: обе точки берутся с текущей скоростью.
+    const needed = (climb - rise(fromX, fromZ)) / dt;
+    if (needed >= -GRAVITY) {
+      state.y = level;
+      state.vy = climb;
+      return;
+    }
+    // Земля ушла из-под гусениц быстрее, чем танк способен за ней падать.
+  }
+
+  state.vy -= GRAVITY * dt;
+  state.y += state.vy * dt;
+  if (state.y > level) return;
+
+  // Приземление. Удар съедает ход: без этого гребни превращались бы в трамплины,
+  // по которым выгодно гонять, и вся тяжесть, добытая склоном, пропадала бы даром.
+  const impact = Math.max(0, -state.vy - LANDING_SOFT);
+  state.y = level;
+  state.vy = climb;
+  if (impact <= 0) return;
+  const drop = impact * LANDING_DRAG;
+  state.speed = Math.abs(state.speed) <= drop ? 0 : state.speed - Math.sign(state.speed) * drop;
 }
 
 /**
@@ -479,9 +565,10 @@ export function sweepTank(
 
   if (!terrain) return from;
 
-  // Высотный слэб цилиндра. Земля берётся под центром танка: наклон корпуса на
-  // склоне меняет силуэт на десяток сантиметров, а стоит выборки в каждом свипе.
-  const base = heightAt(terrain, tank.x, tank.z);
+  // Высотный слэб цилиндра. Основание берём у самого танка, а не выборкой поля:
+  // теперь он умеет отрываться от земли, и в прыжке выборка показала бы силуэт
+  // там, где танка уже нет. Заодно это на одну выборку в свипе дешевле.
+  const base = tank.y;
   const sy = slab(shell.y, shell.vy * dt, base - SHELL_RADIUS, base + TANK_HEIGHT + SHELL_RADIUS);
   if (sy === null) return null;
 
@@ -548,6 +635,10 @@ export function resolveTankCollisions(tanks: TankState[], dt: number): RamHit[] 
       let dz = b.z - a.z;
       const dist2 = dx * dx + dz * dz;
       if (dist2 >= minDist * minDist) continue;
+      // Один из них в прыжке над другим: корпуса разошлись по высоте и в плане
+      // пересекаются только на виде сверху. На плоских картах y у всех нулевой,
+      // и это сравнение не отсекает ничего.
+      if (Math.abs(a.y - b.y) >= TANK_HEIGHT) continue;
 
       let dist = Math.sqrt(dist2);
       if (dist < 1e-6) {

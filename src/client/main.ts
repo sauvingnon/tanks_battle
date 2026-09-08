@@ -446,7 +446,9 @@ function onSnapshot(
 
   const wasReady = self.ready;
   self.reconcile(
-    { x: mine.x, z: mine.z, angle: mine.a, speed: mine.s, turret: mine.t },
+    // vy сервер не шлёт — см. reconcile: её восстанавливает первый же
+    // переигранный шаг. Высота на плоских картах в снапшот не попадает вовсе.
+    { x: mine.x, z: mine.z, angle: mine.a, speed: mine.s, turret: mine.t, y: mine.y ?? 0, vy: self.verticalSpeed },
     ack,
   );
   // При первом появлении разворачиваем камеру туда же, куда смотрит башня.
@@ -540,7 +542,7 @@ function drawSelf(dt: number): void {
 
   selfX = state.x;
   selfZ = state.z;
-  scene.updateTank(selfId, state.x, state.z, state.angle, state.turret);
+  scene.updateTank(selfId, state.x, state.z, state.angle, state.turret, state.y);
   if (topView) scene.updateTopCamera(state.x, state.z, controls.distance, dt);
   else scene.updateCamera(state.x, state.z, controls.yaw, controls.pitch, dt, controls.distance);
   // Порядок важен: наводка считается по камере этого кадра, а ствол поднимается
@@ -581,7 +583,9 @@ function drawAim(x: number, z: number, turret: number): void {
     return;
   }
 
-  const ground = heightAt(terrain, x, z);
+  // Высота своего танка, а не земли под ним: в прыжке метка обязана считаться
+  // от того места, откуда реально уйдёт снаряд.
+  const ground = self.sample(1)?.y ?? heightAt(terrain, x, z);
   gunPitch = terrain.flat ? 0 : aimPitch(x, z, ground, turret);
 
   const flat = Math.cos(gunPitch);
@@ -667,12 +671,17 @@ function drawOthers(renderTime: number): void {
     if (id === selfId) continue;
 
     const start = from.entries.get(id) ?? target;
+    const fromY = start.y;
+    const toY = target.y;
     scene.updateTank(
       id,
       start.x + (target.x - start.x) * t,
       start.z + (target.z - start.z) * t,
       lerpAngle(start.a, target.a, t),
       lerpAngle(start.t, target.t, t),
+      // Высота есть только на рельефе; на плоских картах её в снапшоте нет, и
+      // сцена берёт землю сама.
+      toY === undefined ? undefined : (fromY ?? toY) + (toY - (fromY ?? toY)) * t,
     );
   }
 

@@ -4,7 +4,7 @@ import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 
-import { MAX_HP, SHELL_HEIGHT } from '../shared/constants.js';
+import { GROUND_EPS, MAX_HP, SHELL_HEIGHT } from '../shared/constants.js';
 import { wrapAngle } from '../shared/sim.js';
 import { FLAT, heightAt, slopeAt, TERRAIN_STEP, type Terrain } from '../shared/terrain.js';
 import {
@@ -1016,13 +1016,24 @@ export class Scene3D {
     for (const [id, handle] of this.tanks) this.dropTank(id, handle);
   }
 
-  updateTank(id: number, x: number, z: number, angle: number, turret: number): void {
+  /**
+   * y — высота танка. Не задана — берётся из поля: так рисуются аркадные карты,
+   * где земля плоская и слать высоту было бы платой ни за что. На рельефе её
+   * присылает сервер, потому что танк умеет отрываться от земли, и выборка поля
+   * прижимала бы его к грунту ровно в тот момент, ради которого всё затевалось.
+   */
+  updateTank(
+    id: number,
+    x: number,
+    z: number,
+    angle: number,
+    turret: number,
+    y?: number,
+  ): void {
     const handle = this.tanks.get(id);
     if (!handle) return;
     if (handle.alive) handle.everSeen = true;
-    // Высоту берём из поля, а не из сети: земля у клиента ровно та же, что у
-    // сервера, и гнать её ещё и в каждом снапшоте было бы платой ни за что.
-    handle.root.position.set(x, this.groundY(x, z), z);
+    handle.root.position.set(x, y ?? this.groundY(x, z), z);
     handle.root.rotation.y = angle;
     // Башня хранится в мировых углах, а её узел — потомок корпуса.
     handle.turret.rotation.y = turret - angle;
@@ -1549,9 +1560,15 @@ export class Scene3D {
       // высоту танк берёт из поля точка в точку, и наклон — единственное, чем он
       // может показать вес. Без этой задержки он переламывался на гребне в один
       // кадр и читался наклейкой на грунте.
-      const tilt = this.groundTilt(x, z, forwardX, forwardZ);
-      handle.tiltRoll += (tilt.roll - handle.tiltRoll) * kTilt;
-      handle.tiltPitch += (tilt.pitch - handle.tiltPitch) * kTilt;
+      // В воздухе корпус землю не повторяет: гусеницы её не касаются, и
+      // подстраиваться не подо что. Наклон просто застывает тем, каким был на
+      // отрыве, и доворачивается уже после касания.
+      const airborne = handle.root.position.y > this.groundY(x, z) + GROUND_EPS;
+      if (!airborne) {
+        const tilt = this.groundTilt(x, z, forwardX, forwardZ);
+        handle.tiltRoll += (tilt.roll - handle.tiltRoll) * kTilt;
+        handle.tiltPitch += (tilt.pitch - handle.tiltPitch) * kTilt;
+      }
       handle.body.rotation.z = handle.roll + handle.kickRoll + handle.tiltRoll;
       handle.body.rotation.x = handle.pitch + handle.kickPitch + handle.tiltPitch;
 

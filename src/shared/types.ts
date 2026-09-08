@@ -24,6 +24,16 @@ export interface TankState {
   speed: number;
   /** Мировой угол башни. */
   turret: number;
+  /**
+   * Высота, м. На плоских картах всегда 0 — там её просто некуда девать.
+   * На рельефе это либо высота земли под танком, либо больше неё: танк в воздухе.
+   */
+  y: number;
+  /**
+   * Вертикальная скорость, м/с. Пока танк на земле, её задаёт склон под
+   * гусеницами; в воздухе — только тяжесть.
+   */
+  vy: number;
 }
 
 /** То, что клиент отправляет серверу каждый тик. */
@@ -119,6 +129,12 @@ export interface SnapshotEntry {
   s: number; // speed
   h: number; // hp
   d: 0 | 1; // уничтожен
+  /**
+   * Высота. Есть только на картах с рельефом: на плоскости она всегда 0, и
+   * клиент знает её без сети. Нужна потому, что чужие танки клиент не считает,
+   * а берёт из снапшота, — без неё в прыжке они оставались бы вжатыми в грунт.
+   */
+  y?: number;
   /** Маска активных бонусов; шлём, только когда она не пуста. */
   f?: number;
 }
@@ -156,6 +172,6 @@ export interface SnapshotShell {
   b: number;
 }
 
-export function createTankState(x = 0, z = 0, angle = 0): TankState {
-  return { x, z, angle, speed: 0, turret: angle };
+export function createTankState(x = 0, z = 0, angle = 0, y = 0): TankState {
+  return { x, z, angle, speed: 0, turret: angle, y, vy: 0 };
 }

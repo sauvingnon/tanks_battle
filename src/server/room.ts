@@ -268,7 +268,7 @@ export class Room {
       waiting: false,
       fx: new Array<number>(BONUS_KINDS).fill(0),
       stealth: false,
-      state: createTankState(spawn.x, spawn.z, spawn.angle),
+      state: this.spawnState(spawn),
       hp: MAX_HP,
       dead: false,
       respawnAt: 0,
@@ -462,7 +462,9 @@ export class Room {
       player.id,
       player.state,
       this.aimPitch(player),
-      heightAt(this.terrain, player.state.x, player.state.z),
+      // Высота берётся у самого танка, а не выборкой поля: в прыжке ствол выше
+      // земли, и снаряд обязан вылететь оттуда, где башня действительно есть.
+      player.state.y,
     );
     // Урон считаем здесь, а не при попадании: снаряд после выстрела живёт сам по себе.
     const power = player.fx[BONUS_DAMAGE] > this.tick ? BONUS_DAMAGE_MUL : 1;
@@ -641,9 +643,18 @@ export class Room {
     return true;
   }
 
+  /**
+   * Танк на точке появления, поставленный на свою землю. Без этого он рождался
+   * бы на нулевой высоте и первым же тиком падал на рельеф — с четырёх метров
+   * там, где холм высокий, и сквозь землю там, где низина.
+   */
+  private spawnState(spawn: { x: number; z: number; angle: number }): TankState {
+    return createTankState(spawn.x, spawn.z, spawn.angle, heightAt(this.terrain, spawn.x, spawn.z));
+  }
+
   private respawn(player: Player): void {
     const spawn = spawnPoint(this.spawnCounter++, this.mapId);
-    player.state = createTankState(spawn.x, spawn.z, spawn.angle);
+    player.state = this.spawnState(spawn);
     player.hp = player.brain ? BOT_HP : MAX_HP;
     player.dead = false;
     player.readyAt = this.tick;
@@ -1025,6 +1036,10 @@ export class Room {
         s: round(p.state.speed),
         h: p.hp,
         d: p.dead ? 1 : 0,
+        // Высота — только на рельефе: на плоскости она всегда 0, и клиент знает
+        // это без сети. Чужие танки он не считает, поэтому без неё в прыжке они
+        // оставались бы вжатыми в грунт.
+        ...(this.terrain.flat ? {} : { y: round(p.state.y) }),
         // Поле есть только у тех, у кого эффект реально висит — экономия трафика.
         ...(mask === 0 ? {} : { f: mask }),
       });

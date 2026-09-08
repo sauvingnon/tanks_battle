@@ -10,6 +10,7 @@
  * Запуск: npm run check:terrain
  */
 import {
+  GROUND_EPS,
   GUN_PITCH_MAX,
   GUN_PITCH_MIN,
   MAP_HALF,
@@ -425,6 +426,129 @@ console.log('\n=== Размер карты ===');
     'плоская земля и её отсутствие дают побитово одно и то же',
     withFlat.x === without.x && withFlat.z === without.z && withFlat.speed === without.speed,
   );
+}
+
+// --- Отрыв от земли ---
+
+/**
+ * Отрыв даёт выпуклость, а не крутизна. Стенд проверяет ровно это: длинный скат
+ * любой крутизны танк проходит колёсами по земле, а гребень подбрасывает — и тем
+ * сильнее, чем быстрее через него проехали.
+ */
+{
+  console.log('\n=== Отрыв от земли ===');
+
+  /** Поле из одной функции высоты: считаем узлы честно, как настоящее. */
+  const field = (h: (x: number, z: number) => number): Terrain => {
+    const half = MAP_HALF;
+    const n = Math.round((half * 2) / TERRAIN_STEP) + 1;
+    const d = new Array<number>(n * n);
+    for (let j = 0; j < n; j++) {
+      for (let i = 0; i < n; i++) {
+        d[j * n + i] = Math.round(h(-half + i * TERRAIN_STEP, -half + j * TERRAIN_STEP) * 10);
+      }
+    }
+    return { half, step: TERRAIN_STEP, n, d, flat: false };
+  };
+
+  /** Постоянный скат: высота растёт линейно по Z. */
+  const ramp = (grade: number) => field((_x, z) => z * grade);
+  /** Гребень: холм-косинус шириной 40 м поперёк оси Z. */
+  const ridge = (height: number) =>
+    field((_x, z) => (Math.abs(z) < 20 ? (height * (1 + Math.cos((z / 20) * Math.PI))) / 2 : 0));
+
+  /** Проезд по прямой: максимальный отрыв от земли и итоговая скорость. */
+  const cross = (terrain: Terrain, speed: number, from = -40, seconds = 4) => {
+    const tank = createTankState(0, from, 0, heightAt(terrain, 0, from));
+    tank.speed = speed;
+    let lift = 0;
+    for (let i = 0; i < seconds * 30; i++) {
+      stepTank(tank, { seq: i, throttle: 1, steer: 0, turret: 0 }, 1 / 30, [], 1, MAP_HALF, terrain);
+      lift = Math.max(lift, tank.y - heightAt(terrain, tank.x, tank.z));
+    }
+    return { lift, speed: tank.speed };
+  };
+
+  // Длинный скат: сколь угодно крутой, но прямой — следовать ему не требует
+  // никакого вертикального ускорения, значит и подбрасывать нечему.
+  for (const grade of [0.2, 0.5, 0.9]) {
+    const { lift } = cross(ramp(-grade), 13);
+    check(`скат ${(Math.atan(grade) * 180) / Math.PI | 0}° под гору не подбрасывает`, lift < 0.05,
+      `отрыв ${lift.toFixed(3)} м`);
+  }
+
+  // Гребень — подбрасывает, и тем выше, чем быстрее.
+  const slow = cross(ridge(6), 4);
+  const fast = cross(ridge(6), 13);
+  console.log(`  гребень 6 м: на 14 км/ч отрыв ${slow.lift.toFixed(2)} м, на 47 км/ч ${fast.lift.toFixed(2)} м`);
+  // Порог взят от физики, а не от желаемого. Гребень тут пологий — косинус на
+  // сорока метрах, — и подкидывает он именно на столько: танк уходит в воздух
+  // за четыре метра до вершины и приземляется почти сразу за ней. Настоящие
+  // карты трясут заметно сильнее, это меряется ниже.
+  check('через гребень на скорости танк отрывается', fast.lift > 0.25);
+  check('чем быстрее, тем выше', fast.lift > slow.lift + 0.1);
+
+  // Приземление стоит хода: иначе гребни стали бы трамплинами.
+  const jumped = cross(ridge(6), 13);
+  const rolled = cross(ramp(0), 13);
+  check('приземление съедает ход', jumped.speed < rolled.speed - 0.5,
+    `${(jumped.speed * 3.6).toFixed(0)} против ${(rolled.speed * 3.6).toFixed(0)} км/ч`);
+
+  // В воздухе управления нет: ни газа, ни руля.
+  {
+    const terrain = ridge(6);
+    const tank = createTankState(0, 0, 0, heightAt(terrain, 0, 0) + 4);
+    tank.speed = 10;
+    const angle = tank.angle;
+    stepTank(tank, { seq: 0, throttle: -1, steer: 1, turret: 0 }, 1 / 30, [], 1, MAP_HALF, terrain);
+    check('в воздухе газ не действует', tank.speed === 10);
+    check('в воздухе руль не действует', tank.angle === angle);
+    check('в воздухе танк падает', tank.vy < 0);
+  }
+
+  // Сколько отрыва даёт настоящая карта. Числа тут не столько про правильность,
+  // сколько про то, ради чего всё делалось: если однажды рельеф перенастроят и
+  // танк перестанет отрываться совсем, это должно быть видно сразу.
+  {
+    const measure = (name: string) => {
+      const scene = buildScene(MAP_NAMES.indexOf(name));
+      const edge = scene.half - 8;
+      let best = 0;
+      let air = 0;
+      let total = 0;
+      for (let k = 0; k < 24; k++) {
+        const angle = (k / 24) * Math.PI * 2;
+        const tank = createTankState(-edge * Math.sin(angle), -edge * Math.cos(angle), angle);
+        tank.y = heightAt(scene.terrain, tank.x, tank.z);
+        for (let i = 0; i < 60 * 30; i++) {
+          stepTank(tank, { seq: i, throttle: 1, steer: 0, turret: angle }, 1 / 30, [], 1,
+            scene.half, scene.terrain);
+          if (Math.abs(tank.x) > edge || Math.abs(tank.z) > edge) break;
+          const lift = tank.y - heightAt(scene.terrain, tank.x, tank.z);
+          if (lift > GROUND_EPS) air++;
+          best = Math.max(best, lift);
+          total++;
+        }
+      }
+      return { best, share: air / total };
+    };
+
+    for (const name of ['Холмы', 'Долина']) {
+      const { best, share } = measure(name);
+      console.log(`  ${name}: максимальный отрыв ${best.toFixed(2)} м, в воздухе ${(share * 100).toFixed(0)}% времени`);
+      check(`на «${name}» танк отрывается по-настоящему`, best > 0.5);
+      check(`но не летает больше, чем едет («${name}»)`, share < 0.3);
+    }
+  }
+
+  // И снова главное: на плоскости вертикали нет вовсе.
+  {
+    const tank = createTankState(0, 0, 0.5);
+    for (let i = 0; i < 120; i++) {
+      stepTank(tank, { seq: i, throttle: 1, steer: 0.3, turret: 0.5 }, 1 / 30, [], 1, MAP_HALF, FLAT);
+    }
+    check('на плоской карте танк никуда не отрывается', tank.y === 0 && tank.vy === 0);
+  }
 }
 
 console.log(bad === 0 ? '\nРельеф сходится' : `\nПроблем: ${bad}`);
