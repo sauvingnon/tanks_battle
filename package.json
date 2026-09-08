@@ -21,6 +21,7 @@
     "check:bots": "tsx scripts/check-bots.ts",
     "check:effects": "tsx scripts/check-effects.ts",
     "check:view": "tsx scripts/check-view.ts",
+    "check:aim": "tsx scripts/check-aim.ts",
     "bench:pve": "tsx scripts/bench-pve.ts",
     "smoke": "node scripts/smoke.mjs"
   },

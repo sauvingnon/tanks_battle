@@ -30,6 +30,8 @@ import {
   RULES_ARCADE,
   RULES_REAL,
   SHELL_HEIGHT,
+  SHELL_LIFETIME,
+  SHELL_SPEED,
   type GameMode,
   type Ruleset,
 } from '../shared/constants.js';
@@ -547,7 +549,7 @@ function drawSelf(dt: number): void {
   else scene.updateCamera(state.x, state.z, controls.yaw, controls.pitch, dt, controls.distance);
   // Порядок важен: наводка считается по камере этого кадра, а ствол поднимается
   // на её результат. Иначе метка и ствол расходились бы на кадр при довороте.
-  drawAim(state.x, state.z, state.turret);
+  drawAim(state.x, state.z, state.turret, dt);
   scene.setGunPitch(selfId, gunPitch);
 }
 
@@ -555,8 +557,14 @@ function drawSelf(dt: number): void {
 let selfX = 0;
 let selfZ = 0;
 
-/** Докуда добьёт метка прицела, если на пути ничего нет, м. */
-const AIM_RANGE = 140;
+/** Докуда вообще долетает снаряд, м: скорость на время жизни. Дальше не достанет. */
+const SHELL_REACH = SHELL_SPEED * SHELL_LIFETIME;
+
+/** На какой дальности стоит метка, когда на линии ствола никого нет, м. */
+const AIM_IDLE_RANGE = 80;
+
+/** Как быстро метка переезжает на новую дальность, 1/с. */
+const AIM_RANGE_RATE = 9;
 
 /**
  * Возвышение своего ствола, рад. Считается каждый кадр из наводки и уходит
@@ -565,19 +573,37 @@ const AIM_RANGE = 140;
 let gunPitch = 0;
 
 /**
- * Метка встаёт туда, куда смотрит ствол, а не в центр экрана. Башня доворачивается
- * с задержкой и стреляет от дульного среза, поэтому центр кадра — это не точка
- * попадания, и целиться по нему нельзя. Луч считается тем же свипом, что и снаряд,
- * так что метка садится ровно на то препятствие, в которое упрётся выстрел.
- *
- * На рельефе к этому добавляется высота. Сначала ищется точка, на которую смотрит
- * игрок: луч камеры через центр кадра до земли или укрытия. Потом ствол ведётся
- * в эту точку — насколько хватает углов наводки. И только потом считается сам
- * выстрел: метка стоит там, где снаряд действительно закончит полёт. Поэтому в
- * упор по гребню метка садится на гребень, а не на цель за ним, — видно сразу,
- * что отсюда не достанешь.
+ * Обратная дальность метки, 1/м. Хранится именно обратной, потому что по экрану
+ * метка ходит как единица на дальность: ровный шаг здесь — это ровный переезд в
+ * кадре. Сглаживай мы метры, один и тот же переезд рвал бы картинку у ближней
+ * цели и еле полз бы у дальней.
  */
-function drawAim(x: number, z: number, turret: number): void {
+let aimReciprocal = 1 / AIM_IDLE_RANGE;
+
+/**
+ * Метка стоит на линии выстрела, а не в центре экрана: башня доворачивается с
+ * задержкой и стреляет от дульного среза, поэтому центр кадра — это не туда,
+ * куда уйдёт снаряд.
+ *
+ * Место на этой линии выбирается по дальности цели. Раньше метку ставила точка,
+ * в которую упирался свип, — и это оказалось её главной бедой. Дальность до
+ * препятствия рвётся: чуть повёл башней мимо угла укрытия — и точка удара
+ * перепрыгнула с трёх метров на сто сорок, а метка через полэкрана. На рельефе
+ * к тому же луч ложится на землю почти по касательной, и там дальность скачет
+ * от любого шевеления мышью. Отсюда и дрожь.
+ *
+ * Теперь дальность берётся у того, во что целятся: живой танк у линии ствола
+ * задаёт её сам, а без цели метка стоит на AIM_IDLE_RANGE. Дальность цели —
+ * единственная, на которой «метка накрыла танк» означает «попал»: камера висит
+ * метрах в двух в стороне от линии выстрела, и точки линии с разной дальности
+ * уходят на экране в разные места (подробнее — Scene3D.aimTargetRange). Смена
+ * дальности сглаживается, поэтому даже потеря цели метку не дёргает.
+ *
+ * Свип остался, но метку больше не двигает: он только красит её, когда до цели
+ * выстрел не дойдёт (см. blocked). Так сохранилось то, ради чего он был нужен, —
+ * по цели за гребнем сразу видно, что отсюда её не достать.
+ */
+function drawAim(x: number, z: number, turret: number, dt: number): void {
   if (myDead) {
     crosshair.hidden = true;
     return;
@@ -591,32 +617,64 @@ function drawAim(x: number, z: number, turret: number): void {
   const flat = Math.cos(gunPitch);
   const dx = Math.sin(turret) * flat;
   const dz = Math.cos(turret) * flat;
-  const probe: ShellState = {
-    id: 0,
-    owner: selfId,
-    x: x + dx * MUZZLE_OFFSET,
-    z: z + dz * MUZZLE_OFFSET,
-    y: ground + SHELL_HEIGHT + Math.sin(gunPitch) * MUZZLE_OFFSET,
-    vx: dx * AIM_RANGE,
-    vz: dz * AIM_RANGE,
-    vy: Math.sin(gunPitch) * AIM_RANGE,
-    life: 1,
-    bounces: 0,
-  };
-  // dt = 1, поэтому свип разбирает ровно отрезок длиной AIM_RANGE.
-  // Метка прицела упирается в укрытия, а не во всё подряд: низкий блок она проходит.
-  const wall = sweepShell(probe, 1, cover, terrain.flat ? undefined : terrain, mapHalf);
-  const travel = wall ? wall.t : 1;
+  const dy = Math.sin(gunPitch);
 
-  const point = scene.project(
-    probe.x + probe.vx * travel,
-    probe.y + probe.vy * travel,
-    probe.z + probe.vz * travel,
-  );
+  // Линия выстрела: от дульного среза по направлению ствола.
+  const fromX = x + dx * MUZZLE_OFFSET;
+  const fromZ = z + dz * MUZZLE_OFFSET;
+  const fromY = ground + SHELL_HEIGHT + dy * MUZZLE_OFFSET;
+
+  const target = scene.aimTargetRange(selfId, fromX, fromY, fromZ, dx, dy, dz, SHELL_REACH);
+  const want = target ?? AIM_IDLE_RANGE;
+  aimReciprocal += (1 / want - aimReciprocal) * (1 - Math.exp(-dt * AIM_RANGE_RATE));
+  const aimRange = 1 / aimReciprocal;
+
+  const point = scene.project(fromX + dx * aimRange, fromY + dy * aimRange, fromZ + dz * aimRange);
   crosshair.hidden = point === null;
   if (point) {
     crosshair.style.transform = `translate(${Math.round(point.x)}px, ${Math.round(point.y)}px)`;
+    crosshair.classList.toggle('is-blocked', blocked(target, fromX, fromY, fromZ, dx, dy, dz));
   }
+}
+
+/**
+ * Дойдёт ли выстрел до цели. Считается тем же свипом, которым летит снаряд, —
+ * значит, метка краснеет ровно там, где снаряд и правда упрётся.
+ *
+ * Спрашивается это только при живой цели на линии, и по двум причинам. Смысл:
+ * без цели метка стоит на запасной дальности, и «не долетел до восьмидесяти
+ * метров» ничего не значит — по рельефу ствол смотрит в землю через раз, и
+ * предупреждение горело бы постоянно. Цена: свип идёт по всем укрытиям карты
+ * каждый кадр, и в кадрах, где в прицеле никого, эта работа лишняя.
+ */
+function blocked(
+  target: number | null,
+  fromX: number,
+  fromY: number,
+  fromZ: number,
+  dx: number,
+  dy: number,
+  dz: number,
+): boolean {
+  if (target === null) return false;
+  const probe: ShellState = {
+    id: 0,
+    owner: selfId,
+    x: fromX,
+    z: fromZ,
+    y: fromY,
+    vx: dx * SHELL_REACH,
+    vz: dz * SHELL_REACH,
+    vy: dy * SHELL_REACH,
+    life: 1,
+    bounces: 0,
+  };
+  // dt = 1, поэтому свип разбирает ровно отрезок длиной SHELL_REACH — весь путь
+  // снаряда. Упирается он в укрытия, а не во всё подряд: низкий блок проходит.
+  const wall = sweepShell(probe, 1, cover, terrain.flat ? undefined : terrain, mapHalf);
+  if (!wall) return false;
+  // Полметра запаса: цель, прижавшаяся к стене, не должна мигать красным.
+  return wall.t * SHELL_REACH < target - 0.5;
 }
 
 /** Дистанция, по земле на которой ствол сам ложится в виде сверху, м. */
@@ -757,6 +815,7 @@ const banner = el('wave-banner');
 const bannerTitle = el('wave-title');
 const bannerSub = el('wave-sub');
 const setupPanel = el('setup');
+const setupNote = el('setup-note');
 const setupToggle = el<HTMLButtonElement>('setup-toggle');
 const setupOwner = el('setup-owner');
 const setupMaps = el('setup-maps');
@@ -946,6 +1005,10 @@ function renderSetup(): void {
 
   setupBonuses.checked = bonusesOn;
   setupBonuses.disabled = !isHost;
+
+  // Про волны — только там, где волны есть. В «Все против всех» это пять строк
+  // не о том, и панель без них заметно короче.
+  setupNote.hidden = mode !== MODE_PVE;
 
   // Две галки в панели, которые работают у всех: они не про бой.
   setupTop.checked = topView;
@@ -1178,6 +1241,8 @@ function showOverlay(message: string, isError = false): void {
   overlay.classList.remove('is-hidden');
   hud.hidden = true;
   crosshair.hidden = true;
+  // Дальность метки тянется к цели плавно; от прошлого боя её тянуть некуда.
+  aimReciprocal = 1 / AIM_IDLE_RANGE;
   hint.hidden = true;
   touchLayer.hidden = true;
   setupToggle.hidden = true;

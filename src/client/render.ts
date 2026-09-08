@@ -4,7 +4,7 @@ import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 
-import { GROUND_EPS, MAX_HP, SHELL_HEIGHT } from '../shared/constants.js';
+import { GROUND_EPS, MAX_HP, SHELL_HEIGHT, TANK_HEIGHT } from '../shared/constants.js';
 import { wrapAngle } from '../shared/sim.js';
 import { FLAT, heightAt, slopeAt, TERRAIN_STEP, type Terrain } from '../shared/terrain.js';
 import {
@@ -87,6 +87,13 @@ const CAMERA_BASE_HEIGHT = 3.4;
 /** Минимальный просвет между камерой и землёй под ней: на рельефе она за холмом. */
 const CAMERA_CLEARANCE = 2;
 
+/**
+ * Насколько далеко от линии выстрела танк ещё считается тем, во что целятся, м.
+ * Метке нужна дальность цели, а не попадание в неё: допуск щедрый намеренно —
+ * промахнувшись на корпус, дальность мы всё равно получаем правильную, а вот
+ * потеряв цель, метка уехала бы на запасную дальность посреди прицеливания.
+ */
+const AIM_SNAP_RADIUS = 5;
 
 /** Высота, на которой висит ник над центром танка. */
 const LABEL_HEIGHT = 3.7;
@@ -899,13 +906,15 @@ export class Scene3D {
       node.castShadow = false;
     });
 
-    const { x, z } = handle.root.position;
+    // Обломки летят от самого танка, а не от земли под ним: подбитый в прыжке
+    // разлетается там, где его застало, иначе куски били бы из-под холма.
+    const { x, y, z } = handle.root.position;
     for (let i = 0; i < WRECK_DEBRIS; i++) {
       const course = Math.random() * Math.PI * 2;
       const outward = 3 + Math.random() * 7;
       this.debris.emit(
         x + (Math.random() - 0.5) * 2,
-        this.groundY(x, z) + 1.4,
+        y + 1.4,
         z + (Math.random() - 0.5) * 2,
         Math.sin(course) * outward,
         5 + Math.random() * 6,
@@ -1181,6 +1190,53 @@ export class Scene3D {
     };
   }
 
+  /**
+   * Дальность до ближайшей живой цели у линии выстрела, м. Никого нет — null.
+   *
+   * Это нужно метке прицела, и вот зачем. Линия выстрела на экране — линия, а не
+   * точка, и метка обязана выбрать на ней место. Камера стоит не на дульном срезе,
+   * а примерно в двух метрах в стороне от этой линии, поэтому её точки с разной
+   * дальности проецируются в разные места экрана: метка, взятая на тридцати метрах,
+   * стоит на экране совсем не там, где та же линия проходит на ста двадцати.
+   * Единственная дальность, на которой «метка накрыла танк» значит «попал», —
+   * дальность самого танка. Её и берём.
+   *
+   * Прицеливаться за игрока это не начинает: наводка не двигается, двигается
+   * только место метки на уже наведённой линии.
+   *
+   * Замаскированных пропускаем: цель, которую не видно, не должна выдавать себя
+   * тем, что метка встала на её дальность.
+   */
+  aimTargetRange(
+    exclude: number,
+    fromX: number,
+    fromY: number,
+    fromZ: number,
+    dirX: number,
+    dirY: number,
+    dirZ: number,
+    maxRange: number,
+  ): number | null {
+    let best: number | null = null;
+    for (const [id, handle] of this.tanks) {
+      if (id === exclude || !handle.alive || handle.cloaked) continue;
+      const at = handle.root.position;
+      const toX = at.x - fromX;
+      const toY = at.y + TANK_HEIGHT / 2 - fromY;
+      const toZ = at.z - fromZ;
+
+      const along = toX * dirX + toY * dirY + toZ * dirZ;
+      if (along <= 0 || along > maxRange) continue;
+      if (best !== null && along >= best) continue; // ближний закрывает дальнего
+
+      const offX = toX - dirX * along;
+      const offY = toY - dirY * along;
+      const offZ = toZ - dirZ * along;
+      if (offX * offX + offY * offY + offZ * offZ > AIM_SNAP_RADIUS * AIM_SNAP_RADIUS) continue;
+      best = along;
+    }
+    return best;
+  }
 
   // --- Снаряды ---
 
@@ -1573,7 +1629,11 @@ export class Scene3D {
       handle.body.rotation.x = handle.pitch + handle.kickPitch + handle.tiltPitch;
 
       // Замаскированный не должен выдавать себя ни следом, ни облаком пыли.
-      if (handle.cloaked || step === 0) continue;
+      //
+      // В воздухе их не оставляет никто. И след, и пыль родятся от трения траков
+      // о грунт, а под летящим танком грунта нет: без этой проверки пыль била
+      // из земли метром-другим ниже машины и выдавала прыжок за езду по склону.
+      if (handle.cloaked || airborne || step === 0) continue;
 
       handle.trackDistance += step;
       handle.dustDistance += step;
@@ -1589,7 +1649,9 @@ export class Scene3D {
         // иначе квадрат следа торчал бы из грунта одним краем.
         if (laysTrack) this.tracks.emit(at.x, at.z, yaw, this.clock, this.groundSampler);
         if (!raisesDust) continue;
-        // Пыль выбрасывает назад из-под трака и подбрасывает вверх.
+        // Пыль выбрасывает назад из-под трака и подбрасывает вверх. Высота —
+        // земля под самим траком, а не под серединой танка: на склоне борта
+        // стоят на разных уровнях, и сюда мы попадаем только пока они её касаются.
         this.dust.emit(
           at.x,
           this.groundY(at.x, at.z) + 0.25,

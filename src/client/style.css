@@ -262,6 +262,15 @@ body {
   background: rgba(255, 255, 255, 0.9);
 }
 
+/* Между стволом и меткой что-то есть: выстрел упрётся, не долетев. */
+#crosshair.is-blocked::before {
+  border-color: rgba(255, 122, 96, 0.9);
+}
+
+#crosshair.is-blocked::after {
+  background: rgba(255, 122, 96, 0.95);
+}
+
 #hitmarker {
   position: absolute;
   inset: -6px;
@@ -447,6 +456,21 @@ body {
   right: calc(14px + env(safe-area-inset-right));
   width: 268px;
   max-width: calc(100vw - 28px);
+  /*
+   * Потолок по высоте и прокрутка. Панель растёт с каждой новой настройкой, а
+   * экран — нет: без потолка нижние переключатели просто уезжали за край, и
+   * добраться до них было нечем. Высота — ровно остаток экрана под панелью.
+   *
+   * dvh, а не vh: на телефоне адресная строка то съедает высоту, то отдаёт её
+   * обратно, и vh считается по большему из состояний — то есть по тому, которого
+   * на экране сейчас нет. Строка выше — запасная для браузеров без dvh.
+   */
+  max-height: calc(100vh - 74px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+  max-height: calc(100dvh - 74px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+  overflow-y: auto;
+  /* Докрутив список до края, не прокручиваем заодно страницу под ним. */
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
   display: flex;
   flex-direction: column;
   gap: 8px;
