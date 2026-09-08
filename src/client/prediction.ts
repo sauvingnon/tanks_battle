@@ -1,5 +1,6 @@
 import { DT, MAP_HALF } from '../shared/constants.js';
 import { angleDiff, clamp, lerpAngle, stepTank, wrapAngle } from '../shared/sim.js';
+import { FLAT, type Terrain } from '../shared/terrain.js';
 import type { Box, Input, TankState } from '../shared/types.js';
 
 /** Дальше этого расхождение не сглаживаем, а прыгаем: значит был фриз или телепорт. */
@@ -31,6 +32,13 @@ export class SelfPrediction {
    * стену посреди большой карты, а сервер каждый тик отодвигал бы танк обратно.
    */
   half = MAP_HALF;
+  /**
+   * Земля карты. Тяжесть на склоне входит в шаг симуляции, поэтому предсказание
+   * обязано считать её по тому же полю, что и сервер: с плоскостью вместо
+   * рельефа свой танк на каждом подъёме уезжал бы вперёд серверного, и поправка
+   * тянула бы его назад весь склон.
+   */
+  terrain: Terrain = FLAT;
   /** Пока сервер не сказал обратного — живы. Мёртвый танк не управляется. */
   alive = true;
   /**
@@ -99,7 +107,7 @@ export class SelfPrediction {
     const input: Input = { seq: ++this.seq, throttle, steer, turret, pitch, fire };
     this.pending.push(input);
     this.previous = { ...this.predicted };
-    stepTank(this.predicted, input, DT, this.obstacles, this.boost, this.half);
+    stepTank(this.predicted, input, DT, this.obstacles, this.boost, this.half, this.terrain);
 
     // Страховка от бесконечного роста, если ack почему-то перестал приходить.
     if (this.pending.length > 180) this.pending.splice(0, this.pending.length - 180);
@@ -125,7 +133,7 @@ export class SelfPrediction {
 
     while (this.pending.length > 0 && this.pending[0].seq <= ack) this.pending.shift();
     for (const input of this.pending) {
-      stepTank(this.predicted, input, DT, this.obstacles, this.boost, this.half);
+      stepTank(this.predicted, input, DT, this.obstacles, this.boost, this.half, this.terrain);
     }
 
     const deltaX = this.predicted.x - before.x;

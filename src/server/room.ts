@@ -361,6 +361,7 @@ export class Room {
           this.obstacles,
           this.boost(player),
           this.half,
+          this.relief,
         );
         if (player.last.fire) {
           // Флаг срабатывает ровно один раз на инпут. Иначе last повторялся бы
@@ -444,7 +445,7 @@ export class Room {
         half: this.half,
       },
     );
-    stepTank(bot.state, bot.last, DT, this.obstacles, 1, this.half);
+    stepTank(bot.state, bot.last, DT, this.obstacles, 1, this.half, this.relief);
     if (bot.last.fire) {
       bot.last.fire = false;
       this.tryFire(bot);

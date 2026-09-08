@@ -183,6 +183,21 @@ const SHAKE_FREQ = 21;
 const LEAN_RATE = 9;
 
 /**
+ * Скорость, с которой корпус ложится на склон, 1/с. Заметно меньше LEAN_RATE, и
+ * в этом весь смысл: подвеска отрабатывает землю не мгновенно.
+ *
+ * Танк стоит ровно на высоте поля, поэтому наклон — единственное, чем корпус
+ * может показать, что у него есть вес. Когда он повторял уклон точка в точку,
+ * машина читалась наклейкой на грунте: перевалил гребень — и корпус переломился
+ * в тот же кадр. С запаздыванием нос на вершине ещё смотрит вверх и опускается
+ * уже за ней, то есть ровно так, как это делает настоящая подвеска.
+ *
+ * Выше 6 запаздывание перестаёт читаться, ниже 4 — углы корпуса начинают
+ * черпать грунт на резких перегибах.
+ */
+const TILT_RATE = 5;
+
+/**
  * Толчок корпуса, рад: от своего выстрела и от прилетевшего снаряда. Оба заметно
  * меньше LEAN_MAX (~6°): это удар, а не поза, и он должен читаться как вздрагивание,
  * а не как отдельное положение танка.
@@ -258,6 +273,9 @@ export interface TankHandle {
    */
   kickRoll: number;
   kickPitch: number;
+  /** Наклон по склону, к которому корпус идёт с запаздыванием. */
+  tiltRoll: number;
+  tiltPitch: number;
   /** Пройденный путь с прошлого отпечатка и с прошлой пылинки, м. */
   trackDistance: number;
   dustDistance: number;
@@ -804,6 +822,8 @@ export class Scene3D {
       pitch: 0,
       kickRoll: 0,
       kickPitch: 0,
+      tiltRoll: 0,
+      tiltPitch: 0,
       trackDistance: 0,
       dustDistance: 0,
       paint: bodyMaterial,
@@ -1463,6 +1483,7 @@ export class Scene3D {
   private updateChassis(dt: number): void {
     if (dt <= 0) return;
     const k = 1 - Math.exp(-dt * LEAN_RATE);
+    const kTilt = 1 - Math.exp(-dt * TILT_RATE);
 
     // Толчок гаснет у всех и всегда: он поставлен в момент удара, и ветки
     // «подбит» или «телепорт» ниже до него бы не дошли.
@@ -1490,6 +1511,10 @@ export class Scene3D {
         handle.pitch = 0;
         handle.kickRoll = 0;
         handle.kickPitch = 0;
+        // Танк возродился в другом месте: старый склон к новой земле отношения
+        // не имеет, и доводить корпус от него значило бы въехать боком.
+        handle.tiltRoll = 0;
+        handle.tiltPitch = 0;
         handle.trackDistance = 0;
         handle.dustDistance = 0;
         handle.body.rotation.set(0, 0, 0);
@@ -1519,9 +1544,16 @@ export class Scene3D {
       // корпуса на подвеске, склон — положение самой подвески на земле. Уклон
       // раскладывается по осям корпуса: вдоль курса он задирает нос, поперёк —
       // кренит на борт.
+      //
+      // К склону корпус идёт с запаздыванием, а не садится на него сразу: свою
+      // высоту танк берёт из поля точка в точку, и наклон — единственное, чем он
+      // может показать вес. Без этой задержки он переламывался на гребне в один
+      // кадр и читался наклейкой на грунте.
       const tilt = this.groundTilt(x, z, forwardX, forwardZ);
-      handle.body.rotation.z = handle.roll + handle.kickRoll + tilt.roll;
-      handle.body.rotation.x = handle.pitch + handle.kickPitch + tilt.pitch;
+      handle.tiltRoll += (tilt.roll - handle.tiltRoll) * kTilt;
+      handle.tiltPitch += (tilt.pitch - handle.tiltPitch) * kTilt;
+      handle.body.rotation.z = handle.roll + handle.kickRoll + handle.tiltRoll;
+      handle.body.rotation.x = handle.pitch + handle.kickPitch + handle.tiltPitch;
 
       // Замаскированный не должен выдавать себя ни следом, ни облаком пыли.
       if (handle.cloaked || step === 0) continue;

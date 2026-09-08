@@ -238,6 +238,7 @@ function handleMessage(msg: ServerMessage): void {
       self.half = msg.map.half;
       mapHalf = msg.map.half;
       terrain = terrainFrom(msg.map.terrain);
+      self.terrain = terrain;
       cover = coverBoxes(msg.map.obstacles, terrain);
       if (!worldBuilt) {
         // Земля ставится до сборки мира: по ней строится её же меш.
@@ -258,6 +259,7 @@ function handleMessage(msg: ServerMessage): void {
       self.half = msg.half;
       mapHalf = msg.half;
       terrain = terrainFrom(msg.terrain);
+      self.terrain = terrain;
       cover = coverBoxes(msg.obstacles, terrain);
       scene.setTerrain(terrain);
       scene.buildWorld(msg.half, msg.obstacles);

@@ -5,6 +5,7 @@ import {
   BUMP_GRAZE,
   clamp,
   FRICTION,
+  GRAVITY,
   MAP_HALF,
   MAX_BOUNCES,
   MAX_REVERSE,
@@ -20,13 +21,15 @@ import {
   SHELL_LIFETIME,
   SHELL_RADIUS,
   SHELL_SPEED,
+  SLOPE_HOLD_MAX,
+  SLOPE_HOLD_MIN,
   TANK_HEIGHT,
   TANK_RADIUS,
   TURN_RATE_FULL,
   TURN_RATE_STILL,
   TURRET_RATE,
 } from './constants.js';
-import { groundHit, heightAt, type Terrain } from './terrain.js';
+import { groundHit, heightAt, slopeAt, type Terrain } from './terrain.js';
 import type { Box, Input, ShellState, TankState } from './types.js';
 
 // Живёт в constants.ts, чтобы рельеф мог им пользоваться, не замыкая импорты
@@ -68,10 +71,27 @@ export function stepTank(
    * 140×140, на которых нарисованы аркадные карты и написаны все проверки.
    */
   half = MAP_HALF,
+  /**
+   * Земля под гусеницами. Не задана или плоская — тяжести вдоль курса нет, и вся
+   * ходовая считается ровно так же, как считалась до рельефа.
+   */
+  terrain?: Terrain,
 ): void {
   const throttle = clamp(input.throttle, -1, 1);
   const steer = clamp(input.steer, -1, 1);
   const maxSpeed = MAX_SPEED * boost;
+
+  /**
+   * Тяжесть вдоль курса, м/с². Отрицательная — нос смотрит в гору. На плоскости
+   * ноль, и всё, что ниже, обращается в тождество.
+   *
+   * Считается до газа намеренно: иначе на склоне без газа тяжесть добавлялась бы
+   * уже после того, как накат обнулил ход, и стоящий танк каждый тик уползал бы
+   * вниз на миллиметр. В этом порядке накат гасит её сам и работает стояночным
+   * тормозом — ровно до тех пор, пока склон не круче него.
+   */
+  const pull = terrain && !terrain.flat ? slopePull(state, terrain) : 0;
+  state.speed += pull * dt;
 
   // Продольная динамика: газ против движения тормозит сильнее, чем разгоняет.
   if (throttle !== 0) {
@@ -81,7 +101,13 @@ export function stepTank(
     const drop = FRICTION * dt;
     state.speed = Math.abs(state.speed) <= drop ? 0 : state.speed - Math.sign(state.speed) * drop;
   }
-  state.speed = clamp(state.speed, -MAX_REVERSE * boost, maxSpeed);
+  // Потолок хода тоже держит склон, и это как раз то, чего не хватало: одной
+  // поправки к разгону мало, потому что упирается танк не в разгон, а в потолок,
+  // и в горку он всё равно выходил бы на полные 47 км/ч, только позже.
+  //
+  // Задний ход считается с обратным знаком: под горку смотрит нос, а не корма,
+  // поэтому пятиться в гору должно быть так же тяжело, как ехать в неё передом.
+  state.speed = clamp(state.speed, -MAX_REVERSE * boost * hold(-pull), maxSpeed * hold(pull));
 
   // Поворот корпуса: на месте вертится бодро, на скорости — вяло.
   const speedFrac = Math.min(Math.abs(state.speed) / maxSpeed, 1);
@@ -109,6 +135,29 @@ export function stepTank(
   // отдельно останавливало бы вдвое резче, чем у такой же сплошной стены.
   const hit = Math.max(resolveObstacles(state, obstacles), resolveBounds(state, half));
   if (hit > 0) scrape(state, hit, dt);
+}
+
+/**
+ * Ускорение тяжести вдоль курса, м/с². Знак: отрицательное — нос в гору.
+ *
+ * grade — прирост высоты на метр пути вдоль курса, то есть тангенс наклона;
+ * вдоль склона тянет g·sin, поэтому делим на длину гипотенузы, а не берём
+ * тангенс как есть. Разница заметна как раз на крутом: на 43° «Долины» тангенс
+ * завысил бы тягу почти в полтора раза.
+ */
+function slopePull(state: TankState, terrain: Terrain): number {
+  const slope = slopeAt(terrain, state.x, state.z);
+  const grade = slope.dx * Math.sin(state.angle) + slope.dz * Math.cos(state.angle);
+  return (-GRAVITY * grade) / Math.hypot(1, grade);
+}
+
+/**
+ * Во сколько раз склон меняет потолок хода. along — тяжесть вдоль направления
+ * движения; делим на разгон мотора, потому что множитель и означает «сколько
+ * мотора осталось после подъёма». На ровном along = 0 и множитель ровно 1.
+ */
+function hold(along: number): number {
+  return clamp(1 + along / ACCEL, SLOPE_HOLD_MIN, SLOPE_HOLD_MAX);
 }
 
 /**

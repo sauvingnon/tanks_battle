@@ -337,5 +337,95 @@ console.log('\n=== Размер карты ===');
   check('и летит дальше на большой', sweepShell(shot(), 1, [], undefined, 140) === null);
 }
 
+// --- Тяжесть на склоне ---
+
+/**
+ * Склон должен стоить хода. Стенд ставит танк на ровный скат заданной крутизны
+ * и гонит его несколько секунд на полном газу: интересен не разгон, а то, на чём
+ * он в итоге устаканится, — упирается танк в потолок хода, а не в мотор.
+ */
+{
+  console.log('\n=== Тяжесть на склоне ===');
+
+  /** Поле с постоянным уклоном grade вдоль +Z: высота растёт линейно. */
+  const ramp = (grade: number): Terrain => {
+    const half = MAP_HALF;
+    const n = Math.round((half * 2) / TERRAIN_STEP) + 1;
+    const d = new Array<number>(n * n);
+    for (let j = 0; j < n; j++) {
+      const z = -half + j * TERRAIN_STEP;
+      for (let i = 0; i < n; i++) d[j * n + i] = Math.round(z * grade * 10);
+    }
+    return { half, step: TERRAIN_STEP, n, d, flat: false };
+  };
+
+  /**
+   * Установившаяся скорость на курсе angle после seconds секунд газа.
+   *
+   * Танк каждый тик возвращается в начало координат. Скат постоянной крутизны
+   * везде одинаков, поэтому на физику это не влияет вовсе, зато танк не успевает
+   * доехать до стены карты: на полном ходу он проходит под восемьдесят метров, а
+   * до края всего семьдесят, и без возврата стенд мерил бы не склон, а упор.
+   */
+  const settle = (terrain: Terrain, angle: number, throttle = 1, seconds = 6): number => {
+    const tank = createTankState(0, 0, angle);
+    for (let i = 0; i < seconds * 30; i++) {
+      stepTank(tank, { seq: 0, throttle, steer: 0, turret: angle }, 1 / 30, [], 1, MAP_HALF, terrain);
+      tank.x = 0;
+      tank.z = 0;
+    }
+    return tank.speed;
+  };
+
+  const level = settle(FLAT, 0);
+  const up = settle(ramp(0.25), 0); // +Z в гору
+  const down = settle(ramp(0.25), Math.PI); // тот же скат носом вниз
+
+  const kmh = (v: number) => `${(Math.abs(v) * 3.6).toFixed(0)} км/ч`;
+  console.log(`  ровно ${kmh(level)}, в гору ${kmh(up)}, под гору ${kmh(down)} (уклон 14°)`);
+
+  check('на ровном ход прежний — ровно MAX_SPEED', Math.abs(level - 13) < 1e-9);
+  check('в гору танк держит заметно меньше', up < level - 2, kmh(level - up) + ' разницы');
+  check('под гору разгоняется выше обычного', Math.abs(down) > level + 1);
+
+  // Ровно то, чего не хватало: в горку танк упирается в потолок, а не просто
+  // дольше разгоняется. Проверяем именно установившуюся скорость, а не разгон.
+  check('в гору потолок хода упал, а не только разгон', up < 13 * 0.95);
+
+  /** Стоящий на склоне танк не должен уползать: накат работает тормозом. */
+  const parked = createTankState(0, -40, 0);
+  const slope = ramp(0.25);
+  for (let i = 0; i < 300; i++) {
+    stepTank(parked, { seq: 0, throttle: 0, steer: 0, turret: 0 }, 1 / 30, [], 1, MAP_HALF, slope);
+  }
+  check('без газа танк на склоне стоит, а не сползает', Math.abs(parked.z + 40) < 0.05,
+    `сместился на ${Math.abs(parked.z + 40).toFixed(3)} м за 10 с`);
+
+  // Задний ход: пятиться в гору так же тяжело, как ехать в неё передом. Нос при
+  // этом смотрит под гору, поэтому знак уклона у корпуса обратный.
+  const backUp = settle(ramp(-0.25), 0, -1);
+  const backDown = settle(ramp(0.25), 0, -1);
+  console.log(`  задним ходом: в гору ${kmh(backUp)}, под гору ${kmh(backDown)}`);
+  check('пятиться в гору тяжелее, чем под гору', Math.abs(backUp) < Math.abs(backDown) - 1);
+
+  // Обрыв круче мотора: множитель обязан упереться в пол, иначе потолок хода
+  // ушёл бы в минус и clamp развалился бы.
+  const cliff = settle(ramp(3), 0);
+  check('на обрыве ход остаётся положительным', cliff > 0, kmh(cliff));
+
+  // И главное: аркады это не касается вовсе.
+  const withFlat = createTankState(3, -7, 0.8);
+  const without = createTankState(3, -7, 0.8);
+  for (let i = 0; i < 200; i++) {
+    const input = { seq: i, throttle: 1, steer: 0.4, turret: 0.8 };
+    stepTank(withFlat, input, 1 / 30, [], 1, MAP_HALF, FLAT);
+    stepTank(without, input, 1 / 30, [], 1, MAP_HALF);
+  }
+  check(
+    'плоская земля и её отсутствие дают побитово одно и то же',
+    withFlat.x === without.x && withFlat.z === without.z && withFlat.speed === without.speed,
+  );
+}
+
 console.log(bad === 0 ? '\nРельеф сходится' : `\nПроблем: ${bad}`);
 process.exit(bad === 0 ? 0 : 1);
