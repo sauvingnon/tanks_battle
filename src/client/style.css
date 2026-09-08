@@ -262,15 +262,6 @@ body {
   background: rgba(255, 255, 255, 0.9);
 }
 
-/* Между стволом и меткой что-то есть: выстрел упрётся, не долетев. */
-#crosshair.is-blocked::before {
-  border-color: rgba(255, 122, 96, 0.9);
-}
-
-#crosshair.is-blocked::after {
-  background: rgba(255, 122, 96, 0.95);
-}
-
 #hitmarker {
   position: absolute;
   inset: -6px;

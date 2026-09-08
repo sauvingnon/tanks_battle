@@ -1,6 +1,5 @@
 import { DT, MAP_HALF } from '../shared/constants.js';
 import { angleDiff, clamp, lerpAngle, stepTank, wrapAngle } from '../shared/sim.js';
-import { FLAT, type Terrain } from '../shared/terrain.js';
 import type { Box, Input, TankState } from '../shared/types.js';
 
 /** Дальше этого расхождение не сглаживаем, а прыгаем: значит был фриз или телепорт. */
@@ -13,8 +12,6 @@ export interface RenderState {
   z: number;
   angle: number;
   turret: number;
-  /** Высота, м. На плоских картах всегда 0. */
-  y: number;
 }
 
 /**
@@ -34,13 +31,6 @@ export class SelfPrediction {
    * стену посреди большой карты, а сервер каждый тик отодвигал бы танк обратно.
    */
   half = MAP_HALF;
-  /**
-   * Земля карты. Тяжесть на склоне входит в шаг симуляции, поэтому предсказание
-   * обязано считать её по тому же полю, что и сервер: с плоскостью вместо
-   * рельефа свой танк на каждом подъёме уезжал бы вперёд серверного, и поправка
-   * тянула бы его назад весь склон.
-   */
-  terrain: Terrain = FLAT;
   /** Пока сервер не сказал обратного — живы. Мёртвый танк не управляется. */
   alive = true;
   /**
@@ -87,14 +77,8 @@ export class SelfPrediction {
     this.previous = { ...state };
   }
 
-  /**
-   * Один шаг предсказания. Возвращает инпут, который надо отправить серверу.
-   *
-   * pitch едет с инпутом, но в шаг не входит: вертикальная наводка не двигает
-   * танк, она нужна только в момент выстрела. Поэтому переигровка неподтверждённых
-   * инпутов её не касается, и предсказание от рельефа не зависит вовсе.
-   */
-  step(throttle: number, steer: number, turret: number, pitch = 0, fire = false): Input | null {
+  /** Один шаг предсказания. Возвращает инпут, который надо отправить серверу. */
+  step(throttle: number, steer: number, turret: number, fire = false): Input | null {
     if (!this.predicted) return null;
 
     // Подбитый танк не едет — точно так же, как его считает сервер, иначе
@@ -106,19 +90,14 @@ export class SelfPrediction {
       fire = false;
     }
 
-    const input: Input = { seq: ++this.seq, throttle, steer, turret, pitch, fire };
+    const input: Input = { seq: ++this.seq, throttle, steer, turret, fire };
     this.pending.push(input);
     this.previous = { ...this.predicted };
-    stepTank(this.predicted, input, DT, this.obstacles, this.boost, this.half, this.terrain);
+    stepTank(this.predicted, input, DT, this.obstacles, this.boost, this.half);
 
     // Страховка от бесконечного роста, если ack почему-то перестал приходить.
     if (this.pending.length > 180) this.pending.splice(0, this.pending.length - 180);
     return input;
-  }
-
-  /** Своя вертикальная скорость: её сервер не присылает, и берём мы её у себя. */
-  get verticalSpeed(): number {
-    return this.predicted?.vy ?? 0;
   }
 
   /** Поправка от сервера: ставим его состояние и переигрываем неподтверждённое. */
@@ -137,15 +116,10 @@ export class SelfPrediction {
     this.predicted.angle = server.angle;
     this.predicted.speed = server.speed;
     this.predicted.turret = server.turret;
-    this.predicted.y = server.y;
-    // vy сервер не присылает: на земле её каждый тик заново задаёт склон, и уже
-    // первый переигранный шаг делает её точной. В воздухе за время пути пакета
-    // она разойдётся от силы на метр в секунду — это сантиметры дуги, и на
-    // приземлении расхождение всё равно обнуляется.
 
     while (this.pending.length > 0 && this.pending[0].seq <= ack) this.pending.shift();
     for (const input of this.pending) {
-      stepTank(this.predicted, input, DT, this.obstacles, this.boost, this.half, this.terrain);
+      stepTank(this.predicted, input, DT, this.obstacles, this.boost, this.half);
     }
 
     const deltaX = this.predicted.x - before.x;
@@ -197,9 +171,6 @@ export class SelfPrediction {
       z: from.z + (this.predicted.z - from.z) * t + this.error.z,
       angle: wrapAngle(lerpAngle(from.angle, this.predicted.angle, t) + this.error.angle),
       turret: wrapAngle(lerpAngle(from.turret, this.predicted.turret, t) + this.error.turret),
-      // Своей поправки у высоты нет: она и так непрерывна, а сглаживать её
-      // отдельно значило бы отвязать танк от земли, по которой он едет.
-      y: from.y + (this.predicted.y - from.y) * t,
     };
   }
 }

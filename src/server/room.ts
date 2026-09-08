@@ -15,8 +15,6 @@
   BONUS_STEALTH,
   BONUS_DURATION_S,
   DT,
-  GUN_PITCH_MAX,
-  GUN_PITCH_MIN,
   MAX_BOUNCES,
   BOT_HP,
   MAX_HP,
@@ -48,7 +46,6 @@
   type Ruleset,
 } from '../shared/constants.js';
 import { buildScene, coverBoxes, isMapId, spawnPoint } from '../shared/map.js';
-import { heightAt, terrainNet, type Terrain } from '../shared/terrain.js';
 import type { RoomConfig, ServerMessage, WavePhase, WaveState } from '../shared/protocol.js';
 import {
   bounceShell,
@@ -150,18 +147,13 @@ export class Room {
   /** Геометрия текущей карты. Меняется целиком при смене карты. */
   obstacles: Box[] = this.scene.obstacles;
   /**
-   * Земля текущей карты. На семи аркадных картах это FLAT, и вся высотная
-   * арифметика уходит по короткому пути.
-   */
-  terrain: Terrain = this.scene.terrain;
-  /**
    * Половина стороны текущей карты, м. У больших карт она вчетверо больше
    * площадью, поэтому размер ходит вместе с геометрией, а не берётся из
    * константы: иначе стена стояла бы там, где её никто не рисовал.
    */
   half: number = this.scene.half;
   /** Блоки, по которым свип ведёт снаряд. Пересобирается со сменой карты. */
-  cover: Box[] = coverBoxes(this.obstacles, this.terrain);
+  cover: Box[] = coverBoxes(this.obstacles);
   readonly players = new Map<number, Player>();
 
   /** Индекс карты в MAPS. */
@@ -361,7 +353,6 @@ export class Room {
           this.obstacles,
           this.boost(player),
           this.half,
-          this.relief,
         );
         if (player.last.fire) {
           // Флаг срабатывает ровно один раз на инпут. Иначе last повторялся бы
@@ -441,11 +432,10 @@ export class Room {
         cover: this.cover,
         tanks: this.tanks,
         stance: this.stance,
-        terrain: this.relief,
         half: this.half,
       },
     );
-    stepTank(bot.state, bot.last, DT, this.obstacles, 1, this.half, this.relief);
+    stepTank(bot.state, bot.last, DT, this.obstacles, 1, this.half);
     if (bot.last.fire) {
       bot.last.fire = false;
       this.tryFire(bot);
@@ -457,15 +447,7 @@ export class Room {
     const rush = player.fx[BONUS_RELOAD] > this.tick ? BONUS_RELOAD_MUL : 1;
     player.readyAt = this.tick + Math.max(1, Math.round(RELOAD_TICKS * rush));
 
-    const shell = spawnShell(
-      this.nextShellId++,
-      player.id,
-      player.state,
-      this.aimPitch(player),
-      // Высота берётся у самого танка, а не выборкой поля: в прыжке ствол выше
-      // земли, и снаряд обязан вылететь оттуда, где башня действительно есть.
-      player.state.y,
-    );
+    const shell = spawnShell(this.nextShellId++, player.id, player.state);
     // Урон считаем здесь, а не при попадании: снаряд после выстрела живёт сам по себе.
     const power = player.fx[BONUS_DAMAGE] > this.tick ? BONUS_DAMAGE_MUL : 1;
     shell.dmg = Math.round(SHELL_DAMAGE * power);
@@ -474,26 +456,6 @@ export class Room {
     if (this.shells.length > MAX_SHELLS) this.shells.shift();
   }
 
-  /**
-   * Рельеф для свипов — или undefined, если карта плоская. Именно undefined, а не
-   * FLAT: без него свип двумерный и в точности такой, каким был до рельефа, и
-   * семь аркадных карт не платят за высоту ни одной выборкой.
-   */
-  private get relief(): Terrain | undefined {
-    return this.terrain.flat ? undefined : this.terrain;
-  }
-
-  /**
-   * Вертикальная наводка, с которой уйдёт снаряд. Приходит от клиента, поэтому
-   * зажимается пределами пушки здесь: на плоской карте — жёстко в ноль, чтобы
-   * аркада не зависела от того, что прислал клиент.
-   */
-  private aimPitch(player: Player): number {
-    if (this.terrain.flat) return 0;
-    const want = player.last.pitch;
-    if (typeof want !== 'number' || !Number.isFinite(want)) return 0;
-    return clamp(want, GUN_PITCH_MIN, GUN_PITCH_MAX);
-  }
 
   private updateShells(): void {
     for (let i = this.shells.length - 1; i >= 0; i--) {
@@ -522,9 +484,8 @@ export class Room {
    */
   private flyShell(shell: ShellState, dt: number): boolean {
     for (let segment = 0; segment < MAX_SEGMENTS; segment++) {
-      // Именно cover: на плоской карте низкое укрытие снаряд проходит насквозь.
-      // На рельефе там все блоки, а заодно и сама земля — свип решает по высоте.
-      const wall = sweepShell(shell, dt, this.cover, this.relief, this.half);
+      // Именно cover: низкое укрытие снаряд проходит насквозь.
+      const wall = sweepShell(shell, dt, this.cover, this.half);
 
       // Танк на отрезке важнее стены за ним, поэтому ищем его только до касания.
       const victim = this.firstVictim(shell, dt, wall ? wall.t : 1);
@@ -569,7 +530,7 @@ export class Room {
       // В себя можно попасть только рикошетом: иначе снаряд убивал бы стрелка на вылете.
       if (target.id === shell.owner && shell.bounces === 0) continue;
 
-      const t = sweepTank(shell, dt, target.state, this.relief);
+      const t = sweepTank(shell, dt, target.state);
       if (t === null || t > limit) continue;
       if (best === null || t < best.t) best = { player: target, t };
     }
@@ -581,18 +542,9 @@ export class Room {
     this.boom(shell, BOOM_HIT);
   }
 
-  /**
-   * Взрыв там, где снаряд остановился. Высоту шлём только с рельефом: на
-   * плоскости она всегда одна и та же, и клиент знает её без сети.
-   */
+  /** Взрыв там, где снаряд остановился. */
   private boom(shell: ShellState, kind: BoomKind): void {
-    this.booms.push({
-      x: shell.x,
-      z: shell.z,
-      k: kind,
-      o: shell.owner,
-      ...(this.terrain.flat ? {} : { y: round(shell.y) }),
-    });
+    this.booms.push({ x: shell.x, z: shell.z, k: kind, o: shell.owner });
   }
 
   /**
@@ -643,13 +595,8 @@ export class Room {
     return true;
   }
 
-  /**
-   * Танк на точке появления, поставленный на свою землю. Без этого он рождался
-   * бы на нулевой высоте и первым же тиком падал на рельеф — с четырёх метров
-   * там, где холм высокий, и сквозь землю там, где низина.
-   */
   private spawnState(spawn: { x: number; z: number; angle: number }): TankState {
-    return createTankState(spawn.x, spawn.z, spawn.angle, heightAt(this.terrain, spawn.x, spawn.z));
+    return createTankState(spawn.x, spawn.z, spawn.angle);
   }
 
   private respawn(player: Player): void {
@@ -800,19 +747,11 @@ export class Room {
       this.mapId = map;
       this.scene = buildScene(this.mapId);
       this.obstacles = this.scene.obstacles;
-      this.terrain = this.scene.terrain;
       this.half = this.scene.half;
-      this.cover = coverBoxes(this.obstacles, this.terrain);
+      this.cover = coverBoxes(this.obstacles);
       // Геометрию клиент не строит сам — шлём её раньше рестарта, чтобы к первому
-      // же снапшоту нового мира у него была правильная карта. Землю тем же
-      // сообщением и по той же причине.
-      this.emit({
-        t: 'map',
-        id: this.mapId,
-        half: this.half,
-        obstacles: this.obstacles,
-        terrain: terrainNet(this.terrain),
-      });
+      // же снапшоту нового мира у него была правильная карта.
+      this.emit({ t: 'map', id: this.mapId, half: this.half, obstacles: this.obstacles });
     }
 
     const newMode = mode !== undefined && mode !== this.mode;
@@ -1036,10 +975,6 @@ export class Room {
         s: round(p.state.speed),
         h: p.hp,
         d: p.dead ? 1 : 0,
-        // Высота — только на рельефе: на плоскости она всегда 0, и клиент знает
-        // это без сети. Чужие танки он не считает, поэтому без неё в прыжке они
-        // оставались бы вжатыми в грунт.
-        ...(this.terrain.flat ? {} : { y: round(p.state.y) }),
         // Поле есть только у тех, у кого эффект реально висит — экономия трафика.
         ...(mask === 0 ? {} : { f: mask }),
       });
@@ -1053,10 +988,7 @@ export class Room {
       o: s.owner,
       x: round(s.x),
       z: round(s.z),
-      y: round(s.y),
       a: round(Math.atan2(s.vx, s.vz)),
-      // Наклон нужен только мешу и только когда он не нулевой, то есть на рельефе.
-      ...(s.vy === 0 ? {} : { p: round(Math.atan2(s.vy, Math.hypot(s.vx, s.vz))) }),
       b: s.bounces,
     }));
   }

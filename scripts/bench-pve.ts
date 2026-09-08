@@ -69,10 +69,7 @@ function runGame(mapId: number, difficulty: number, stance: number): Result {
       cover: room.cover,
       tanks,
       stance,
-      // Герой воюет по тем же правилам, что и боты: на карте с рельефом он
-      // считает возвышение и упирается в те же гребни.
-      terrain: room.terrain.flat ? undefined : room.terrain,
-      // И в тех же стенах: с чужим размером карты герой на большой карте не видел
+      // В тех же стенах: с чужим размером карты герой на большой карте не видел
       // бы ни одного выстрела — свип гасил бы луч о стену, которой там нет.
       half: room.half,
     });

@@ -6,7 +6,6 @@ import { WebSocketServer, type WebSocket } from 'ws';
 
 import { DT, SNAPSHOT_EVERY, TICK_HZ, isMode, isRuleset } from '../shared/constants.js';
 import { decode, encode, type ClientMessage, type ServerMessage } from '../shared/protocol.js';
-import { terrainNet } from '../shared/terrain.js';
 import { Room, type Player } from './room.js';
 
 const PORT = Number(process.env.PORT ?? 8080);
@@ -123,7 +122,7 @@ wss.on('connection', (ws) => {
         id: player.id,
         you: room.info(player),
         tickHz: TICK_HZ,
-        map: { half: room.half, obstacles: room.obstacles, terrain: terrainNet(room.terrain) },
+        map: { half: room.half, obstacles: room.obstacles },
         players: room.allInfo(),
         ...room.config(),
         wave: room.waveState(),
@@ -156,8 +155,6 @@ wss.on('connection', (ws) => {
         throttle: msg.th,
         steer: msg.st,
         turret: msg.tu,
-        // Пределами пушки её зажмёт комната: здесь только отсекаем мусор.
-        pitch: isFiniteNumber(msg.pi) ? msg.pi : 0,
         fire: msg.f === 1,
       });
       return;
