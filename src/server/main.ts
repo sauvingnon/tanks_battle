@@ -146,6 +146,12 @@ wss.on('connection', (ws) => {
       return;
     }
 
+    if (msg.t === 'upgrade') {
+      if (!session.player || !Number.isInteger(msg.id)) return;
+      room.chooseUpgrade(msg.id);
+      return;
+    }
+
     if (msg.t === 'input') {
       const player = session.player;
       if (!player) return;

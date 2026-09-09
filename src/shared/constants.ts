@@ -83,9 +83,16 @@ export const SHELL_SPEED = 62;
 export const SHELL_RADIUS = 0.3;
 export const SHELL_LIFETIME = 3.5; // с
 /** Высота полёта. Все препятствия на карте выше — значит укрытия работают. */
-export const SHELL_HEIGHT = 2.15;
+export const SHELL_HEIGHT = 1.97;
 /** Вылет снаряда от центра танка, чуть дальше дульного среза. */
 export const MUZZLE_OFFSET = 4.2;
+
+/**
+ * Высота остова подбитого танка, когда он временно становится препятствием
+ * карты (см. Room.refreshWrecks). Выше SHELL_HEIGHT — труп держит выстрел,
+ * как броневой блок, а не как низкое укрытие навылет.
+ */
+export const WRECK_HEIGHT = 2.5;
 
 // --- Рикошет ---
 
@@ -145,10 +152,48 @@ export const MAX_SHELLS = 120;
 export const MODE_DM = 'dm';
 /** Все против ботов: волны, одна жизнь на волну. */
 export const MODE_PVE = 'pve';
-export type GameMode = typeof MODE_DM | typeof MODE_PVE;
+/** Забег на 10 волн с развитием танка между волнами. */
+export const MODE_EXPEDITION = 'expedition';
+export type GameMode = typeof MODE_DM | typeof MODE_PVE | typeof MODE_EXPEDITION;
 
 export function isMode(v: unknown): v is GameMode {
-  return v === MODE_DM || v === MODE_PVE;
+  return v === MODE_DM || v === MODE_PVE || v === MODE_EXPEDITION;
+}
+
+export const EXPEDITION_WAVES = 10;
+export const EXPEDITION_UPGRADE_COUNT = 3;
+
+/** Сила базового танка в экспедиции: сначала слабее, к финалу сильнее. */
+export function expeditionPower(wave: number): number {
+  if (wave <= 1) return 0.84;
+  if (wave === 2) return 0.9;
+  if (wave === 3) return 0.96;
+  if (wave <= 5) return 1;
+  return Math.min(1.28, 1 + (wave - 5) * 0.07);
+}
+
+export interface ExpeditionUpgrade {
+  id: number;
+  name: string;
+  description: string;
+  speed: number;
+  damage: number;
+  reload: number;
+}
+
+/** Небольшой фиксированный пул — его легко расширить новыми картами. */
+export const EXPEDITION_UPGRADES: ExpeditionUpgrade[] = [
+  // Бонусы намеренно ощущаются сразу: одна карта должна быть заметнее
+  // косметического прироста, но суммарная сила всё ещё растёт постепенно.
+  { id: 0, name: 'Усиленная ходовая', description: '+12% скорость и ускорение', speed: 1.12, damage: 1, reload: 1 },
+  { id: 1, name: 'Стабилизатор', description: '+18% урон снаряда', speed: 1, damage: 1.18, reload: 1 },
+  { id: 2, name: 'Быстрый досылатель', description: '-16% перезарядка', speed: 1, damage: 1, reload: 0.84 },
+  { id: 3, name: 'Форсаж', description: '+10% скорость и ускорение', speed: 1.1, damage: 1, reload: 1 },
+  { id: 4, name: 'Тяжёлый боеприпас', description: '+14% урон снаряда', speed: 1, damage: 1.14, reload: 1 },
+];
+
+export function isCoopMode(mode: GameMode): boolean {
+  return mode === MODE_PVE || mode === MODE_EXPEDITION;
 }
 
 // --- Правила боя ---
@@ -180,7 +225,7 @@ export function isRuleset(v: unknown): v is Ruleset {
  * реалистичных правилах загорается только в режиме против ботов.
  */
 export function alliedTeams(mode: GameMode, a: number, b: number): boolean {
-  return mode === MODE_PVE && a === b;
+  return isCoopMode(mode) && a === b;
 }
 
 /** Четыре уровня сложности; индекс — он же стартовый тир ботов. */
@@ -217,11 +262,24 @@ export function waveQuota(wave: number): number {
 /**
  * Сколько ботов приходится на одного живого человека — по уровню сложности.
  * Численный перевес человек отыграть не может в принципе: перезарядка у всех
- * одна, и трое стреляют в тебя ровно втрое чаще, чем ты в них. Поэтому толпа —
- * это и есть сложность, а не декорация к ней: на «Новичке» дерёшься с двумя,
- * на «Асе» — с тремя, и разница чувствуется сразу.
+ * одна, и двое-трое стреляют в тебя ровно во столько же раз чаще, чем ты в них.
+ * Поэтому толпа — это и есть сложность, а не декорация к ней.
+ *
+ * Пробное снижение (было [2, 2, 3, 3]): жалоба была на то, что уже на «Среднем»
+ * вязнешь, а на «Ветеране»/«Асе» толпа гасит почти всегда — причём и в одиночку
+ * тоже, не только вдвоём-втроём. Первая правка ([1.5, 1.5, 2, 2.5]) одиночку
+ * почти не облегчила: потолок в `waveConcurrent` — это `alive < room`, а он на
+ * практике равен `ceil(room)`, то есть 1.5 и 2 дают один и тот же максимум
+ * одновременных ботов (2). Реальный шаг вниз для соло — только через целое
+ * значение или через переход на следующий целый порог. Числа ниже подобраны по
+ * `ceil(humans · perHuman)`, не по самому множителю.
+ *
+ * Тут же лежит отдельный баг — множитель берётся от числа подключённых людей, а
+ * не живых, поэтому смерть одного из друзей посреди волны потолок ботов не
+ * снижает: оставшиеся отвечают за того же вчетверо-впятеро, что и был весь
+ * отряд. Это ещё не тронуто, только сами числа.
  */
-export const BOTS_PER_HUMAN = [2, 2, 3, 3];
+export const BOTS_PER_HUMAN = [1, 1, 1.5, 2];
 
 /** Сколько ботов волны N живут на карте одновременно: квота выпускается порциями. */
 export function waveConcurrent(wave: number, humans: number, difficulty = 0): number {

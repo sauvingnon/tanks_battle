@@ -58,11 +58,13 @@ export const BOOM_GROUND = 0; // снаряд разбился о препятс
 export const BOOM_HIT = 1; // попадание в танк
 export const BOOM_KILL = 2; // танк уничтожен
 export const BOOM_RICOCHET = 3; // снаряд чиркнул по стене и полетел дальше
+export const BOOM_NEAR = 4; // снаряд прошёл рядом с танком, не задев — подавление
 export type BoomKind =
   | typeof BOOM_GROUND
   | typeof BOOM_HIT
   | typeof BOOM_KILL
-  | typeof BOOM_RICOCHET;
+  | typeof BOOM_RICOCHET
+  | typeof BOOM_NEAR;
 
 /** Событие взрыва за тик (короткие ключи — трафик). */
 export interface Boom {
@@ -99,6 +101,8 @@ export interface SnapshotEntry {
   d: 0 | 1; // уничтожен
   /** Маска активных бонусов; шлём, только когда она не пуста. */
   f?: number;
+  /** Монотонный счётчик подтверждённых выстрелов; нужен владельцу для отдачи. */
+  q?: number;
 }
 
 /** Ящик с бонусом на карте. */

@@ -82,6 +82,10 @@ export class Net {
     });
   }
 
+  sendUpgrade(id: number): void {
+    this.send({ t: 'upgrade', id });
+  }
+
   private send(msg: ClientMessage): void {
     if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(encode(msg));
   }

@@ -28,7 +28,7 @@ import {
   sweepShell,
   sweepTank,
 } from '../shared/sim.js';
-import { spawnCount, spawnPoint } from '../shared/map.js';
+import { bushBlockers, spawnCount, spawnPoint } from '../shared/map.js';
 import { createTankState, type Box, type Input, type ShellState, type TankState } from '../shared/types.js';
 
 /** Что тир меняет в поведении. Характеристики самого танка одинаковы у всех. */
@@ -85,15 +85,31 @@ export interface BotTier {
    * право на ближний бой и есть главная разница между уровнями.
    */
   pressers: number;
+  /**
+   * Дальность, на которой бот вообще способен заметить цель в конусе обзора
+   * корпуса (см. SIGHT_FOV), м, — и, отдельно, вплотную видит и за его
+   * пределами (см. NEAR_SIGHT_FRAC, общий для всех тиров): гусеницы и мотор
+   * слышно спиной не хуже, чем видно глазами. Плюс то и другое ещё должно
+   * быть не закрыто препятствием (hasShot). Дальше конуса и не вплотную, или
+   * за стеной — цели для бота просто не существует.
+   */
+  sight: number;
+  /**
+   * Сколько секунд бот ещё едет и целится туда, где видел цель в последний
+   * раз, после того как она пропала (вышла за sight, скрылась за укрытием или
+   * ушла под «Маскировку»). Кончилось — цель забыта совсем, дальше обычный
+   * патруль.
+   */
+  memory: number;
 }
 
 // Ошибка прицела в радианах разворачивается в метры промаха на дистанции:
 // на 30 м 0.14 рад — это 4 м мимо при радиусе танка 2.4, то есть чаще мимо, чем в цель.
 export const BOT_TIERS: BotTier[] = [
-  { reaction: 1.3, aimError: 0.26, lead: 0, fireGate: 1.7, cover: false, ricochet: false, range: 52, keep: 46, hesitate: 2.6, pressers: 1 },
-  { reaction: 0.6, aimError: 0.17, lead: 0, fireGate: 1.25, cover: true, ricochet: false, range: 42, keep: 36, hesitate: 1.4, pressers: 1 },
-  { reaction: 0.25, aimError: 0.085, lead: 0.6, fireGate: 0.95, cover: true, ricochet: true, range: 40, keep: 30, hesitate: 0.6, pressers: 2 },
-  { reaction: 0.11, aimError: 0.018, lead: 1, fireGate: 0.7, cover: true, ricochet: true, range: 44, keep: 26, hesitate: 0, pressers: 3 },
+  { reaction: 1.3, aimError: 0.26, lead: 0, fireGate: 1.7, cover: false, ricochet: false, range: 52, keep: 46, hesitate: 2.6, pressers: 1, sight: 58, memory: 2.5 },
+  { reaction: 0.6, aimError: 0.17, lead: 0, fireGate: 1.25, cover: true, ricochet: false, range: 42, keep: 36, hesitate: 1.4, pressers: 1, sight: 72, memory: 3.5 },
+  { reaction: 0.25, aimError: 0.085, lead: 0.6, fireGate: 0.95, cover: true, ricochet: true, range: 40, keep: 30, hesitate: 0.6, pressers: 2, sight: 86, memory: 5 },
+  { reaction: 0.11, aimError: 0.018, lead: 1, fireGate: 0.7, cover: true, ricochet: true, range: 44, keep: 26, hesitate: 0, pressers: 3, sight: 100, memory: 6.5 },
 ];
 
 /**
@@ -164,6 +180,24 @@ export interface BotBrain {
   unstickUntil: number;
   /** Руль на время выезда: назад по своей же колее смысла нет. */
   unstickSteer: number;
+  /** Тик, на котором цель в последний раз реально видели (в sight и без укрытия). */
+  lastSeenAt: number;
+  /** Последняя увиденная точка цели: пока видно — обновляется каждый тик, забыл — стоит на месте. */
+  lastX: number;
+  lastZ: number;
+  /** До какого тика бот ещё едет к lastX/lastZ, забыв цель, прежде чем вернуться к обычному патрулю. */
+  searchUntil: number;
+  /** Текущая точка патруля — куда идёт, пока цели нет вовсе. */
+  patrolX: number;
+  patrolZ: number;
+  /** Тик, на котором пора выбрать новую точку патруля. */
+  patrolAt: number;
+  /**
+   * Видел ли цель прямо сейчас (итог think() за последний тик). Читает только
+   * room.ts при попадании: если бот уже реально дерётся, случайный обстрел
+   * издали от третьего не должен сдёргивать его на розыски того, кто попал.
+   */
+  engaged: boolean;
 }
 
 export function createBrain(tier: number, tick: number, index: number): BotBrain {
@@ -185,6 +219,14 @@ export function createBrain(tier: number, tick: number, index: number): BotBrain
     stuckFor: 0,
     unstickUntil: 0,
     unstickSteer: 1,
+    lastSeenAt: tick,
+    lastX: 0,
+    lastZ: 0,
+    searchUntil: tick,
+    patrolX: 0,
+    patrolZ: 0,
+    patrolAt: tick,
+    engaged: false,
   };
 }
 
@@ -201,6 +243,8 @@ export interface BotTarget {
 export interface BotSelf extends BotTarget {
   hp: number;
   brain: BotBrain;
+  /** Недавно рядом разорвался снаряд (или сам зацепило) — рука дрожит сильнее. */
+  suppressed: boolean;
 }
 
 export interface BotWorld {
@@ -209,7 +253,15 @@ export interface BotWorld {
   obstacles: Box[];
   /** Только то, что держит снаряд. Низкое укрытие бот простреливает насквозь. */
   cover: Box[];
+  /**
+   * Кусты карты — рвут луч обзора бота (см. hasShot), снаряд не держат. Только
+   * для ИИ: на то, что видит на экране человек, кусты не влияют. Не заданы —
+   * кустов нет.
+   */
+  bushes?: Box[];
   tanks: Iterable<BotTarget>;
+  /** Летящие снаряды — для уклонения (см. dodge()). Не заданы — уклонения нет. */
+  shells?: Iterable<ShellState>;
   /** Манера боя комнаты; не задана — нейтральная. */
   stance?: number;
   /**
@@ -222,6 +274,28 @@ export interface BotWorld {
 
 /** Раз в столько тиков бот пересматривает цель — полсекунды. */
 const RETHINK_TICKS = Math.round(TICK_HZ / 2);
+/** Сколько бот едет к точке, где забытую цель видели в последний раз, прежде чем сдаться, с. */
+const SEARCH_S = 4;
+/** Раз в столько бот выбирает новую точку патруля, с. */
+const PATROL_S = 9;
+/** Горизонт предсказания для уклонения от снаряда, с — см. dodge(). */
+const DODGE_HORIZON_S = 0.55;
+/**
+ * Полуугол обзора от направления корпуса, рад. Не половина «спереди»: боевой
+ * heading() на рабочей дистанции ведёт бота чистым боком к цели (орбита), то
+ * есть корпус смотрит перпендикулярно ей же — при полуугле меньше 90° бот в
+ * своей обычной стойке терял бы цель из виду сам у себя за кормой. 110°
+ * оставляет реальный слепой сектор строго сзади (140°), не ломая при этом
+ * штатное кружение боком. Башню не считаю: это про то, куда обращена машина
+ * целиком (экипаж, приборы), а не куда сейчас довёрнут ствол.
+ */
+const SIGHT_FOV = (110 * Math.PI) / 180;
+/**
+ * Доля tier.sight, в которой цель видно вообще без учёта конуса — вплотную
+ * видно и боком, и спиной. За этой дальностью и до самого tier.sight решает
+ * уже только курс корпуса (см. SIGHT_FOV).
+ */
+const NEAR_SIGHT_FRAC = 0.35;
 /** Длина щупов объезда, м. */
 const FEELER = 13;
 
@@ -233,6 +307,9 @@ const PRESS_MIN = 10;
 const SPREAD = 18;
 /** Дальше этого бот не стреляет: снаряд живёт 3.5 с и по дороге его собьёт стена. */
 const MAX_ENGAGE = 95;
+
+/** Во сколько раз шире увод ствола, пока бот подавлен (см. BotSelf.suppressed). */
+const SUPPRESS_AIM_MULT = 2.2;
 
 /** Ниже этой скорости считаем, что танк никуда не едет, м/с. */
 const STUCK_SPEED = 1.5;
@@ -258,24 +335,58 @@ export function think(self: BotSelf, world: BotWorld): Input {
   const target = findTank(world, brain.targetId);
   if (!target || target.dead) {
     brain.targetId = 0;
+    brain.engaged = false;
+    // Цель мертва или уже вышла — искать её незачем, но если до этого бот уже
+    // ехал доразведать другую потерянную цель, доедет: searchUntil про это,
+    // а не про то, что случилось с target прямо сейчас.
+    if (world.tick < brain.searchUntil) return search(self, world, brain.lastX, brain.lastZ);
     return patrol(self, world);
   }
 
-  const dx = target.state.x - me.x;
-  const dz = target.state.z - me.z;
-  const dist = Math.hypot(dx, dz) || 1e-6;
+  // Реальная дистанция до цели — только для того, чтобы решить, видно ли её
+  // вообще (см. tier.sight). Дальше бот работает не с ней, а с тем, что «знает».
+  const realDist = Math.hypot(target.state.x - me.x, target.state.z - me.z) || 1e-6;
+  // Чистая линия огня, без предела дальности: ею тактика объезда решает, есть
+  // ли смысл довернуть в обход препятствия. Дальность восприятия сюда не
+  // подмешана нарочно — иначе на длинных коридорах бот жал бы вперёд просто
+  // потому, что цель дальше tier.sight, хотя видно её прекрасно, и толпа
+  // забивала бы единственные ворота на карте.
+  const shot = hasShot(me, target.state, world.cover, world.bushes, world.half);
+  // Загородил именно куст, а не стена: за стеной цель прячется по праву и её
+  // логично обходить искать угол, а спрятавшегося в листве нужно не обходить,
+  // а решительно подъехать вплотную — вблизи куст переставит слепить (см.
+  // bushBlockers), и охота вообще имеет смысл только так.
+  const bushOnly = !shot && hasShot(me, target.state, world.cover, undefined, world.half);
+  const visible =
+    inSight(me, tier, target.state.x, target.state.z, realDist) &&
+    shot &&
+    !(target.stealth && realDist > BONUS_STEALTH_RANGE);
+  brain.engaged = visible;
 
-  // Цель ушла под «Маскировку» — бот теряет её из виду до следующего пересмотра.
-  if (target.stealth && dist > BONUS_STEALTH_RANGE) {
+  if (visible) {
+    brain.lastSeenAt = world.tick;
+    brain.lastX = target.state.x;
+    brain.lastZ = target.state.z;
+  } else if (world.tick - brain.lastSeenAt > Math.round(tier.memory * TICK_HZ)) {
+    // Не видно дольше tier.memory — забыл. Едет туда, где видел в последний
+    // раз, вместо того чтобы сразу вернуться к пустому патрулю.
     brain.targetId = 0;
-    return patrol(self, world);
+    brain.searchUntil = world.tick + Math.round(SEARCH_S * TICK_HZ);
+    return search(self, world, brain.lastX, brain.lastZ);
   }
+
+  // Точка, на которую бот реально ориентируется: живая, если видит цель,
+  // иначе — та, где видел её в последний раз.
+  const trackX = visible ? target.state.x : brain.lastX;
+  const trackZ = visible ? target.state.z : brain.lastZ;
+  const dist = Math.hypot(trackX - me.x, trackZ - me.z) || 1e-6;
 
   // --- Прицел ---
-  // Место цели бот освежает раз в tier.reaction, а между обновлениями держит
-  // ствол на устаревшей точке. Из этого сама собой выходит вся разница уровней
-  // по едущей цели: наводится он идеально, но не туда.
-  if (brain.aimFor !== target.id || world.tick >= brain.aimAt) {
+  // Место цели бот освежает раз в tier.reaction и только пока видит её —
+  // остальное время держит ствол там, где видел в последний раз. Из этого
+  // сама собой выходит вся разница уровней по едущей цели: наводится он
+  // идеально, но не туда.
+  if (visible && (brain.aimFor !== target.id || world.tick >= brain.aimAt)) {
     brain.aimFor = target.id;
     brain.aimAt = world.tick + Math.max(1, Math.round(tier.reaction * TICK_HZ));
     // Упреждение считается в момент взгляда: оно поправляет ту картинку, которую
@@ -288,8 +399,7 @@ export function think(self: BotSelf, world: BotWorld): Input {
   const aim = brain.bank ?? Math.atan2(brain.aimX - me.x, brain.aimZ - me.z);
   const turret = aim + brain.aimBias;
 
-  const shot = hasShot(me, target.state, world.cover, world.half);
-  const clear = shot || brain.bank !== null;
+  const clear = visible || brain.bank !== null;
   // Порог наводки — угловой размер танка на этой дистанции, растянутый терпением тира.
   const gate = Math.atan2(TANK_RADIUS, Math.max(dist, TANK_RADIUS)) * tier.fireGate;
   const aimed = Math.abs(angleDiff(me.turret, turret)) < gate;
@@ -302,68 +412,83 @@ export function think(self: BotSelf, world: BotWorld): Input {
   // --- Ход ---
   // На низком HP разрывает дистанцию: подставляться под добивание невыгодно.
   const retreat = tier.cover && self.hp <= BOT_HP * 0.35;
-  const want = heading(self, target.state, dist, tier, world, retreat, shot);
+  const want =
+    dodge(self, world) ??
+    heading(self, createTankState(trackX, trackZ), dist, tier, world, retreat, shot, bushOnly);
   const drive = unstick(brain, me, world.tick, steerTo(me, want, world.obstacles, world.half));
 
   return { seq: 0, throttle: drive.throttle, steer: drive.steer, turret, fire };
 }
 
-/** Выбор цели: ближайший видимый противник, иначе просто ближайший. */
+/**
+ * Выбор цели среди тех, кого видно прямо сейчас: в радиусе обзора тира и без
+ * препятствий на линии огня. Потерянную из виду цель этот перебор не трогает —
+ * когда её забыть, решает think() по tier.memory, а не рестарт раз в полсекунды.
+ */
 function retarget(self: BotSelf, world: BotWorld, tier: BotTier): void {
   const brain = self.brain;
   const me = self.state;
 
-  let best: BotTarget | null = null;
-  let bestScore = Infinity;
+  let spotted: BotTarget | null = null;
+  let spottedDist = Infinity;
 
   for (const tank of world.tanks) {
     if (tank.dead || tank.team === self.team || tank.id === self.id) continue;
     const d = Math.hypot(tank.state.x - me.x, tank.state.z - me.z);
     // Замаскированного издали бот не видит вовсе; вплотную — уже да.
     if (tank.stealth && d > BONUS_STEALTH_RANGE) continue;
-    // Видимую цель предпочитаем даже если она вдвое дальше укрытой.
-    const score = hasShot(me, tank.state, world.cover, world.half) ? d : d * 2.5 + 40;
-    if (score < bestScore) {
-      bestScore = score;
-      best = tank;
+    // Дальше sight, вне зоны восприятия (см. inSight) или за укрытием/кустом —
+    // кандидат на смену цели не участвует: это ровно тот же тест, что think()
+    // гоняет каждый тик.
+    if (
+      !inSight(me, tier, tank.state.x, tank.state.z, d) ||
+      !hasShot(me, tank.state, world.cover, world.bushes, world.half)
+    )
+      continue;
+    if (d < spottedDist) {
+      spottedDist = d;
+      spotted = tank;
     }
   }
 
-  if (!best) {
-    brain.targetId = 0;
+  if (spotted) {
+    // Смена цели стоит боту реакции: мгновенно переносить огонь умеет только Ас.
+    if (spotted.id !== brain.targetId) {
+      brain.targetId = spotted.id;
+      // Только откладываем выстрел, но никогда не приближаем: иначе смена цели
+      // обнуляла бы паузу hesitate и новичок стрелял бы чаще ветерана.
+      brain.readyAt = Math.max(brain.readyAt, world.tick + Math.round(tier.reaction * TICK_HZ));
+    }
+    // Подавлен — рука дрожит заметно сильнее, пока не отпустило.
+    const wobble = self.suppressed ? tier.aimError * SUPPRESS_AIM_MULT : tier.aimError;
+    brain.aimBias = (Math.random() * 2 - 1) * wobble;
+
+    // Слот наседающего раздаётся без всякого сговора: если между мной и целью
+    // уже столько соседей, сколько тир разрешает пустить в ближний бой, — я
+    // держу дистанцию. Правило чисто локальное, а строй из него получается общий.
+    let closer = 0;
+    for (const tank of world.tanks) {
+      if (tank.id === self.id || tank.dead || tank.team !== self.team) continue;
+      if (Math.hypot(spotted.state.x - tank.state.x, spotted.state.z - tank.state.z) < spottedDist)
+        closer++;
+    }
+    brain.press = closer < Math.max(0, tier.pressers + stanceOf(world.stance).pressers);
+    // Видимость есть по определению spotted — обходной рикошет не нужен.
     brain.bank = null;
-    return;
+  } else if (tier.ricochet && brain.targetId !== 0) {
+    // Никого не видно, но старая цель ещё в памяти — пробуем закинуть снаряд
+    // рикошетом туда, где её видели в последний раз.
+    brain.bank = findBankShot(me, createTankState(brain.lastX, brain.lastZ), world.cover, world.half);
+  } else {
+    brain.bank = null;
   }
-
-  // Смена цели стоит боту реакции: мгновенно переносить огонь умеет только Ас.
-  if (best.id !== brain.targetId) {
-    brain.targetId = best.id;
-    // Только откладываем выстрел, но никогда не приближаем: иначе смена цели
-    // обнуляла бы паузу hesitate и новичок стрелял бы чаще ветерана.
-    brain.readyAt = Math.max(brain.readyAt, world.tick + Math.round(tier.reaction * TICK_HZ));
-  }
-  brain.aimBias = (Math.random() * 2 - 1) * tier.aimError;
-
-  // Слот наседающего раздаётся без всякого сговора: если между мной и целью уже
-  // столько соседей, сколько тир разрешает пустить в ближний бой, — я держу
-  // дистанцию. Правило чисто локальное, а строй из него получается общий.
-  const myGap = Math.hypot(best.state.x - me.x, best.state.z - me.z);
-  let closer = 0;
-  for (const tank of world.tanks) {
-    if (tank.id === self.id || tank.dead || tank.team !== self.team) continue;
-    if (Math.hypot(best.state.x - tank.state.x, best.state.z - tank.state.z) < myGap) closer++;
-  }
-  brain.press = closer < Math.max(0, tier.pressers + stanceOf(world.stance).pressers);
-
-  // Рикошет ищем только когда прямого выстрела нет — иначе он и не нужен.
-  brain.bank =
-    tier.ricochet && !hasShot(me, best.state, world.cover, world.half)
-      ? findBankShot(me, best.state, world.cover, world.half)
-      : null;
 
   if (world.tick > brain.orbitUntil) {
     brain.orbit = Math.random() < 0.5 ? 1 : -1;
-    brain.orbitUntil = world.tick + TICK_HZ * (2 + Math.random() * 3);
+    // В бою виляет чаще — так труднее подгадать упреждение под едущую цель;
+    // вне боя резкие рывки ни к чему, патруль должен выглядеть спокойным.
+    const span = spotted ? 1.2 + Math.random() * 1.3 : 3 + Math.random() * 3;
+    brain.orbitUntil = world.tick + TICK_HZ * span;
   }
 }
 
@@ -371,6 +496,42 @@ function findTank(world: BotWorld, id: number): BotTarget | null {
   if (id === 0) return null;
   for (const tank of world.tanks) if (tank.id === id) return tank;
   return null;
+}
+
+/**
+ * Настоящее уклонение: не «чаще меняет сторону обхода», а реакция на конкретный
+ * снаряд. Перебирает world.shells тем же sweepTank, каким комната считает
+ * попадание, — если снаряд чужой команды придёт в бота в ближайшие
+ * DODGE_HORIZON_S секунд, возвращает угол резко в сторону от линии его полёта
+ * (не пересекая её — усиливая тот боковой отступ, на котором бот и так уже
+ * стоит от этой линии, чтобы уклонение никогда не заводило под снаряд).
+ * Снарядов нет совсем (world.shells не задан) или угрозы нет — null, вызывающая
+ * сторона сама решает, что делать вместо этого.
+ */
+function dodge(self: BotSelf, world: BotWorld): number | null {
+  if (!world.shells) return null;
+  const me = self.state;
+
+  let threat: ShellState | null = null;
+  let soonest = Infinity;
+  for (const shell of world.shells) {
+    if (shell.owner === self.id) continue;
+    const owner = findTank(world, shell.owner);
+    if (owner && owner.team === self.team) continue;
+    const t = sweepTank(shell, DODGE_HORIZON_S, me);
+    if (t === null || t > soonest) continue;
+    soonest = t;
+    threat = shell;
+  }
+  if (!threat) return null;
+
+  const speed = Math.hypot(threat.vx, threat.vz) || 1e-6;
+  // Перпендикуляр к линии полёта снаряда.
+  const px = -threat.vz / speed;
+  const pz = threat.vx / speed;
+  // На какой стороне от линии снаряда я сейчас — усиливаю именно этот отступ.
+  const side = Math.sign((me.x - threat.x) * px + (me.z - threat.z) * pz) || 1;
+  return Math.atan2(px * side, pz * side);
 }
 
 /**
@@ -387,6 +548,7 @@ function heading(
   world: BotWorld,
   retreat: boolean,
   shot: boolean,
+  bushOnly: boolean,
 ): number {
   const me = self.state;
 
@@ -406,38 +568,90 @@ function heading(
   else if (dist < range * 0.8) radial = -0.6;
   else radial = 0;
 
-  // Цель за укрытием: ищем угол, но не ближе своего предела сближения.
-  if (!shot && radial <= 0 && dist > floor) radial = 0.35;
+  // Прямого выстрела нет (загорожено): ищем угол, но не ближе предела сближения.
+  // Загородил куст, а не стена — это не про обход, а про то, что до цели надо
+  // доехать: жмём решительно, а не просто подруливаем.
+  if (!shot && radial <= 0 && dist > floor) radial = bushOnly ? 0.7 : 0.35;
 
   // На рабочей дистанции идёт чистым боком, на подходе — заметно сносит вбок.
   const tangent = (radial === 0 ? 1 : 0.45) * self.brain.orbit;
 
-  let vx = tx * radial - tz * tangent;
-  let vz = tz * radial + tx * tangent;
+  const { vx, vz } = spread(self, world, tx * radial - tz * tangent, tz * radial + tx * tangent);
+  return avoid(me, Math.atan2(vx, vz), world.obstacles, world.half);
+}
 
+/**
+ * Расталкивание с соседями по команде: чем ближе сосед, тем сильнее толчок в
+ * сторону. Нужно не только в бою (heading), но и вне его (patrol/search) —
+ * без этого толпа, идущая не по цели, а просто к одной точке (центр карты или
+ * место поиска), сбивается в один узкий проход и там стоит.
+ */
+function spread(
+  self: BotSelf,
+  world: BotWorld,
+  vx: number,
+  vz: number,
+): { vx: number; vz: number } {
+  const me = self.state;
   for (const other of world.tanks) {
     if (other.id === self.id || other.dead || other.team !== self.team) continue;
     const dx = me.x - other.state.x;
     const dz = me.z - other.state.z;
     const gap = Math.hypot(dx, dz);
     if (gap > SPREAD || gap < 1e-3) continue;
-    // Чем ближе сосед, тем сильнее толчок в сторону.
     const push = (1 - gap / SPREAD) * 1.4;
     vx += (dx / gap) * push;
     vz += (dz / gap) * push;
   }
-
-  return avoid(me, Math.atan2(vx, vz), world.obstacles, world.half);
+  return { vx, vz };
 }
 
-/** Если цели нет — едем к центру карты, объезжая блоки. */
+/**
+ * Пока цели нет вовсе — бродит по случайным точкам карты, а не едет вечно в
+ * одну и ту же (например, в центр). Фиксированная точка притяжения на
+ * симметричной карте с симметричным спавном может свести двух патрулирующих
+ * в замкнутую орбиту друг напротив друга, где они никогда не встретятся
+ * взглядом — так и было, пока патруль целился строго в центр.
+ */
 function patrol(self: BotSelf, world: BotWorld): Input {
+  const brain = self.brain;
   const me = self.state;
-  const want = avoid(me, Math.atan2(-me.x, -me.z), world.obstacles, world.half);
+
+  if (world.tick >= brain.patrolAt || Math.hypot(brain.patrolX - me.x, brain.patrolZ - me.z) < 8) {
+    const half = world.half ?? 70;
+    brain.patrolX = (Math.random() * 2 - 1) * half * 0.8;
+    brain.patrolZ = (Math.random() * 2 - 1) * half * 0.8;
+    brain.patrolAt = world.tick + Math.round(PATROL_S * TICK_HZ);
+  }
+
+  const base = dodge(self, world) ?? Math.atan2(brain.patrolX - me.x, brain.patrolZ - me.z);
+  const { vx, vz } = spread(self, world, Math.sin(base), Math.cos(base));
+  const want = avoid(me, Math.atan2(vx, vz), world.obstacles, world.half);
   const drive = steerTo(me, want, world.obstacles, world.half);
   // Газ убавлен, но выезд из упора идёт на полном: иначе бот так и останется в блоке.
   const move = unstick(self.brain, me, world.tick, {
     throttle: drive.throttle * 0.6,
+    steer: drive.steer,
+  });
+  return { seq: 0, throttle: move.throttle, steer: move.steer, turret: me.turret };
+}
+
+/**
+ * Цель забыта, но точка, где её видели, ещё свежа: едем туда — это и есть
+ * «искал». Доехали и никого не нашли — дальше стоять незачем, отдаём ход
+ * обычному патрулю; searchUntil в think() всё равно оборвёт поиск по таймеру,
+ * даже если бот застрял и до точки так и не добрался.
+ */
+function search(self: BotSelf, world: BotWorld, x: number, z: number): Input {
+  const me = self.state;
+  if (Math.hypot(x - me.x, z - me.z) < 6) return patrol(self, world);
+
+  const base = dodge(self, world) ?? Math.atan2(x - me.x, z - me.z);
+  const { vx, vz } = spread(self, world, Math.sin(base), Math.cos(base));
+  const want = avoid(me, Math.atan2(vx, vz), world.obstacles, world.half);
+  const drive = steerTo(me, want, world.obstacles, world.half);
+  const move = unstick(self.brain, me, world.tick, {
+    throttle: drive.throttle * 0.75,
     steer: drive.steer,
   });
   return { seq: 0, throttle: move.throttle, steer: move.steer, turret: me.turret };
@@ -498,18 +712,85 @@ function free(
   return worst;
 }
 
-/** Свободна ли линия огня до цели. Считается по укрытиям, а не по всем блокам. */
-function hasShot(me: TankState, target: TankState, cover: Box[], half?: number): boolean {
+/** В конусе обзора корпуса ли точка (x, z) — см. SIGHT_FOV. */
+function facing(me: TankState, x: number, z: number): boolean {
+  if (Math.abs(x - me.x) < 1e-3 && Math.abs(z - me.z) < 1e-3) return true;
+  const bearing = Math.atan2(x - me.x, z - me.z);
+  return Math.abs(angleDiff(me.angle, bearing)) <= SIGHT_FOV;
+}
+
+/**
+ * В зоне восприятия ли точка на расстоянии dist от корпуса: либо вплотную
+ * (см. NEAR_SIGHT_FRAC — тогда курс корпуса не важен), либо дальше, но в
+ * конусе обзора и не за пределами tier.sight.
+ */
+function inSight(me: TankState, tier: BotTier, x: number, z: number, dist: number): boolean {
+  if (dist > tier.sight) return false;
+  return dist <= tier.sight * NEAR_SIGHT_FRAC || facing(me, x, z);
+}
+
+/**
+ * Свободен ли путь от (me.x, me.z) до точки (x, z), не ближе чем pullback к
+ * самой точке — иначе цель у самого конца луча считалась бы сама себе стеной.
+ * bushes — уже отфильтрованный для позиции me список (см. bushBlockers):
+ * собственный куст смотрящего в него не входит.
+ */
+function rayClear(
+  me: TankState,
+  x: number,
+  z: number,
+  pullback: number,
+  cover: Box[],
+  bushes: Box[],
+  half?: number,
+): boolean {
+  const dx = x - me.x;
+  const dz = z - me.z;
+  const dist = Math.hypot(dx, dz);
+  if (dist < 1e-3) return true;
+  const shorten = Math.max(0, dist - pullback) / dist;
+  const probe = ray(me.x, me.z, dx * shorten, dz * shorten);
+  if (sweepShell(probe, 1, cover, half) !== null) return false;
+  return bushes.length === 0 || sweepShell(probe, 1, bushes, half) === null;
+}
+
+/**
+ * Доля TANK_RADIUS, на которую от центра цели отступают пробные точки по
+ * краю корпуса — чуть меньше радиуса, чтобы точка не садилась ровно на угол
+ * укрытия и не давала ложных «вижу» из-за погрешности геометрии.
+ */
+const EDGE_PROBE = TANK_RADIUS * 0.85;
+/**
+ * Насколько короче до края корпуса, чем до его центра: луч на край почти
+ * параллелен лучу на центр (при обычных боевых дистанциях это хорошее
+ * приближение), а сама тестовая точка лежит внутри окружности танка —
+ * теорема Пифагора для хорды на расстоянии EDGE_PROBE от центра.
+ */
+const EDGE_PULLBACK = Math.sqrt(Math.max(0, TANK_RADIUS * TANK_RADIUS - EDGE_PROBE * EDGE_PROBE));
+
+/**
+ * Свободна ли линия огня до цели. Танк — круг, а не точка: пробуем не только
+ * центр, но и оба края корпуса (перпендикулярно линии стрелок→цель) — торчащая
+ * из-за угла четверть танка тоже считается видимой, а не только его середина.
+ * Укрытия держат снаряд и рвут обзор всегда; кусты (bushes, необязательны) —
+ * только обзор, и не для смотрящего, который сам сейчас в этом кусте (см.
+ * bushBlockers): его собственная листва не слепит его самого на выходе.
+ */
+function hasShot(me: TankState, target: TankState, cover: Box[], bushes: Box[] = [], half?: number): boolean {
   const dx = target.x - me.x;
   const dz = target.z - me.z;
   const dist = Math.hypot(dx, dz);
   if (dist < 1e-3) return true;
   if (dist > MAX_ENGAGE) return false;
 
-  // Останавливаемся у борта цели, а не в её центре, иначе сама цель считается стеной.
-  const shorten = Math.max(0, dist - TANK_RADIUS) / dist;
-  const probe = ray(me.x, me.z, dx * shorten, dz * shorten);
-  return sweepShell(probe, 1, cover, half) === null;
+  const blockers = bushBlockers(bushes, me.x, me.z);
+  if (rayClear(me, target.x, target.z, TANK_RADIUS, cover, blockers, half)) return true;
+  const nx = (-dz / dist) * EDGE_PROBE;
+  const nz = (dx / dist) * EDGE_PROBE;
+  return (
+    rayClear(me, target.x + nx, target.z + nz, EDGE_PULLBACK, cover, blockers, half) ||
+    rayClear(me, target.x - nx, target.z - nz, EDGE_PULLBACK, cover, blockers, half)
+  );
 }
 
 /**

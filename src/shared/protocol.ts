@@ -1,4 +1,4 @@
-import type { GameMode, Ruleset } from './constants.js';
+import type { ExpeditionUpgrade, GameMode, Ruleset } from './constants.js';
 import type {
   Boom,
   Box,
@@ -12,7 +12,7 @@ import type {
  * Фаза боя в режиме против ботов.
  * fight — волна на карте, break — передышка перед следующей, over — все пали.
  */
-export type WavePhase = 'fight' | 'break' | 'over';
+export type WavePhase = 'fight' | 'break' | 'upgrade' | 'over';
 
 /** Что сейчас происходит в комнате: одно и то же поле в welcome и в wave. */
 export interface WaveState {
@@ -25,6 +25,12 @@ export interface WaveState {
   until: number;
   /** Лучшая волна за время жизни сервера. */
   best: number;
+  /** Текущая сила танка в экспедиции и уже выбранные улучшения. */
+  power?: number;
+  upgrades?: number[];
+  choices?: ExpeditionUpgrade[];
+  /** Победа в экспедиции, в отличие от проигрыша в фазе over. */
+  victory?: boolean;
 }
 
 /** Настройки комнаты. Одинаковые поля в welcome и в config. */
@@ -56,6 +62,7 @@ export type ClientMessage =
   | { t: 'join'; name: string }
   | { t: 'input'; seq: number; th: number; st: number; tu: number; f?: 1 }
   | { t: 'ping'; id: number }
+  | { t: 'upgrade'; id: number }
   /** Настройка комнаты; принимается только от хоста. */
   | {
       t: 'setup';
@@ -80,12 +87,11 @@ export type ServerMessage =
     } & RoomConfig)
   | { t: 'joined'; player: PlayerInfo }
   /**
-   * Танк ушёл из комнаты. killed отличает подбитого бота от вышедшего игрока:
-   * бот исчезает из комнаты тем же тиком, в котором погиб, и без этой пометки
-   * клиент стёр бы его до того, как узнает о смерти, — вместо горящего остова
-   * бот просто пропадал бы с карты.
+   * Танк ушёл из комнаты насовсем: отключился человек, или волна зачистила
+   * остов подбитого бота. Гибель как таковая сюда не попадает — труп остаётся
+   * в комнате как обычный игрок с dead=1 в снапшоте, пока не возродится.
    */
-  | { t: 'left'; id: number; killed?: boolean }
+  | { t: 'left'; id: number }
   /** Хост сменил настройки, либо хост сменился сам. */
   | ({ t: 'config' } & RoomConfig)
   /** Сменилась карта: клиент пересобирает мир по этой геометрии. */

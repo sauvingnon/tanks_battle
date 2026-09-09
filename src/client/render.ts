@@ -1,10 +1,13 @@
 import * as THREE from 'three';
 import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
+import { RoundedBoxGeometry } from 'three/examples/jsm/geometries/RoundedBoxGeometry.js';
 import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
+import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 
 import { MAX_HP, SHELL_HEIGHT } from '../shared/constants.js';
+import { isBush } from '../shared/map.js';
 import { wrapAngle } from '../shared/sim.js';
 import {
   bodyKick,
@@ -25,9 +28,11 @@ import {
   BLOOM_THRESHOLD,
   BONUS_COLORS,
   COLOR_BOX,
+  COLOR_CRATE,
   COLOR_GROUND,
-  COLOR_LOW_BOX,
+  COLOR_HOUSE_WALL,
   COLOR_METAL,
+  COLOR_ROOF,
   COLOR_TRACK,
   COLOR_WALL,
   EXPOSURE,
@@ -39,21 +44,34 @@ import {
   GLOW_RICOCHET,
   GLOW_SHELL,
   GLOW_TRACER,
+  LEAF_COLORS,
   PALETTE,
   SUN_INTENSITY,
 } from './look.js';
 import {
   buildTankGeometry,
   MUZZLE_TIP_Z,
+  MUZZLE_Y,
+  placeTrackLink,
+  TRACK_LINK_COUNT,
+  TRACK_SIDE,
   type TankGeometry,
   TURRET_Y,
 } from './tank.js';
-import { armorTexture, concreteTexture, groundTexture, scaleBoxUv } from './textures.js';
+import {
+  armorTexture,
+  concreteTexture,
+  crateTexture,
+  groundTexture,
+  houseWallTexture,
+  scaleBoxUv,
+} from './textures.js';
 import { TOP_HEIGHT, TOP_ZOOM_SCALE, topFrustum, topParticleFov } from './topview.js';
 import {
   BOOM_GROUND,
   BOOM_HIT,
   BOOM_KILL,
+  BOOM_NEAR,
   BOOM_RICOCHET,
   type Box,
   type BoomKind,
@@ -73,8 +91,170 @@ const BONUS_HOVER = 1.7;
 const GROUND_TILE = 9;
 const BLOCK_TILE = 4;
 
+/**
+ * Разбивка «полных» укрытий по силуэту — чисто декоративная, идёт по форме
+ * блока карты, а не по её смыслу: играть на решение это не влияет никак, оно
+ * уже целиком закрыто высотой блока (`h >= SHELL_HEIGHT`).
+ */
+const HOUSE_FOOTPRINT = 10; // м; квадратный блок от этого размера — домик
+const WALL_ASPECT = 2.2; // вытянутый блок остаётся стеной, а не домиком/ящиком
+/** Один сегмент фаски: силуэт остаётся low-poly, но уходит ощущение «кубов». */
+const OBSTACLE_BEVEL_SEGMENTS = 1;
+
+/**
+ * Куст — кластер мелких кубиков, а не плоская крашеная коробка (см. buildBush).
+ * Высота чисто декоративная: физику низкого укрытия решает Box.h (в кустах,
+ * где танк проезжает целиком, она даже не участвует в столкновении — см.
+ * passableObstacles в map.ts), а кластер всегда поднимается заметно выше танка.
+ */
+const LEAF_CUBE = 1.4; // м, ребро кубика
+const BUSH_HEIGHT = 3.2; // м, высота кластера
+const BUSH_LAYERS = 3;
+const LEAF_PALETTE = LEAF_COLORS.map((c) => new THREE.Color(c));
+
+type BoxLook =
+  | 'wall'
+  | 'house'
+  | 'warehouse'
+  | 'tower'
+  | 'guardhouse'
+  | 'crate'
+  | 'container'
+  | 'barricade'
+  | 'berm'
+  | 'rock'
+  | 'bush';
+
+function boxLook(box: Box, mapId = 0): BoxLook {
+  // Кусты определяются не вкусом рендера, а тем же правилом, что у сервера:
+  // в них можно въехать, они прячут ботов и имеют свой кластер листвы.
+  // Никакая карта и никакой визуальный архетип не должны это переопределять.
+  if (isBush(box)) return 'bush';
+  const aspect = Math.max(box.w, box.d) / Math.max(0.1, Math.min(box.w, box.d));
+  const shortest = Math.min(box.w, box.d);
+  const area = box.w * box.d;
+  // На «Дюнах» и «Холмах» те же самые данные Box — это рельеф, а не дома.
+  // Контекст карты даёт им каменный силуэт и не превращает скалы в сараи.
+  if (mapId === 6 || mapId === 7) return box.h < SHELL_HEIGHT ? 'berm' : 'rock';
+  if (box.h < SHELL_HEIGHT) {
+    if (mapId === 4) return 'barricade';
+    if (mapId === 5 || mapId === 9) return 'container';
+    if (aspect >= 4) return 'barricade';
+    if (shortest <= 5 && Math.max(box.w, box.d) >= 8) return 'container';
+    if (area >= 70) return 'berm';
+    return 'bush';
+  }
+  if (box.h >= 7 && aspect < 1.35) return 'tower';
+  if (aspect >= WALL_ASPECT) return 'wall';
+  if (aspect >= 1.45 || area >= 190) return 'warehouse';
+  if (shortest >= HOUSE_FOOTPRINT) return 'house';
+  return shortest >= 6 ? 'guardhouse' : 'crate';
+}
+
+/**
+ * Декоративная форма препятствия. Коллизии по-прежнему считают исходный Box,
+ * поэтому фаски не меняют проезды и прострелы — это только более живой силуэт.
+ */
+function obstacleGeometry(box: Box, look: BoxLook): THREE.BufferGeometry {
+  const shortest = Math.min(box.w, box.h, box.d);
+  const bevel = Math.min(shortest * 0.16, look === 'wall' || look === 'barricade' ? 0.38 : 0.3);
+  return new RoundedBoxGeometry(
+    box.w,
+    box.h,
+    box.d,
+    OBSTACLE_BEVEL_SEGMENTS,
+    Math.max(0.08, bevel),
+  );
+}
+
+/** Группа деталей, которые сливаются в несколько мешей на всю карту. */
+interface DecorBatch {
+  roof: THREE.BufferGeometry[];
+  trim: THREE.BufferGeometry[];
+  windows: THREE.BufferGeometry[];
+  doors: THREE.BufferGeometry[];
+  rocks: THREE.BufferGeometry[];
+}
+
+function createDecorBatch(): DecorBatch {
+  return { roof: [], trim: [], windows: [], doors: [], rocks: [] };
+}
+
+function worldBox(w: number, h: number, d: number, x: number, y: number, z: number): THREE.BoxGeometry {
+  const geometry = new THREE.BoxGeometry(w, h, d);
+  geometry.translate(x, y, z);
+  return geometry;
+}
+
+/** Двускатная крыша — настоящая призма с коньком, а не пирамидальная крышка. */
+function gableRoof(width: number, depth: number, height: number): THREE.BufferGeometry {
+  const hw = width / 2;
+  const hd = depth / 2;
+  const hh = height / 2;
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute(
+    'position',
+    new THREE.Float32BufferAttribute([
+      -hw, -hh, -hd, hw, -hh, -hd, 0, hh, -hd,
+      -hw, -hh, hd, hw, -hh, hd, 0, hh, hd,
+    ], 3),
+  );
+  geometry.setAttribute(
+    'uv',
+    new THREE.Float32BufferAttribute([
+      0, 0, 1, 0, 0.5, 1,
+      0, 0, 1, 0, 0.5, 1,
+    ], 2),
+  );
+  geometry.setIndex([
+    // Торцы и оба наружных ската. Дна здесь намеренно нет: оно лежало бы
+    // в точности на верхней грани корпуса дома (y = box.h) и давало бы
+    // z-fighting — мерцание/рваные пятна на крыше при движении камеры.
+    0, 2, 1, 3, 4, 5,
+    0, 3, 5, 0, 5, 2,
+    1, 5, 4, 1, 2, 5,
+  ]);
+  geometry.computeVertexNormals();
+  return geometry;
+}
+
+function addGable(
+  batch: DecorBatch,
+  box: Box,
+  roofHeight: number,
+  ridgeAlongX: boolean,
+): void {
+  const geometry = gableRoof(
+    ridgeAlongX ? box.d * 1.12 : box.w * 1.12,
+    ridgeAlongX ? box.w * 1.12 : box.d * 1.12,
+    roofHeight,
+  );
+  if (ridgeAlongX) geometry.rotateY(Math.PI / 2);
+  geometry.translate(box.x, box.h + roofHeight / 2, box.z);
+  batch.roof.push(geometry);
+}
+
+/** Повторяемый, но стабильный вариант объекта — без прыжков картинки между заходами. */
+function boxVariant(box: Box): number {
+  return (Math.abs(Math.round(box.x * 17 + box.z * 31 + box.w * 7 + box.d * 13)) >>> 0) % 4;
+}
+
 const CAMERA_DISTANCE = 15;
 const CAMERA_BASE_HEIGHT = 3.4;
+
+/**
+ * Вынос камеры от первого лица вперёд по стволу, м. Совсем небольшой — камера
+ * сидит на башне, а не едет по стволу вперёд: слишком большой вынос на
+ * высоте ствола утыкал камеру прямо в казённик/маску пушки.
+ */
+const FPV_FORWARD = 0.4;
+/**
+ * Высота камеры от первого лица: заметно выше оси ствола — как будто сидишь
+ * в открытом люке командирской башенки, а не лежишь щекой на казённике.
+ */
+const FPV_HEIGHT = TURRET_Y + 1.3;
+/** Насколько далеко вынесена точка, куда смотрит камера от первого лица — далеко за горизонт, важно только направление. */
+const FPV_LOOK = 60;
 
 /** Высота, на которой висит ник над центром танка. */
 const LABEL_HEIGHT = 3.7;
@@ -108,6 +288,8 @@ const BOOM_PRESETS: Record<BoomKind, EffectPreset> = {
   [BOOM_KILL]: { radius: 4.2, life: 0.75, color: 0xff8a3c, ring: true, glow: GLOW_KILL },
   // Рикошет — короткая белая искра: снаряд жив и полетел дальше, взрыва не было.
   [BOOM_RICOCHET]: { radius: 0.9, life: 0.16, color: 0xfff4c8, glow: GLOW_RICOCHET },
+  // Близкий разрыв: не огонь, а холодная короткая вспышка воздуха рядом с бортом.
+  [BOOM_NEAR]: { radius: 1.1, life: 0.18, color: 0xd8e6ff, glow: GLOW_RICOCHET },
 };
 
 /** На какой высоте рвануло: у земли, по корпусу танка или на высоте полёта снаряда. */
@@ -116,6 +298,7 @@ const BOOM_HEIGHT: Record<BoomKind, number> = {
   [BOOM_HIT]: 1.4,
   [BOOM_KILL]: 1.4,
   [BOOM_RICOCHET]: SHELL_HEIGHT,
+  [BOOM_NEAR]: SHELL_HEIGHT,
 };
 
 /**
@@ -145,7 +328,7 @@ const MUZZLE_SMOKE: EffectPreset = {
 };
 
 /** Длина трассера за снарядом, м. */
-const TRACER_LENGTH = 6;
+export const TRACER_LENGTH = 6;
 
 // --- Отдача ствола ---
 
@@ -153,6 +336,13 @@ const TRACER_LENGTH = 6;
 const RECOIL_BACK = 0.62;
 /** Скорость возврата: ствол откатывается рывком, а выходит обратно плавно. */
 const RECOIL_RETURN = 8;
+
+/**
+ * Высота центра, вокруг которого верх танка качается на подвеске. Корпус не
+ * вращается вокруг самой земли: так при крене он выглядит опёртым на ходовую,
+ * а не воткнутым в асфальт носом или бортом.
+ */
+const SUSPENSION_PIVOT_Y = 0.78;
 
 // --- Тряска камеры ---
 
@@ -169,6 +359,8 @@ const SHAKE_FREQ = 21;
 
 /** Скорость подхода к целевому наклону корпуса. */
 const LEAN_RATE = 9;
+/** Держит зазор между качающимся корпусом и неподвижной ходовой. */
+const SUSPENSION_AMPLITUDE = 0.78;
 
 /**
  * Толчок корпуса, рад: от своего выстрела и от прилетевшего снаряда. Оба заметно
@@ -222,14 +414,19 @@ const WRECK_PITCH = -0.07;
 export interface TankHandle {
   root: THREE.Group;
   /**
-   * Корпус с башней. Отдельный узел внутри root нужен, чтобы крен и клевок
-   * жили в осях самого танка: root уже повёрнут по курсу, и наклон в его
-   * системе координат смешивал бы поворот с креном.
+   * Верхняя масса: корпус, броня и башня. Отдельный узел внутри root нужен,
+   * чтобы крен и клевок жили в осях самого танка, не передаваясь гусеницам.
+   * root уже повёрнут по курсу, поэтому наклон в его системе не смешивается
+   * с поворотом по курсу.
    */
   body: THREE.Group;
+  /** Ходовая сидит прямо на root: при живом танке она всегда остаётся на земле. */
+  runningGear: THREE.Group;
   turret: THREE.Group;
   /** Ствол ходит отдельно от башни: по нему играется откат. */
   barrel: THREE.Mesh;
+  /** Два InstancedMesh настоящих звеньев: левый и правый трак. */
+  trackLinks: readonly THREE.InstancedMesh[];
   /** Остаток отката, 1 в момент выстрела и 0 в покое. */
   recoil: number;
   /** Прошлое положение: по нему считаются скорость и поворот за кадр. */
@@ -249,6 +446,8 @@ export interface TankHandle {
   /** Пройденный путь с прошлого отпечатка и с прошлой пылинки, м. */
   trackDistance: number;
   dustDistance: number;
+  /** Пробег правой и левой ленты: на развороте они едут в разные стороны. */
+  treadPhase: [number, number];
   /** Краска корпуса этого танка: на время гибели темнеет до копоти. */
   paint: THREE.MeshStandardMaterial;
   /** Исходный цвет краски, чтобы вернуть его при возрождении. */
@@ -263,12 +462,6 @@ export interface TankHandle {
   everSeen: boolean;
   /** Когда остов выбросит следующий клуб дыма, в секундах от начала гибели. */
   smokeAt: number;
-  /**
-   * Танк уже вышел из комнаты и держится на сцене только ради остова: как
-   * догорит — убираем совсем. Так подбитый бот, которого сервер удаляет тем же
-   * тиком, всё-таки успевает сгореть на глазах.
-   */
-  retire: boolean;
   label: HTMLElement;
   hpFill: HTMLElement;
   /** Размеры подписи в пикселях, замеряются один раз — текст не меняется. */
@@ -291,6 +484,8 @@ export interface TankHandle {
 interface ShellHandle {
   /** Снаряд и его трассер ездят вместе, поэтому это группа, а не меш. */
   group: THREE.Group;
+  /** Хвост меняет длину у самого дула, чтобы не проходить сквозь ствол. */
+  tracer: THREE.Mesh;
   /** Помечается каждый кадр: непомеченные снаряды сервер больше не присылает. */
   seen: boolean;
 }
@@ -343,6 +538,8 @@ export class Scene3D {
   private readonly groundMap: THREE.CanvasTexture;
   private readonly concreteMap: THREE.CanvasTexture;
   private readonly armorMap: THREE.CanvasTexture;
+  private readonly houseWallMap: THREE.CanvasTexture;
+  private readonly crateMap: THREE.CanvasTexture;
 
   /** Геометрия танка: общая на всех, разница между танками только в цвете. */
   private readonly tankGeo: TankGeometry = buildTankGeometry();
@@ -412,11 +609,20 @@ export class Scene3D {
   private readonly trackMaterial = new THREE.MeshStandardMaterial({
     color: COLOR_TRACK,
     roughness: 0.95,
+    flatShading: true,
+  });
+  /** Катки светлее ленты: иначе на тёмной ходовой они теряют форму. */
+  private readonly wheelMaterial = new THREE.MeshStandardMaterial({
+    color: 0x68707a,
+    roughness: 0.72,
+    metalness: 0.32,
+    flatShading: true,
   });
   private readonly metalMaterial = new THREE.MeshStandardMaterial({
     color: COLOR_METAL,
     roughness: 0.6,
     metalness: 0.25,
+    flatShading: true,
   });
 
   /**
@@ -441,8 +647,21 @@ export class Scene3D {
   private trauma = 0;
   private shakeTime = 0;
 
+  /**
+   * По одному InstancedMesh на куст, в том же порядке, что и bushBoxes() —
+   * см. setActiveBush: прятать нужно не листву вообще, а ровно тот куст,
+   * внутри которого сейчас камера. Полупрозрачность тут не годится: изнутри
+   * густого куста луч взгляда проходит через десяток кубиков подряд, и даже
+   * лёгкая полупрозрачность каждого в сумме всё равно даёт почти сплошную
+   * стену — работает только полное скрытие одного, самого мешающего куста.
+   */
+  private bushMeshes: THREE.InstancedMesh[] = [];
+  private activeBush = -1;
+
   /** Рабочие векторы для дульной вспышки: считается она несколько раз в секунду. */
   private readonly muzzlePoint = new THREE.Vector3();
+  /** Общая болванка матрицы: ей расставляем звенья без аллокаций каждый кадр. */
+  private readonly trackLinkDummy = new THREE.Object3D();
 
   constructor(
     private readonly canvas: HTMLCanvasElement,
@@ -473,6 +692,8 @@ export class Scene3D {
     this.groundMap = groundTexture(this.renderer);
     this.concreteMap = concreteTexture(this.renderer);
     this.armorMap = armorTexture(this.renderer);
+    this.houseWallMap = houseWallTexture(this.renderer);
+    this.crateMap = crateTexture(this.renderer);
 
     // Цвет копится в полуплавающей точке: свечению нужны значения ярче единицы,
     // а в обычные 8 бит на канал они бы срезались ещё до размытия.
@@ -532,7 +753,7 @@ export class Scene3D {
    * группе: старую снимаем целиком и освобождаем её буферы, иначе смена карты
    * оставляла бы прошлые блоки и в сцене, и в видеопамяти.
    */
-  buildWorld(half: number, obstacles: Box[]): void {
+  buildWorld(half: number, obstacles: Box[], mapId = 0): void {
     this.clearWorld();
     // Следы, пыль и обломки от прошлой карты к новой отношения не имеют.
     this.tracks.clear();
@@ -565,6 +786,7 @@ export class Scene3D {
       color: COLOR_WALL,
       roughness: 0.9,
       map: this.concreteMap,
+      flatShading: true,
     });
     const wallHeight = 4;
     const thickness = 2;
@@ -576,7 +798,7 @@ export class Scene3D {
       [-half - thickness / 2, 0, thickness, span],
     ];
     for (const [x, z, w, d] of walls) {
-      const geometry = new THREE.BoxGeometry(w, wallHeight, d);
+      const geometry = obstacleGeometry({ x: 0, z: 0, w, d, h: wallHeight }, 'wall');
       scaleBoxUv(geometry, w, wallHeight, d, BLOCK_TILE);
       const wall = new THREE.Mesh(geometry, wallMaterial);
       wall.position.set(x, wallHeight / 2, z);
@@ -585,21 +807,86 @@ export class Scene3D {
       this.world.add(wall);
     }
 
-    const boxMaterial = new THREE.MeshStandardMaterial({
+    const wallBoxMaterial = new THREE.MeshStandardMaterial({
       color: COLOR_BOX,
       roughness: 0.85,
       map: this.concreteMap,
+      flatShading: true,
     });
-    // Низкое укрытие простреливается насквозь, поэтому его надо отличать с одного
-    // взгляда: другой цвет и заметно теплее — «за этим не спрячешься».
-    const lowMaterial = new THREE.MeshStandardMaterial({
-      color: COLOR_LOW_BOX,
+    const houseMaterial = new THREE.MeshStandardMaterial({
+      color: COLOR_HOUSE_WALL,
+      roughness: 0.8,
+      map: this.houseWallMap,
+      flatShading: true,
+    });
+    const crateMaterial = new THREE.MeshStandardMaterial({
+      color: COLOR_CRATE,
+      roughness: 0.9,
+      map: this.crateMap,
+      flatShading: true,
+    });
+    const roofMaterial = new THREE.MeshStandardMaterial({
+      color: COLOR_ROOF,
+      roughness: 0.95,
+      flatShading: true,
+    });
+    const trimMaterial = new THREE.MeshStandardMaterial({
+      color: COLOR_METAL,
+      roughness: 0.82,
+      metalness: 0.18,
+      flatShading: true,
+    });
+    const windowMaterial = new THREE.MeshStandardMaterial({
+      color: 0x1d2934,
+      emissive: 0x071018,
+      emissiveIntensity: 0.35,
+      roughness: 0.35,
+      metalness: 0.35,
+      flatShading: true,
+    });
+    const doorMaterial = new THREE.MeshStandardMaterial({
+      color: 0x302d29,
+      roughness: 0.9,
+      flatShading: true,
+    });
+    const rockMaterial = new THREE.MeshStandardMaterial({
+      color: COLOR_BOX,
       roughness: 1,
-      map: this.concreteMap,
+      flatShading: true,
     });
+    // Куст — кластер мелких кубиков (см. buildBush), не крашеная коробка: своя
+    // геометрия и материал на кубик, отдельно от «полных» укрытий ниже.
+    const leafGeometry = new THREE.BoxGeometry(LEAF_CUBE, LEAF_CUBE, LEAF_CUBE);
+    const leafMaterial = new THREE.MeshStandardMaterial({ roughness: 1 });
+    this.bushMeshes = [];
+    this.activeBush = -1;
+    const decor = createDecorBatch();
     for (const box of obstacles) {
-      const material = box.h >= SHELL_HEIGHT ? boxMaterial : lowMaterial;
-      const geometry = new THREE.BoxGeometry(box.w, box.h, box.d);
+      const look = boxLook(box, mapId);
+      if (look === 'bush') {
+        this.buildBush(box, leafGeometry, leafMaterial);
+        continue;
+      }
+
+      // Градирня и каменные гряды получают собственный силуэт, а не очередной
+      // скруглённый куб. Остальные типы держат физический Box как основу и
+      // обрастают фасадом/крышей/обвязкой через общий пакет деталей ниже.
+      if (look === 'tower') {
+        this.buildTower(box, wallBoxMaterial, roofMaterial, trimMaterial);
+        continue;
+      }
+      if (look === 'berm' || look === 'rock') {
+        this.buildBerm(box, decor);
+        continue;
+      }
+
+      const material =
+        look === 'house' || look === 'guardhouse'
+          ? houseMaterial
+          : look === 'crate' || look === 'container'
+            ? crateMaterial
+            : wallBoxMaterial;
+      const geometry = obstacleGeometry(box, look);
       // Развёртка правится на геометрии, а не отдельным материалом на блок:
       // блоков на карте под сотню, и сотня материалов — это сотня шейдеров.
       scaleBoxUv(geometry, box.w, box.h, box.d, BLOCK_TILE);
@@ -608,7 +895,248 @@ export class Scene3D {
       mesh.castShadow = true;
       mesh.receiveShadow = true;
       this.world.add(mesh);
+      this.decorateObstacle(box, look, decor);
     }
+    this.flushDecor(decor, roofMaterial, trimMaterial, windowMaterial, doorMaterial, rockMaterial);
+  }
+
+  /**
+   * Небольшая библиотека фасадов. Все элементы добавляются в общий batch и
+   * сливаются ниже: детализации стало больше, но карта не получает сотни
+   * отдельных draw call.
+   */
+  private decorateObstacle(box: Box, look: Exclude<BoxLook, 'bush' | 'tower' | 'berm' | 'rock'>, batch: DecorBatch): void {
+    const frontZ = box.z + box.d / 2 + 0.055;
+    const backZ = box.z - box.d / 2 - 0.055;
+    const rightX = box.x + box.w / 2 + 0.055;
+    const variant = boxVariant(box);
+
+    if (look === 'house' || look === 'guardhouse') {
+      const roofHeight = Math.min(3.4, Math.max(1.25, Math.min(box.w, box.d) * 0.22));
+      const ridgeAlongX = box.w >= box.d;
+      addGable(batch, box, roofHeight, ridgeAlongX);
+
+      // Конёк, труба и угловые планки: сверху дом читается не плоским пятном.
+      batch.trim.push(
+        worldBox(
+          ridgeAlongX ? box.w * 0.96 : 0.16,
+          0.13,
+          ridgeAlongX ? 0.16 : box.d * 0.96,
+          box.x,
+          box.h + roofHeight + 0.02,
+          box.z,
+        ),
+        worldBox(0.32, 0.85, 0.32, box.x + (variant < 2 ? -1 : 1) * box.w * 0.24, box.h + roofHeight + 0.36, box.z - box.d * 0.18),
+      );
+      for (const sx of [-1, 1]) {
+        batch.trim.push(worldBox(0.13, Math.min(box.h * 0.8, 3), 0.13, box.x + sx * (box.w / 2 - 0.18), Math.min(box.h * 0.4, 1.5), frontZ));
+      }
+
+      // Обычная входная дверь, не ворота склада: фасад дома должен читаться
+      // в одном масштабе с одиночными геометрическими окнами.
+      const doorW = Math.min(1.35, box.w * 0.18);
+      const doorH = Math.min(2.15, box.h * 0.52);
+      batch.doors.push(worldBox(doorW, doorH, 0.08, box.x, doorH / 2, frontZ));
+      const windowW = Math.min(1.5, box.w * 0.18);
+      const windowH = Math.min(1.25, box.h * 0.3);
+      for (const sx of [-1, 1]) {
+        batch.windows.push(worldBox(windowW, windowH, 0.06, box.x + sx * box.w * 0.3, box.h * 0.58, frontZ));
+        batch.windows.push(worldBox(windowW, windowH, 0.06, box.x + sx * box.w * 0.25, box.h * 0.58, backZ));
+      }
+      return;
+    }
+
+    if (look === 'warehouse') {
+      const roofHeight = Math.min(3.1, Math.max(1.1, Math.min(box.w, box.d) * 0.16));
+      const ridgeAlongX = box.w >= box.d;
+      addGable(batch, box, roofHeight, ridgeAlongX);
+      // Вентиляционные фонари на крыше и рёбра: это уже цех/склад, не домик.
+      const vents = Math.max(2, Math.floor(Math.max(box.w, box.d) / 10));
+      for (let i = 0; i < vents; i++) {
+        const t = vents === 1 ? 0 : i / (vents - 1) - 0.5;
+        const x = ridgeAlongX ? box.x + t * box.w * 0.55 : box.x;
+        const z = ridgeAlongX ? box.z : box.z + t * box.d * 0.55;
+        batch.trim.push(worldBox(ridgeAlongX ? 0.7 : 1.3, 0.35, ridgeAlongX ? 1.3 : 0.7, x, box.h + roofHeight + 0.17, z));
+      }
+      if (ridgeAlongX) {
+        const gateW = Math.min(box.w * 0.42, 6);
+        const gateH = Math.min(box.h * 0.72, 4);
+        batch.doors.push(worldBox(gateW, gateH, 0.1, box.x, gateH / 2, frontZ));
+        for (let x = box.x - box.w * 0.42; x <= box.x + box.w * 0.42; x += 3.5) {
+          batch.trim.push(worldBox(0.15, box.h * 0.9, 0.12, x, box.h * 0.45, frontZ + 0.025));
+        }
+      } else {
+        const gateD = Math.min(box.d * 0.42, 6);
+        const gateH = Math.min(box.h * 0.72, 4);
+        batch.doors.push(worldBox(0.1, gateH, gateD, rightX, gateH / 2, box.z));
+        for (let z = box.z - box.d * 0.42; z <= box.z + box.d * 0.42; z += 3.5) {
+          batch.trim.push(worldBox(0.12, box.h * 0.9, 0.15, rightX + 0.025, box.h * 0.45, z));
+        }
+      }
+      return;
+    }
+
+    if (look === 'wall' || look === 'barricade') {
+      const longX = box.w >= box.d;
+      const length = Math.max(box.w, box.d);
+      const posts = Math.max(2, Math.ceil(length / 7));
+      batch.trim.push(worldBox(box.w + 0.18, 0.16, box.d + 0.18, box.x, box.h + 0.08, box.z));
+      for (let i = 0; i <= posts; i++) {
+        const t = i / posts - 0.5;
+        const x = longX ? box.x + t * box.w : box.x;
+        const z = longX ? box.z : box.z + t * box.d;
+        batch.trim.push(worldBox(longX ? 0.24 : box.w + 0.12, box.h + 0.18, longX ? box.d + 0.12 : 0.24, x, box.h / 2, z));
+      }
+      return;
+    }
+
+    if (look === 'container') {
+      const longX = box.w >= box.d;
+      const length = Math.max(box.w, box.d);
+      const ribs = Math.max(3, Math.floor(length / 1.6));
+      for (let i = 0; i <= ribs; i++) {
+        const t = i / ribs - 0.5;
+        const x = longX ? box.x + t * box.w : box.x;
+        const z = longX ? box.z : box.z + t * box.d;
+        batch.trim.push(worldBox(longX ? 0.08 : box.w + 0.1, box.h * 0.88, longX ? box.d + 0.1 : 0.08, x, box.h * 0.48, z));
+      }
+      // Двустворчатая дверь на торце контейнера.
+      if (longX) {
+        batch.doors.push(worldBox(0.07, box.h * 0.78, box.d * 0.37, rightX, box.h * 0.43, box.z - box.d * 0.22));
+        batch.doors.push(worldBox(0.07, box.h * 0.78, box.d * 0.37, rightX, box.h * 0.43, box.z + box.d * 0.22));
+      } else {
+        batch.doors.push(worldBox(box.w * 0.37, box.h * 0.78, 0.07, box.x - box.w * 0.22, box.h * 0.43, frontZ));
+        batch.doors.push(worldBox(box.w * 0.37, box.h * 0.78, 0.07, box.x + box.w * 0.22, box.h * 0.43, frontZ));
+      }
+      return;
+    }
+
+    // Ящик/тумба: уголки и перекрёстные ремни ломают идеальную плоскость граней.
+    const strapY = box.h * 0.58;
+    batch.trim.push(
+      worldBox(box.w + 0.12, 0.12, 0.12, box.x, strapY, frontZ),
+      worldBox(0.12, 0.12, box.d + 0.12, rightX, strapY, box.z),
+      worldBox(box.w * 0.7, 0.1, box.d * 0.7, box.x, box.h + 0.06, box.z),
+    );
+  }
+
+  /**
+   * Высокий блок — квадратная башня строго по своему игровому Box.
+   *
+   * Здесь намеренно нет цилиндра: снаряды и движение считают карту набором
+   * прямоугольников. Круглая градирня оставляла видимые пустые углы, в которых
+   * выстрел попадал в невидимую квадратную коллизию. Архитектурные детали могут
+   * выходить на пару сантиметров, но несущий объём совпадает с физикой точно.
+   */
+  private buildTower(
+    box: Box,
+    bodyMaterial: THREE.MeshStandardMaterial,
+    roofMaterial: THREE.MeshStandardMaterial,
+    trimMaterial: THREE.MeshStandardMaterial,
+  ): void {
+    const body = new THREE.Mesh(new THREE.BoxGeometry(box.w, box.h, box.d), bodyMaterial);
+    body.position.set(box.x, box.h / 2, box.z);
+    body.castShadow = true;
+    body.receiveShadow = true;
+    this.world.add(body);
+
+    const rim = new THREE.Mesh(new THREE.BoxGeometry(box.w + 0.16, 0.3, box.d + 0.16), trimMaterial);
+    rim.position.set(box.x, box.h - 0.05, box.z);
+    rim.castShadow = true;
+    this.world.add(rim);
+
+    const capHeight = Math.min(0.7, Math.max(0.35, box.h * 0.08));
+    const cap = new THREE.Mesh(new THREE.BoxGeometry(box.w * 0.82, capHeight, box.d * 0.82), roofMaterial);
+    cap.position.set(box.x, box.h + capHeight / 2, box.z);
+    cap.castShadow = true;
+    this.world.add(cap);
+  }
+
+  /** Низкие дюны и каменные гряды: несколько многогранников вместо одного блока. */
+  private buildBerm(box: Box, batch: DecorBatch): void {
+    const variant = boxVariant(box);
+    const offsets: Array<[number, number, number]> = [
+      [-0.22, -0.08, 0.62],
+      [0.2, 0.12, 0.54],
+      [0.02, -0.24, 0.46],
+    ];
+    for (let i = 0; i < offsets.length; i++) {
+      const [ox, oz, scale] = offsets[i];
+      const rock = new THREE.DodecahedronGeometry(1, 0);
+      rock.scale(box.w * scale * 0.5, Math.max(0.45, box.h * (0.55 + i * 0.08)), box.d * scale * 0.5);
+      rock.rotateY((variant + i) * 0.65);
+      rock.translate(box.x + ox * box.w, Math.max(0.25, box.h * 0.4), box.z + oz * box.d);
+      batch.rocks.push(rock);
+    }
+  }
+
+  private flushDecor(
+    batch: DecorBatch,
+    roofMaterial: THREE.MeshStandardMaterial,
+    trimMaterial: THREE.MeshStandardMaterial,
+    windowMaterial: THREE.MeshStandardMaterial,
+    doorMaterial: THREE.MeshStandardMaterial,
+    rockMaterial: THREE.MeshStandardMaterial,
+  ): void {
+    const add = (geometries: THREE.BufferGeometry[], material: THREE.MeshStandardMaterial) => {
+      if (geometries.length === 0) return;
+      const geometry = mergeGeometries(geometries);
+      if (!geometry) return;
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      this.world.add(mesh);
+    };
+    add(batch.roof, roofMaterial);
+    add(batch.trim, trimMaterial);
+    add(batch.windows, windowMaterial);
+    add(batch.doors, doorMaterial);
+    add(batch.rocks, rockMaterial);
+  }
+
+  /**
+   * Куст: кластер мелких кубиков вместо одной плоской коробки — читается как
+   * листва, а не крашеный бетон. Высота фиксирована и заметно выше танка
+   * (BUSH_HEIGHT) — box.h в этом не участвует, он у куста чисто про физику
+   * (держит снаряд или нет, мешает ехать или нет — см. isBush в map.ts).
+   * Один InstancedMesh на куст: кубиков в кластере может быть несколько
+   * десятков, обычный Mesh на каждый обошёлся бы куда дороже по кадру.
+   */
+  private buildBush(box: Box, geometry: THREE.BoxGeometry, material: THREE.MeshStandardMaterial): void {
+    const cols = Math.max(2, Math.round(box.w / LEAF_CUBE));
+    const rows = Math.max(2, Math.round(box.d / LEAF_CUBE));
+    const stepX = box.w / cols;
+    const stepZ = box.d / rows;
+    const stepY = BUSH_HEIGHT / BUSH_LAYERS;
+
+    const mesh = new THREE.InstancedMesh(geometry, material, cols * rows * BUSH_LAYERS);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    const dummy = new THREE.Object3D();
+    let i = 0;
+    for (let layer = 0; layer < BUSH_LAYERS; layer++) {
+      for (let cx = 0; cx < cols; cx++) {
+        for (let cz = 0; cz < rows; cz++) {
+          const x = box.x - box.w / 2 + stepX * (cx + 0.5) + (Math.random() - 0.5) * stepX * 0.4;
+          const z = box.z - box.d / 2 + stepZ * (cz + 0.5) + (Math.random() - 0.5) * stepZ * 0.4;
+          const y = stepY * (layer + 0.5) + (Math.random() - 0.5) * stepY * 0.5;
+          dummy.position.set(x, y, z);
+          dummy.rotation.set(0, Math.random() * Math.PI * 2, 0);
+          dummy.scale.setScalar(0.85 + Math.random() * 0.3);
+          dummy.updateMatrix();
+          mesh.setMatrixAt(i, dummy.matrix);
+          mesh.setColorAt(i, LEAF_PALETTE[(Math.random() * LEAF_PALETTE.length) | 0]);
+          i++;
+        }
+      }
+    }
+    mesh.instanceMatrix.needsUpdate = true;
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+    this.world.add(mesh);
+    // Порядок совпадает с bushBoxes() — обе функции идут по одному и тому же
+    // отфильтрованному списку obstacles, так что индекс тут и есть тот самый
+    // индекс, который main.ts получает от bushIndexAt (см. setActiveBush).
+    this.bushMeshes.push(mesh);
   }
 
   /** Снимает прошлую карту вместе с её буферами. */
@@ -621,6 +1149,8 @@ export class Scene3D {
       else material?.dispose();
     }
     this.world.clear();
+    this.bushMeshes = [];
+    this.activeBush = -1;
   }
 
   addTank(
@@ -634,30 +1164,55 @@ export class Scene3D {
     if (existing) return existing;
 
     const root = new THREE.Group();
+    // Ходовая не наследует раскачку корпуса: пока танк жив, она сохраняет
+    // плоскость земли, а верхняя масса работает как на рессорах.
+    const runningGear = new THREE.Group();
     const body = new THREE.Group();
-    root.add(body);
+    body.position.y = SUSPENSION_PIVOT_Y;
+    // Геометрия остаётся в прежних координатах, но поворот body теперь идёт
+    // вокруг высоты подвески, а не вокруг нуля у земли.
+    const upperHull = new THREE.Group();
+    upperHull.position.y = -SUSPENSION_PIVOT_Y;
+    body.add(upperHull);
+    root.add(runningGear, body);
 
     const paintColor = PALETTE[colorIndex % PALETTE.length];
     const bodyMaterial = new THREE.MeshStandardMaterial({
       color: paintColor,
       roughness: 0.72,
       metalness: 0.15,
+      flatShading: true,
       // Текстура серая и светлая: она умножается на краску, поэтому цвет танка
       // остаётся тем же, а броня перестаёт быть ровной заливкой.
       map: this.armorMap,
     });
 
-    // Геометрия уже слита по материалам и стоит на своих местах: пять мешей
-    // на танк вместо двух десятков, и каждый из них — один вызов отрисовки.
+    // Геометрия уже слита по материалам и стоит на своих местах: несколько
+    // крупных мешей на танк вместо двух десятков, и каждый — один draw call.
     const hull = new THREE.Mesh(this.tankGeo.hull, bodyMaterial);
     hull.castShadow = true;
     hull.receiveShadow = true;
-    body.add(hull);
+    upperHull.add(hull);
 
     const running = new THREE.Mesh(this.tankGeo.running, this.trackMaterial);
     running.castShadow = true;
     running.receiveShadow = true;
-    body.add(running);
+    runningGear.add(running);
+
+    const wheels = new THREE.Mesh(this.tankGeo.wheels, this.wheelMaterial);
+    wheels.castShadow = true;
+    wheels.receiveShadow = true;
+    runningGear.add(wheels);
+
+    // По одному InstancedMesh на сторону: у гусеницы видны реальные звенья,
+    // но двадцать две детали не превращаются в двадцать два draw call.
+    const trackLinks = [-1, 1].map((side) => this.createTrackLinks(side));
+    for (const links of trackLinks) runningGear.add(links);
+
+    const hullMetal = new THREE.Mesh(this.tankGeo.hullMetal, this.metalMaterial);
+    hullMetal.castShadow = true;
+    hullMetal.receiveShadow = true;
+    upperHull.add(hullMetal);
 
     const turret = new THREE.Group();
     turret.position.y = TURRET_Y;
@@ -675,7 +1230,7 @@ export class Scene3D {
     barrel.castShadow = true;
     turret.add(barrel);
 
-    body.add(turret);
+    upperHull.add(turret);
 
     this.scene.add(root);
 
@@ -699,8 +1254,10 @@ export class Scene3D {
     const handle: TankHandle = {
       root,
       body,
+      runningGear,
       turret,
       barrel,
+      trackLinks,
       recoil: 0,
       lastX: 0,
       lastZ: 0,
@@ -712,11 +1269,11 @@ export class Scene3D {
       kickPitch: 0,
       trackDistance: 0,
       dustDistance: 0,
+      treadPhase: [0, 0],
       paint: bodyMaterial,
       paintColor,
       dying: -1,
       smokeAt: 0,
-      retire: false,
       everSeen: false,
       label,
       hpFill,
@@ -732,6 +1289,34 @@ export class Scene3D {
     };
     this.tanks.set(id, handle);
     return handle;
+  }
+
+  /** Создаёт одну сторону гусеницы и ставит звенья в исходную фазу. */
+  private createTrackLinks(side: number): THREE.InstancedMesh {
+    const mesh = new THREE.InstancedMesh(this.tankGeo.trackLink, this.trackMaterial, TRACK_LINK_COUNT);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    for (let index = 0; index < TRACK_LINK_COUNT; index++) {
+      placeTrackLink(this.trackLinkDummy, index, 0, side);
+      this.trackLinkDummy.updateMatrix();
+      mesh.setMatrixAt(index, this.trackLinkDummy.matrix);
+    }
+    mesh.instanceMatrix.needsUpdate = true;
+    return mesh;
+  }
+
+  /** Передвигает оба пояса звеньев по их замкнутому контуру. */
+  private updateTrackLinks(handle: TankHandle): void {
+    for (let sideIndex = 0; sideIndex < handle.trackLinks.length; sideIndex++) {
+      const side = sideIndex === 0 ? -1 : 1;
+      const mesh = handle.trackLinks[sideIndex];
+      for (let index = 0; index < TRACK_LINK_COUNT; index++) {
+        placeTrackLink(this.trackLinkDummy, index, handle.treadPhase[sideIndex], side);
+        this.trackLinkDummy.updateMatrix();
+        mesh.setMatrixAt(index, this.trackLinkDummy.matrix);
+      }
+      mesh.instanceMatrix.needsUpdate = true;
+    }
   }
 
   /**
@@ -759,13 +1344,23 @@ export class Scene3D {
     }
   }
 
-  /** Танк подбит: копоть, перекос, разлёт обломков и горящий остов на WRECK_S. */
+  /** Танк подбит: копоть, перекос, разлёт обломков и осевший остов, который остаётся на карте. */
   private killTank(handle: TankHandle): void {
-    // Танк, которого мы живым не застали, просто не рисуем: взрыв ему устроили
-    // до нашего появления, и показывать его сейчас — врать о том, что случилось.
+    // Танк, которого мы живым не застали (зашли посреди волны, а он уже
+    // труп), не получает вспышку и обломки — взрыв ему устроили до нашего
+    // появления, и разыгрывать его сейчас — врать о том, что случилось. Но
+    // сам остов теперь физическое препятствие карты, поэтому он всё равно
+    // должен быть виден — просто сразу в уже осевшей позе, без анимации.
     if (!handle.everSeen) {
-      handle.dying = -1;
-      handle.root.visible = false;
+      handle.dying = WRECK_S;
+      handle.smokeAt = Infinity;
+      handle.root.visible = !handle.cloaked;
+      handle.paint.color.setHex(handle.paintColor).multiplyScalar(WRECK_DARKEN);
+      handle.body.rotation.set(WRECK_PITCH, 0, WRECK_ROLL);
+      this.setWreckPose(handle, wreckSink(WRECK_S));
+      handle.roll = WRECK_ROLL;
+      handle.pitch = WRECK_PITCH;
+      this.setTankShadow(handle, false);
       return;
     }
 
@@ -775,15 +1370,14 @@ export class Scene3D {
 
     handle.paint.color.setHex(handle.paintColor).multiplyScalar(WRECK_DARKEN);
     handle.body.rotation.set(WRECK_PITCH, 0, WRECK_ROLL);
+    this.setWreckPose(handle, 0);
     handle.roll = WRECK_ROLL;
     handle.pitch = WRECK_PITCH;
 
     // Остов уходит под землю, а тень рисуется отдельным проходом сверху: земля
     // в карту теней не пишет, поэтому провалившийся танк продолжал бы бросать
     // на неё тень — на пустом месте лежало бы тёмное пятно.
-    handle.body.traverse((node) => {
-      node.castShadow = false;
-    });
+    this.setTankShadow(handle, false);
 
     const { x, z } = handle.root.position;
     for (let i = 0; i < WRECK_DEBRIS; i++) {
@@ -806,31 +1400,45 @@ export class Scene3D {
   private reviveTank(handle: TankHandle): void {
     handle.dying = -1;
     handle.paint.color.setHex(handle.paintColor);
-    handle.body.position.y = 0;
+    handle.body.position.y = SUSPENSION_PIVOT_Y;
     handle.body.rotation.set(0, 0, 0);
+    handle.runningGear.position.set(0, 0, 0);
+    handle.runningGear.rotation.set(0, 0, 0);
     handle.roll = 0;
     handle.pitch = 0;
-    handle.body.traverse((node) => {
-      node.castShadow = true;
-    });
+    this.setTankShadow(handle, true);
     handle.root.visible = !handle.cloaked;
   }
 
-  /** Горящий остов: оседает, дымит и в конце убирается со сцены. */
+  /** На смерти ходовая снова следует за корпусом, чтобы остов не распался на части. */
+  private setWreckPose(handle: TankHandle, sink: number): void {
+    handle.body.position.y = SUSPENSION_PIVOT_Y + sink;
+    handle.runningGear.position.y = sink;
+    handle.runningGear.rotation.copy(handle.body.rotation);
+  }
+
+  /** И верх, и ходовая участвуют в одном состоянии теней — живом либо остове. */
+  private setTankShadow(handle: TankHandle, castShadow: boolean): void {
+    handle.body.traverse((node) => {
+      node.castShadow = castShadow;
+    });
+    handle.runningGear.traverse((node) => {
+      node.castShadow = castShadow;
+    });
+  }
+
+  /**
+   * Горящий остов: оседает и дымит первые WRECK_S секунд, дальше просто лежит
+   * осевшим препятствием — сервер держит его на карте до возрождения, и
+   * убирать со сцены раньше нельзя, иначе танки будут врезаться в пустоту.
+   */
   private updateWrecks(dt: number): void {
-    for (const [id, handle] of this.tanks) {
-      if (handle.dying < 0) continue;
+    for (const [, handle] of this.tanks) {
+      if (handle.dying < 0 || handle.dying >= WRECK_S) continue;
       handle.dying += dt;
 
-      if (handle.dying >= WRECK_S) {
-        handle.dying = -1;
-        handle.root.visible = false;
-        if (handle.retire) this.dropTank(id, handle);
-        continue;
-      }
-
-      handle.body.position.y = wreckSink(handle.dying);
-      if (handle.dying < handle.smokeAt) continue;
+      this.setWreckPose(handle, wreckSink(Math.min(handle.dying, WRECK_S)));
+      if (handle.dying >= WRECK_S || handle.dying < handle.smokeAt) continue;
       handle.smokeAt += WRECK_SMOKE_EVERY;
       this.spawnEffect(
         handle.root.position.x + (Math.random() - 0.5) * 1.6,
@@ -869,24 +1477,13 @@ export class Scene3D {
   }
 
   /**
-   * Танк ушёл из комнаты. killed — его подбили: тогда сцена оставляет остов
-   * догореть и убирает его сама, когда гибель доиграет.
-   *
-   * Различать обязательно: бота сервер удаляет из комнаты тем же тиком, в
-   * котором тот погиб, и «вышел» с «подбит» приходят одним сообщением. Без
-   * пометки бот исчезал бы с карты мгновенно — ровно как отключившийся игрок.
+   * Танк насовсем ушёл из комнаты (отключился человек, или волна зачистила
+   * труп бота). Сама гибель сюда не попадает — она приходит dead-флагом
+   * снапшота и уже отыграна killTank раньше; здесь только уборка со сцены.
    */
-  removeTank(id: number, killed = false): void {
+  removeTank(id: number): void {
     const handle = this.tanks.get(id);
     if (!handle) return;
-
-    if (killed && handle.everSeen && handle.alive) {
-      handle.alive = false;
-      handle.retire = true;
-      this.killTank(handle);
-      // Подпись гасит updateLabels: она смотрит на alive и снимет её сама.
-      return;
-    }
     this.dropTank(id, handle);
   }
 
@@ -942,6 +1539,48 @@ export class Scene3D {
     // Цель взгляда не трясётся вместе с камерой: смещаем только точку съёмки,
     // и толчок выходит поворотом кадра, а не сползанием прицела с танка.
     this.cameraTarget.set(x, 2.2, z);
+    this.applyShake(dt);
+    this.camera.lookAt(this.cameraTarget);
+  }
+
+  /**
+   * Кусты непрозрачны по умолчанию — так они читаются как заросли снаружи, в
+   * третьем лице и с чужих экранов. index — тот куст (см. bushIndexAt в
+   * main.ts), внутри которого сейчас физически камера от первого лица: его
+   * целиком прячем (не притушиваем!), иначе взгляд изнутри густого куста идёт
+   * сквозь десяток кубиков подряд и лёгкая полупрозрачность каждого в сумме
+   * всё равно даёт сплошную стену. -1 — камера не в кусте, всё видно как есть.
+   */
+  setActiveBush(index: number): void {
+    if (index === this.activeBush) return;
+    this.activeBush = index;
+    for (let i = 0; i < this.bushMeshes.length; i++) this.bushMeshes[i].visible = i !== index;
+  }
+
+  /**
+   * Вид от первого лица: камера стоит у башни и сама смотрит туда, куда наводит
+   * игрок — те же yaw/pitch, что крутят камеру от третьего лица, только здесь
+   * это направление взгляда, а не угол обзора вокруг цели. zoom (дистанция)
+   * тут не участвует вовсе: смотровая точка одна и та же.
+   */
+  updateFirstPersonCamera(x: number, z: number, yaw: number, pitch: number, dt: number): void {
+    const camX = x + Math.sin(yaw) * FPV_FORWARD;
+    const camZ = z + Math.cos(yaw) * FPV_FORWARD;
+
+    if (!this.cameraReady) {
+      this.cameraHeight = FPV_HEIGHT;
+      this.cameraReady = true;
+    } else {
+      this.cameraHeight += (FPV_HEIGHT - this.cameraHeight) * (1 - Math.exp(-dt * 14));
+    }
+    this.camera.position.set(camX, this.cameraHeight, camZ);
+
+    // Та же спереди-вверх математика, что и у pitch в третьем лице (там он же
+    // крутит камеру над целью): положительный pitch — взгляд вниз.
+    const dirX = Math.sin(yaw) * Math.cos(pitch);
+    const dirY = -Math.sin(pitch);
+    const dirZ = Math.cos(yaw) * Math.cos(pitch);
+    this.cameraTarget.set(camX + dirX * FPV_LOOK, this.cameraHeight + dirY * FPV_LOOK, camZ + dirZ * FPV_LOOK);
     this.applyShake(dt);
     this.camera.lookAt(this.cameraTarget);
   }
@@ -1046,7 +1685,7 @@ export class Scene3D {
    * Ставит меши по списку из снапшота. Снаряды живут по id: те, кого в списке нет,
    * уже взорвались — их меш уходит в пул, а взрыв прилетает отдельным событием.
    */
-  syncShells(list: Array<{ id: number; x: number; z: number; angle: number }>): void {
+  syncShells(list: Array<{ id: number; x: number; z: number; angle: number; trail?: number }>): void {
     for (const handle of this.shells.values()) handle.seen = false;
 
     for (const shell of list) {
@@ -1054,13 +1693,17 @@ export class Scene3D {
       if (!handle) {
         const group = this.shellPool.pop() ?? this.createShell();
         this.scene.add(group);
-        handle = { group, seen: true };
+        handle = { group, tracer: group.getObjectByName('shell-tracer') as THREE.Mesh, seen: true };
         this.shells.set(shell.id, handle);
       }
       handle.seen = true;
       handle.group.position.set(shell.x, SHELL_HEIGHT, shell.z);
       // Группа собрана вдоль своего +Z, а угол 0 в игре смотрит в мировой +Z.
       handle.group.rotation.y = shell.angle;
+      const trail = Math.max(0, Math.min(TRACER_LENGTH, shell.trail ?? TRACER_LENGTH));
+      handle.tracer.visible = trail > 0.02;
+      handle.tracer.scale.set(1, trail, 1);
+      handle.tracer.position.z = -trail / 2;
     }
 
     for (const [id, handle] of this.shells) {
@@ -1082,6 +1725,7 @@ export class Scene3D {
     // Конус растёт вдоль своего +Y, поворот на -90° уводит остриё назад, в -Z:
     // хвост сходит на нет позади снаряда, а широким концом сидит на нём.
     const tracer = new THREE.Mesh(this.geo.tracer, this.tracerMaterial);
+    tracer.name = 'shell-tracer';
     tracer.rotation.x = -Math.PI / 2;
     tracer.scale.set(1, TRACER_LENGTH, 1);
     tracer.position.z = -TRACER_LENGTH / 2;
@@ -1209,7 +1853,7 @@ export class Scene3D {
     // Матрицу считает рендер, то есть в ней прошлый кадр; обновляем вручную,
     // иначе вспышка отстаёт от башни на кадр при быстром довороте.
     handle.turret.updateWorldMatrix(true, false);
-    const point = handle.turret.localToWorld(this.muzzlePoint.set(0, 0.36, MUZZLE_TIP_Z));
+    const point = handle.turret.localToWorld(this.muzzlePoint.set(0, MUZZLE_Y, MUZZLE_TIP_Z));
     // Ствол смотрит вдоль +Z башни, а башня крутится только вокруг вертикали.
     const angle = handle.root.rotation.y + handle.turret.rotation.y;
 
@@ -1362,6 +2006,9 @@ export class Scene3D {
         handle.kickPitch = 0;
         handle.trackDistance = 0;
         handle.dustDistance = 0;
+        handle.treadPhase[0] = 0;
+        handle.treadPhase[1] = 0;
+        this.updateTrackLinks(handle);
         handle.body.rotation.set(0, 0, 0);
         continue;
       }
@@ -1381,11 +2028,21 @@ export class Scene3D {
       const accel = (speed - handle.speed) / dt;
       handle.speed = speed;
 
+      // Две ленты получают разный пробег на развороте. Поэтому даже танк,
+      // который крутится на месте, не стоит на неподвижных гусеницах.
+      const rightTravel = speed * dt + yawDelta * TRACK_SIDE;
+      const leftTravel = speed * dt - yawDelta * TRACK_SIDE;
+      if (Math.abs(rightTravel) > 0.001 || Math.abs(leftTravel) > 0.001) {
+        handle.treadPhase[0] += rightTravel;
+        handle.treadPhase[1] += leftTravel;
+        this.updateTrackLinks(handle);
+      }
+
       const lean = bodyLean(yawDelta / dt, speed, accel);
       handle.roll += (lean.roll - handle.roll) * k;
       handle.pitch += (lean.pitch - handle.pitch) * k;
-      handle.body.rotation.z = handle.roll + handle.kickRoll;
-      handle.body.rotation.x = handle.pitch + handle.kickPitch;
+      handle.body.rotation.z = (handle.roll + handle.kickRoll) * SUSPENSION_AMPLITUDE;
+      handle.body.rotation.x = (handle.pitch + handle.kickPitch) * SUSPENSION_AMPLITUDE;
 
       // Замаскированный не должен выдавать себя ни следом, ни облаком пыли.
       if (handle.cloaked || step === 0) continue;

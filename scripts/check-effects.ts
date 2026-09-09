@@ -45,9 +45,13 @@ import {
 import {
   buildTankGeometry,
   MUZZLE_TIP_Z,
+  MUZZLE_Y,
+  placeTrackLink,
+  TRACK_LINK_COUNT,
   TRACK_SIDE,
   TURRET_Y,
 } from '../src/client/tank.js';
+import { MUZZLE_OFFSET, SHELL_HEIGHT, TANK_RADIUS } from '../src/shared/constants.js';
 import { scaleBoxUv } from '../src/client/textures.js';
 
 const checks: Array<[string, boolean]> = [];
@@ -293,9 +297,12 @@ const near = (a: number, b: number, eps = 1e-6) => Math.abs(a - b) < eps;
 // --- 5в. Уход остова ---
 
 {
-  // Оставлять остов до возрождения нельзя: на сервере подбитый танк выброшен
-  // и из столкновений, и из поиска цели снарядом. Он обязан исчезнуть сам.
-  check('остов живёт заметно меньше возрождения', WRECK_S > 1 && WRECK_S < 2.5);
+  // На сервере подбитый танк — препятствие карты до возрождения (в волнах —
+  // до её конца), поэтому остов больше не прячется и не исчезает сам: он
+  // должен читаться на поле весь бой. WRECK_S — только длительность анимации
+  // просадки, дальше корпус просто лежит осевшим, а не убирается со сцены
+  // (это делает Room.refreshWrecks на сервере, а не таймер клиента).
+  check('анимация просадки короче возрождения', WRECK_S > 1 && WRECK_S < 2.5);
 
   check('в первый миг остов стоит на месте', near(wreckSink(0), 0));
   check('сразу после гибели он ещё не проседает', near(wreckSink(0.2), 0));
@@ -304,7 +311,9 @@ const near = (a: number, b: number, eps = 1e-6) => Math.abs(a - b) < eps;
   const end = wreckSink(WRECK_S);
   check('к середине остов уже осел', middle < 0);
   check('оседание только вниз и только ускоряется', end < middle);
-  check('к концу корпус целиком под землёй', end <= -2.5);
+  // Не спрятать, а вмять в воронку: корпус должен читаться издали весь бой,
+  // поэтому глубина заметно меньше собственной высоты танка (~2.5 м).
+  check('к концу остов осел в воронку, но не исчез из виду', end <= -0.7 && end > -1.6);
 
   // Кривая монотонна: подпрыгнувший на середине остов выглядел бы живым.
   let previous = 0;
@@ -419,6 +428,8 @@ const near = (a: number, b: number, eps = 1e-6) => Math.abs(a - b) < eps;
 
   const hull = bounds(tank.hull);
   const running = bounds(tank.running);
+  const wheels = bounds(tank.wheels);
+  const trackLink = bounds(tank.trackLink);
   const barrel = bounds(tank.barrel);
   const turret = bounds(tank.turret);
 
@@ -426,6 +437,8 @@ const near = (a: number, b: number, eps = 1e-6) => Math.abs(a - b) < eps;
   // подвинуть дульный тормоз — и она молча уедет внутрь ствола или повиснет
   // в воздухе, потому что константу правят отдельно от геометрии.
   check('дульный срез совпадает с концом ствола', near(barrel.max.z, MUZZLE_TIP_Z, 1e-6));
+  check('дульный срез совпадает с серверным spawn', near(MUZZLE_TIP_Z, MUZZLE_OFFSET, 1e-6));
+  check('дуло лежит на высоте снаряда', near(TURRET_Y + MUZZLE_Y, SHELL_HEIGHT, 1e-6));
   check('ствол смотрит вперёд', barrel.min.z > 0);
 
   // Ходовая обязана стоять там, где её ищут следы на земле.
@@ -442,21 +455,45 @@ const near = (a: number, b: number, eps = 1e-6) => Math.abs(a - b) < eps;
   check('башня не достаёт до ника', topmost < 3.4);
   check('башня всё же выше корпуса', TURRET_Y + turret.min.y >= hull.max.y - 0.5);
 
-  // Силуэт менять нельзя: по нему игрок оценивает дистанцию, а радиус
-  // столкновений на сервере — 2.4 м и от внешнего вида не зависит вовсе.
-  // Прежний танк был 1.84 м в полуширину (траки) и 2.45 в полудлину.
-  const halfWidth = Math.max(hull.max.x, running.max.x, -hull.min.x, -running.min.x);
+  // Широкая лента должна читаться снаружи катков, но не выходить за реальный
+  // радиус танка: иначе выстрел в край видимой гусеницы пролетит насквозь.
+  const beltHalfWidth = TRACK_SIDE + trackLink.max.x;
+  const halfWidth = Math.max(
+    hull.max.x,
+    running.max.x,
+    wheels.max.x,
+    -hull.min.x,
+    -running.min.x,
+    -wheels.min.x,
+    beltHalfWidth,
+  );
   const halfLength = Math.max(hull.max.z, running.max.z, -hull.min.z, -running.min.z);
-  check('танк не шире прежнего заметно', halfWidth <= 2.0);
+  check('широкая лента видна за катками', beltHalfWidth > wheels.max.x);
+  check('гусеницы не выходят за боевой радиус', halfWidth < TANK_RADIUS);
   check('танк не длиннее прежнего', halfLength <= 2.5);
-  // И не уже: похудевший танк начали бы недооценивать по дистанции.
-  check('танк не сузился', halfWidth >= 1.7);
+  check('анимированное звено остаётся широким', trackLink.max.x - trackLink.min.x >= 0.55);
 
   // Слияние должно было дать по одной геометрии на материал, а не по одной
   // на деталь: иначе весь смысл — в вызовах отрисовки — теряется.
   for (const [name, geometry] of Object.entries(tank)) {
     check(`${name} — одна слитая геометрия`, geometry.getAttribute('position').count > 0);
   }
+
+  // Внешняя лента теперь не текстура на коробке: звенья должны обходить оба
+  // колеса, уходить на нижнюю ветвь и ехать в обратную сторону на заднем ходу.
+  const link = new THREE.Object3D();
+  const positions: Array<{ x: number; y: number; z: number; pitch: number }> = [];
+  for (let i = 0; i < TRACK_LINK_COUNT; i++) {
+    placeTrackLink(link, i, 0, 1);
+    positions.push({ x: link.position.x, y: link.position.y, z: link.position.z, pitch: link.rotation.x });
+  }
+  check('звенья не проваливаются под землю', positions.every((p) => p.y >= 0.17));
+  check('лента обходит верх и низ ходовой', Math.min(...positions.map((p) => p.y)) < Math.max(...positions.map((p) => p.y)));
+  check('на концах звенья плавно доворачиваются', positions.some((p) => Math.abs(p.pitch) > 0.5));
+  placeTrackLink(link, 0, 0.3, 1);
+  check('фаза действительно двигает звено вперёд', link.position.z > positions[0].z);
+  placeTrackLink(link, 0, 0, -1);
+  check('левая лента зеркальна правой', near(link.position.x, -positions[0].x));
 }
 
 // --- 6. Шейдеры собраны без опечаток в объявлениях ---

@@ -62,12 +62,15 @@ function runGame(mapId: number, difficulty: number, stance: number): Result {
       state: hero.state,
       hp: hero.hp,
       brain,
+      suppressed: room.tickCount < hero.suppressedUntil,
     };
     const input = think(self, {
       tick: room.tickCount,
       obstacles: room.obstacles,
       cover: room.cover,
+      bushes: room.bushes,
       tanks,
+      shells: room.liveShells,
       stance,
       // В тех же стенах: с чужим размером карты герой на большой карте не видел
       // бы ни одного выстрела — свип гасил бы луч о стену, которой там нет.

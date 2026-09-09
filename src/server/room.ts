@@ -25,17 +25,24 @@
   MAX_SHELLS,
   MAX_TIER,
   MODE_DM,
-  MODE_PVE,
+  MODE_EXPEDITION,
+  EXPEDITION_WAVES,
+  EXPEDITION_UPGRADE_COUNT,
+  EXPEDITION_UPGRADES,
+  expeditionPower,
+  isCoopMode,
   RAM_COOLDOWN_S,
   RELOAD_S,
   RESPAWN_S,
   SHELL_DAMAGE,
+  SHELL_RADIUS,
   TANK_RADIUS,
   TICK_HZ,
   WAVE_BREAK_S,
   WAVE_OPENING_BOTS,
   WAVE_OVER_S,
   WAVE_SPAWN_DELAY_S,
+  WRECK_HEIGHT,
   waveConcurrent,
   waveElite,
   waveQuota,
@@ -45,7 +52,7 @@
   type GameMode,
   type Ruleset,
 } from '../shared/constants.js';
-import { buildScene, coverBoxes, isMapId, spawnPoint } from '../shared/map.js';
+import { buildScene, bushBoxes, coverBoxes, isMapId, passableObstacles, spawnPoint } from '../shared/map.js';
 import type { RoomConfig, ServerMessage, WavePhase, WaveState } from '../shared/protocol.js';
 import {
   bounceShell,
@@ -55,6 +62,7 @@ import {
   spawnShell,
   stepShell,
   stepTank,
+  sweepCircle,
   sweepShell,
   sweepTank,
   type RamHit,
@@ -63,6 +71,7 @@ import {
   BOOM_GROUND,
   BOOM_HIT,
   BOOM_KILL,
+  BOOM_NEAR,
   BOOM_RICOCHET,
   TEAM_BOTS,
   TEAM_PLAYERS,
@@ -85,6 +94,21 @@ import { botName, botSpawn, createBrain, think, type BotBrain } from './bot.js';
 const RELOAD_TICKS = Math.round(RELOAD_S * TICK_HZ);
 const RESPAWN_TICKS = Math.round(RESPAWN_S * TICK_HZ);
 const RAM_COOLDOWN_TICKS = Math.round(RAM_COOLDOWN_S * TICK_HZ);
+
+/** Насколько дальше настоящего радиуса попадания снаряд ещё считается «прошёл рядом», м. */
+const NEAR_MISS_MARGIN = 2.2;
+/** Подавление после близкого разрыва (или уцелевшего попадания), с. */
+const SUPPRESS_S = 1.6;
+const SUPPRESS_TICKS = Math.round(SUPPRESS_S * TICK_HZ);
+
+/**
+ * Дальность слуха — доля половины стороны карты, зажатая в разумных пределах:
+ * на маленькой карте выстрел не должен быть слышен из другого её конца, на
+ * большой — не должен превращаться в отдельный, куда более узкий обзор.
+ */
+const HEARING_FRAC = 0.4;
+const HEARING_MIN = 25;
+const HEARING_MAX = 55;
 
 /**
  * На сколько отрезков максимум режется путь снаряда за тик. Каждый отскок начинает
@@ -115,8 +139,12 @@ export interface Player {
   readyAt: number;
   /** Тик, раньше которого этот танк не получает и не наносит урон тараном. */
   ramAt: number;
+  /** Тик, раньше которого танк подавлен — рука у бота дрожит сильнее (см. suppress). */
+  suppressedUntil: number;
   kills: number;
   deaths: number;
+  /** Монотонный счётчик реально принятых сервером выстрелов. */
+  shots: number;
   /** Очередь необработанных инпутов. */
   queue: Input[];
   /** seq последнего инпута, применённого сервером — клиент по нему делает реконсиляцию. */
@@ -154,6 +182,18 @@ export class Room {
   half: number = this.scene.half;
   /** Блоки, по которым свип ведёт снаряд. Пересобирается со сменой карты. */
   cover: Box[] = coverBoxes(this.obstacles);
+  /** Кусты карты — рвут обзор ИИ ботов (см. bot.ts, hasShot), на экран игрока не влияют. */
+  bushes: Box[] = bushBoxes(this.obstacles);
+  /** obstacles без кустов — по этому списку едет танк, кусты не мешают. */
+  private moveObstacles: Box[] = passableObstacles(this.obstacles);
+  /**
+   * То же самое, но раз в тик дополненное остовами подбитых танков (см.
+   * refreshWrecks): по ним и едут, и стреляют, и объезжают, а `obstacles`/
+   * `cover` выше остаются чистой геометрией карты — их читают сетевое
+   * сообщение `'map'` и скрипты проверки.
+   */
+  private liveObstacles: Box[] = this.moveObstacles;
+  private liveCover: Box[] = this.cover;
   readonly players = new Map<number, Player>();
 
   /** Индекс карты в MAPS. */
@@ -202,6 +242,10 @@ export class Room {
   private opening = 0;
   private best = 0;
   private botCounter = 0;
+  /** Усиления всей команды в текущем забеге экспедиции. */
+  private expeditionUpgrades: number[] = [];
+  private upgradeChoices: number[] = [];
+  private victory = false;
 
   /**
    * Живой список танков для ИИ. Именно объект, а не players.values(): итератор
@@ -239,7 +283,7 @@ export class Room {
       this.emitConfig();
     }
     // Волна уже идёт — новичок ждёт её конца, иначе он выпал бы в гущу боя.
-    if (this.mode === MODE_PVE && this.phase === 'fight') player.waiting = true;
+    if (isCoopMode(this.mode) && this.phase === 'fight') player.waiting = true;
     if (player.waiting) player.dead = true;
 
     return player;
@@ -266,8 +310,10 @@ export class Room {
       respawnAt: 0,
       readyAt: 0,
       ramAt: 0,
+      suppressedUntil: 0,
       kills: 0,
       deaths: 0,
+      shots: 0,
       queue: [],
       ack: 0,
       last: { seq: 0, throttle: 0, steer: 0, turret: spawn.angle },
@@ -320,8 +366,9 @@ export class Room {
     this.tick++;
     this.booms = [];
 
-    if (this.mode === MODE_PVE) this.updateWave();
+    if (isCoopMode(this.mode)) this.updateWave();
     if (this.bonusesOn) this.updateBonuses();
+    this.refreshWrecks();
 
     for (const player of this.players.values()) {
       if (player.brain) {
@@ -345,12 +392,15 @@ export class Room {
         }
         // Если новых инпутов нет — продолжаем с последним известным: танк не замирает
         // при потере пакета, а клиент предсказывает ровно то же самое.
-        // Подбитый танк не едет и не стреляет, что бы ни прислал клиент.
+        // Подбитый танк не едет и не стреляет, что бы ни прислал клиент. Ему
+        // самому список остовов не нужен — с нулевым газом это лишь риск
+        // упереться в собственный только что появившийся труп-препятствие;
+        // живым его видят остальные через liveObstacles.
         stepTank(
           player.state,
           player.dead ? frozen(player) : player.last,
           DT,
-          this.obstacles,
+          player.dead ? this.moveObstacles : this.liveObstacles,
           this.boost(player),
           this.half,
         );
@@ -372,7 +422,6 @@ export class Room {
         DT,
       ),
     );
-
     this.updateShells();
   }
 
@@ -416,6 +465,8 @@ export class Room {
 
   /** Шаг бота: думает сам, дальше едет и стреляет по общим правилам. */
   private stepBot(bot: Player): void {
+    // Труп не думает и не едет: иначе он рулил бы по инерции последнего инпута.
+    if (bot.dead) return;
     bot.last = think(
       {
         id: bot.id,
@@ -425,17 +476,20 @@ export class Room {
         state: bot.state,
         hp: bot.hp,
         brain: bot.brain!,
+        suppressed: this.tick < bot.suppressedUntil,
       },
       {
         tick: this.tick,
-        obstacles: this.obstacles,
-        cover: this.cover,
+        obstacles: this.liveObstacles,
+        cover: this.liveCover,
+        bushes: this.bushes,
         tanks: this.tanks,
+        shells: this.shells,
         stance: this.stance,
         half: this.half,
       },
     );
-    stepTank(bot.state, bot.last, DT, this.obstacles, 1, this.half);
+    stepTank(bot.state, bot.last, DT, this.liveObstacles, 1, this.half);
     if (bot.last.fire) {
       bot.last.fire = false;
       this.tryFire(bot);
@@ -445,15 +499,29 @@ export class Room {
   private tryFire(player: Player): void {
     if (this.tick < player.readyAt) return;
     const rush = player.fx[BONUS_RELOAD] > this.tick ? BONUS_RELOAD_MUL : 1;
-    player.readyAt = this.tick + Math.max(1, Math.round(RELOAD_TICKS * rush));
+    const expeditionReload = player.brain ? 1 : this.expeditionStats().reload;
+    player.readyAt = this.tick + Math.max(1, Math.round(RELOAD_TICKS * rush * expeditionReload));
 
     const shell = spawnShell(this.nextShellId++, player.id, player.state);
+    player.shots++;
     // Урон считаем здесь, а не при попадании: снаряд после выстрела живёт сам по себе.
-    const power = player.fx[BONUS_DAMAGE] > this.tick ? BONUS_DAMAGE_MUL : 1;
+    const power =
+      (player.fx[BONUS_DAMAGE] > this.tick ? BONUS_DAMAGE_MUL : 1) *
+      (player.brain ? 1 : this.expeditionStats().damage);
     shell.dmg = Math.round(SHELL_DAMAGE * power);
     this.shells.push(shell);
     // Переполнение возможно только при явном флуде — жертвуем самым старым снарядом.
     if (this.shells.length > MAX_SHELLS) this.shells.shift();
+
+    // Слух: выстрел рядом заметен и без визуального контакта — в отличие от
+    // hasShot(), тут нарочно нет проверки стен, звук идёт не по лучу зрения.
+    const hearing = clamp(this.half * HEARING_FRAC, HEARING_MIN, HEARING_MAX);
+    for (const bot of this.players.values()) {
+      if (!bot.brain || bot.dead) continue;
+      if (Math.hypot(bot.state.x - player.state.x, bot.state.z - player.state.z) <= hearing) {
+        this.notice(bot, player);
+      }
+    }
   }
 
 
@@ -468,6 +536,21 @@ export class Room {
   }
 
   /**
+   * Бот узнаёт, где враг, не видя его: попадание по себе или выстрел рядом —
+   * тем же механизмом «помню, где видел», что и при потере цели из виду (см.
+   * bot.ts think()). Не перебивает бота, который прямо сейчас реально видит
+   * цель — случайный выстрел издали от третьего не должен сдёргивать его с боя.
+   */
+  private notice(bot: Player, source: Player): void {
+    if (!bot.brain || bot.brain.engaged) return;
+    if (source.id === bot.id || source.team === bot.team || source.dead) return;
+    bot.brain.targetId = source.id;
+    bot.brain.lastX = source.state.x;
+    bot.brain.lastZ = source.state.z;
+    bot.brain.lastSeenAt = this.tick;
+  }
+
+  /**
    * Танк покидает комнату (бот погиб, человек отключился), а его снаряды ещё летят.
    * Запоминаем имя, чтобы попадание не досталось «Неизвестному»: выстрел был сделан
    * по правилам, и то, что стрелка уже нет, к его снаряду отношения не имеет.
@@ -479,13 +562,37 @@ export class Room {
   }
 
   /**
+   * Живая геометрия на этот тик: карта плюс остовы подбитых. Труп не убирают
+   * до возрождения — в PvE это конец волны, в DM короткий таймер респауна, —
+   * и всё это время он держит выстрел и перекрывает путь, как обычный блок.
+   * Квадрат TANK_RADIUS*2 — то же огрубление, которым уже пользуются объезд
+   * ботов и попадание по танку; ротацию по курсу Box не поддерживает.
+   */
+  private refreshWrecks(): void {
+    const wrecks: Box[] = [];
+    for (const p of this.players.values()) {
+      if (!p.dead) continue;
+      wrecks.push({
+        x: p.state.x,
+        z: p.state.z,
+        w: TANK_RADIUS * 2,
+        d: TANK_RADIUS * 2,
+        h: WRECK_HEIGHT,
+      });
+    }
+    this.liveObstacles = wrecks.length ? [...this.moveObstacles, ...wrecks] : this.moveObstacles;
+    // WRECK_HEIGHT ≥ SHELL_HEIGHT — труп сам себе укрытие, отдельный фильтр не нужен.
+    this.liveCover = wrecks.length ? [...this.cover, ...wrecks] : this.cover;
+  }
+
+  /**
    * Проводит снаряд через тик. Путь режется на отрезки: до ближайшего касания,
    * а после отскока — остаток тика заново. Возвращает true, если снаряд отжил своё.
    */
   private flyShell(shell: ShellState, dt: number): boolean {
     for (let segment = 0; segment < MAX_SEGMENTS; segment++) {
       // Именно cover: низкое укрытие снаряд проходит насквозь.
-      const wall = sweepShell(shell, dt, this.cover, this.half);
+      const wall = sweepShell(shell, dt, this.liveCover, this.half);
 
       // Танк на отрезке важнее стены за ним, поэтому ищем его только до касания.
       const victim = this.firstVictim(shell, dt, wall ? wall.t : 1);
@@ -493,6 +600,19 @@ export class Room {
         stepShell(shell, dt * victim.t);
         this.damage(victim.player, shell);
         return true;
+      }
+
+      const grazed = this.grazed(shell, dt, wall ? wall.t : 1);
+      if (grazed.length > 0) {
+        const shooter = this.players.get(shell.owner);
+        for (const near of grazed) {
+          this.suppress(near);
+          // Трассер прошёл рядом — заметно и без прямого попадания, даже если
+          // стрелявший был далеко и звук выстрела туда не долетел (см. tryFire).
+          if (shooter) this.notice(near, shooter);
+          // Взрыв рисуем у задетого танка, а не у снаряда — иначе тряхнёт не там, где реально свистнуло.
+          this.booms.push({ x: near.state.x, z: near.state.z, k: BOOM_NEAR, o: shell.owner });
+        }
       }
 
       if (!wall) {
@@ -537,6 +657,31 @@ export class Room {
     return best;
   }
 
+  /**
+   * Живые танки, мимо которых снаряд на этом отрезке прошёл близко, но не задел —
+   * тот же перебор, что firstVictim, увеличенным радиусом. Своего стрелка не считаю
+   * никогда (не пугаться собственного дула), даже на рикошете.
+   */
+  private grazed(shell: ShellState, dt: number, limit: number): Player[] {
+    const r = TANK_RADIUS + SHELL_RADIUS + NEAR_MISS_MARGIN;
+    const near: Player[] = [];
+    for (const target of this.players.values()) {
+      if (target.dead || target.id === shell.owner) continue;
+      const t = sweepCircle(shell, dt, target.state.x, target.state.z, r);
+      if (t === null || t > limit) continue;
+      // Настоящее попадание уже ушло бы отдельной веткой (firstVictim), сюда не заходя,
+      // но на отскоке снаряд мог зацепить кого-то ещё этим же отрезком — не дублируем.
+      if (sweepTank(shell, dt, target.state) !== null) continue;
+      near.push(target);
+    }
+    return near;
+  }
+
+  /** Близкий разрыв (или уцелевшее попадание) на время сбивает точность и трясёт камеру. */
+  private suppress(target: Player): void {
+    target.suppressedUntil = this.tick + SUPPRESS_TICKS;
+  }
+
   private damage(victim: Player, shell: ShellState): void {
     if (this.hurt(victim, shell.dmg ?? SHELL_DAMAGE, shell.owner)) return;
     this.boom(shell, BOOM_HIT);
@@ -565,7 +710,14 @@ export class Room {
     const killerName = name ?? killer?.name ?? this.ghosts.get(killerId) ?? 'Неизвестный';
 
     victim.hp -= amount;
-    if (victim.hp > 0) return false;
+    if (victim.hp > 0) {
+      // Выжил, но словил трассер: даже без визуального контакта бот понимает,
+      // с чьей стороны прилетело, и вправе пойти проверить.
+      if (killer) this.notice(victim, killer);
+      // Попадание рвёт не меньше, чем разрыв рядом — та же контузия.
+      this.suppress(victim);
+      return false;
+    }
 
     victim.hp = 0;
     victim.dead = true;
@@ -581,14 +733,9 @@ export class Room {
     if (killer && killer !== victim) killer.kills++;
     this.kills.push({ killer: killerName, victim: victim.name });
 
-    if (victim.brain) {
-      // Бот выбывает насовсем: волна кончится, когда карта опустеет. Пометка
-      // killed нужна клиенту: без неё он стёр бы танк тем же кадром, и вместо
-      // горящего остова бот просто исчезал бы — то же событие, что и выход из игры.
-      this.forget(victim);
-      this.players.delete(victim.id);
-      this.emit({ t: 'left', id: victim.id, killed: true });
-    } else if (this.mode === MODE_PVE) {
+    // Бот из комнаты не уходит: его остов остаётся на карте препятствием до
+    // конца волны (см. refreshWrecks), а из players его выметет clearBots.
+    if (!victim.brain && isCoopMode(this.mode)) {
       // Жизнь одна на волну — в строй вернёт только её зачистка.
       victim.waiting = true;
     }
@@ -614,7 +761,22 @@ export class Room {
 
   /** Множитель хода от бонуса «Ход»; клиент подставляет в предсказание то же число. */
   private boost(player: Player): number {
-    return player.fx[BONUS_SPEED] > this.tick ? BONUS_SPEED_MUL : 1;
+    const bonus = player.fx[BONUS_SPEED] > this.tick ? BONUS_SPEED_MUL : 1;
+    return bonus * (player.brain || this.mode !== MODE_EXPEDITION ? 1 : this.expeditionStats().speed);
+  }
+
+  private expeditionStats(): { speed: number; damage: number; reload: number } {
+    let speed = expeditionPower(this.wave);
+    let damage = 1;
+    let reload = 1;
+    for (const id of this.expeditionUpgrades) {
+      const upgrade = EXPEDITION_UPGRADES[id];
+      if (!upgrade) continue;
+      speed *= upgrade.speed;
+      damage *= upgrade.damage;
+      reload *= upgrade.reload;
+    }
+    return { speed, damage, reload };
   }
 
   private updateBonuses(): void {
@@ -749,6 +911,8 @@ export class Room {
       this.obstacles = this.scene.obstacles;
       this.half = this.scene.half;
       this.cover = coverBoxes(this.obstacles);
+      this.bushes = bushBoxes(this.obstacles);
+      this.moveObstacles = passableObstacles(this.obstacles);
       // Геометрию клиент не строит сам — шлём её раньше рестарта, чтобы к первому
       // же снапшоту нового мира у него была правильная карта.
       this.emit({ t: 'map', id: this.mapId, half: this.half, obstacles: this.obstacles });
@@ -775,6 +939,9 @@ export class Room {
     this.shells.length = 0;
     this.resetScores();
     this.wave = 0;
+    this.expeditionUpgrades = [];
+    this.upgradeChoices = [];
+    this.victory = false;
     this.runDifficulty = this.difficulty;
     this.phase = 'break';
     this.phaseUntil = this.tick;
@@ -797,8 +964,16 @@ export class Room {
         this.clearBots();
         this.wave = 0;
         this.phase = 'break';
+        this.expeditionUpgrades = [];
+        this.upgradeChoices = [];
+        this.victory = false;
       }
       this.phaseUntil = this.tick;
+      return;
+    }
+
+    if (this.phase === 'upgrade') {
+      if (this.tick >= this.phaseUntil) this.chooseUpgrade(this.upgradeChoices[0]);
       return;
     }
 
@@ -825,7 +1000,10 @@ export class Room {
   }
 
   private startWave(wave: number): void {
-    if (wave === 1) this.resetScores();
+    if (wave === 1) {
+      this.resetScores();
+      this.victory = false;
+    }
     // Выбор хоста вступает в силу здесь — ровно на границе волн.
     const tookEffect = this.runDifficulty !== this.difficulty;
     this.runDifficulty = this.difficulty;
@@ -850,17 +1028,61 @@ export class Room {
 
   private endWave(): void {
     this.best = Math.max(this.best, this.wave);
-    this.phase = 'break';
-    this.phaseUntil = this.tick + Math.round(WAVE_BREAK_S * TICK_HZ);
+    // Волна зачищена — трупам ботов пора освободить поле для следующей.
+    this.clearBots();
+    if (this.mode === MODE_EXPEDITION) {
+      if (this.wave >= EXPEDITION_WAVES) {
+        this.victory = true;
+        this.phase = 'over';
+        this.phaseUntil = this.tick + Math.round(WAVE_OVER_S * TICK_HZ);
+        this.emitWave();
+        return;
+      }
+      this.upgradeChoices = this.makeUpgradeChoices(this.wave);
+      this.phase = 'upgrade';
+      this.phaseUntil = this.tick + Math.round(18 * TICK_HZ);
+    } else {
+      this.phase = 'break';
+      this.phaseUntil = this.tick + Math.round(WAVE_BREAK_S * TICK_HZ);
+    }
     this.emitWave();
   }
 
   private gameOver(): void {
     this.best = Math.max(this.best, this.wave);
     this.clearBots();
+    this.upgradeChoices = [];
     this.phase = 'over';
+    this.victory = false;
     this.phaseUntil = this.tick + Math.round(WAVE_OVER_S * TICK_HZ);
     this.emitWave();
+  }
+
+  private makeUpgradeChoices(wave: number): number[] {
+    const start = (wave - 1) % EXPEDITION_UPGRADES.length;
+    const choices: number[] = [];
+    for (let i = 0; i < EXPEDITION_UPGRADE_COUNT; i++) {
+      choices.push((start + i) % EXPEDITION_UPGRADES.length);
+    }
+    return choices;
+  }
+
+  /** Первый валидный выбор команды фиксирует улучшение для всей экспедиции. */
+  chooseUpgrade(id: number): boolean {
+    if (this.mode !== MODE_EXPEDITION || this.phase !== 'upgrade') return false;
+    if (!this.upgradeChoices.includes(id)) return false;
+    this.expeditionUpgrades.push(id);
+    this.upgradeChoices = [];
+    for (const player of this.players.values()) {
+      if (player.brain) continue;
+      player.waiting = false;
+      if (player.dead) this.respawn(player);
+      player.hp = MAX_HP;
+    }
+    this.phase = 'break';
+    this.phaseUntil = this.tick + Math.round(2 * TICK_HZ);
+    this.emitWave();
+    return true;
   }
 
   /** Волна выпускается по одному: сразу всей толпой она задавила бы числом. */
@@ -891,6 +1113,9 @@ export class Room {
   private clearBots(): void {
     for (const [id, player] of this.players) {
       if (!player.brain) continue;
+      // Настоящий уход из комнаты — здесь, а не в момент гибели: снаряды
+      // мёртвого бота могли долететь, пока труп лежал на карте.
+      this.forget(player);
       this.players.delete(id);
       this.emit({ t: 'left', id });
     }
@@ -916,12 +1141,21 @@ export class Room {
   }
 
   waveState(): WaveState {
+    const expedition = this.mode === MODE_EXPEDITION;
     return {
       wave: this.wave,
       phase: this.phase,
       left: this.quotaLeft + this.botCount,
       until: this.phase === 'fight' ? 0 : Math.max(0, (this.phaseUntil - this.tick) / TICK_HZ),
       best: this.best,
+      ...(expedition
+        ? {
+            power: expeditionPower(this.wave),
+            upgrades: [...this.expeditionUpgrades],
+            choices: this.upgradeChoices.map((id) => EXPEDITION_UPGRADES[id]),
+            victory: this.victory,
+          }
+        : {}),
     };
   }
 
@@ -941,7 +1175,7 @@ export class Room {
       rules: this.rules,
       difficulty: this.difficulty,
       // Что реально в силе прямо сейчас: в бою это может отставать от выбора хоста.
-      active: this.mode === MODE_PVE && this.phase === 'fight' ? this.runDifficulty : this.difficulty,
+      active: isCoopMode(this.mode) && this.phase === 'fight' ? this.runDifficulty : this.difficulty,
       stance: this.stance,
       bonuses: this.bonusesOn,
       hostId: this.hostId,
@@ -955,9 +1189,10 @@ export class Room {
     return n;
   }
 
+  /** Ботов ещё в строю — трупы (см. refreshWrecks) в счёт не идут. */
   get botCount(): number {
     let n = 0;
-    for (const player of this.players.values()) if (player.brain) n++;
+    for (const player of this.players.values()) if (player.brain && !player.dead) n++;
     return n;
   }
 
@@ -977,6 +1212,9 @@ export class Room {
         d: p.dead ? 1 : 0,
         // Поле есть только у тех, у кого эффект реально висит — экономия трафика.
         ...(mask === 0 ? {} : { f: mask }),
+        // Счётчик нужен клиенту, чтобы отдача и вспышка означали именно
+        // подтверждённый сервером выстрел, а не ранний запрос во время отката.
+        q: p.shots,
       });
     }
     return entries;
@@ -1008,6 +1246,11 @@ export class Room {
 
   get shellCount(): number {
     return this.shells.length;
+  }
+
+  /** Летящие снаряды как есть — для стендов, которые сами водят think() (bench-pve.ts). */
+  get liveShells(): readonly ShellState[] {
+    return this.shells;
   }
 
   /** Сколько имён ушедших стрелков держим ради их снарядов. Для проверок. */

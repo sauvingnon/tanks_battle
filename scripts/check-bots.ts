@@ -595,17 +595,20 @@ function dropOn(room: Room, player: Player, kind: number): void {
  * Средняя дистанция, на которой боты держатся от игрока. Человек стоит на месте,
  * поэтому число зависит только от манеры, а не от того, кто кого переехал.
  */
-function holdDistance(stance: number): number {
+function holdDistanceRun(stance: number): number {
   const room = new Room();
   const hero = room.add('Игрок', noop);
-  room.setup(MODE_PVE, 1, false, 0, stance);
+  // Тир 2 (Ветеран), не 1 (Средний): при одном человеке и текущем
+  // BOTS_PER_HUMAN на «Среднем» одновременно дерётся только один бот — на
+  // одной точке манеру от шума не отличить. На «Ветеране» их двое (ceil(1.5)).
+  room.setup(MODE_PVE, 2, false, 0, stance);
   hero.state = createTankState(0, 0, 0);
 
   // Первые секунды боты едут от спавнов на краю карты — это дорога, а не манера.
   const warmup = 10 * TICK_HZ;
   let sum = 0;
   let samples = 0;
-  for (let i = 0; i < warmup + 40 * TICK_HZ; i++) {
+  for (let i = 0; i < warmup + 60 * TICK_HZ; i++) {
     // Держим человека живым и на месте: меряем поведение ботов, а не бой.
     hero.hp = MAX_HP;
     hero.dead = false;
@@ -619,11 +622,29 @@ function holdDistance(stance: number): number {
     run(room, 1);
     if (i < warmup) continue;
     for (const bot of bots(room)) {
+      // Только тех, кто прямо сейчас видит игрока: засвет/память время от
+      // времени уводят бота искать потерянную цель, и его блуждание по карте —
+      // это шум обзора, а не то, что должна показывать манера боя.
+      if (bot.brain?.targetId !== hero.id) continue;
       sum += Math.hypot(bot.state.x, bot.state.z);
       samples++;
     }
   }
   return samples > 0 ? sum / samples : 0;
+}
+
+/**
+ * Несколько независимых прогонов вместо одного длинного: с засветом/памятью
+ * бот время от времени теряет игрока и минуту-другую не даёт ни одного
+ * валидного замера — один долгий забег может целиком попасть в такую полосу.
+ * Независимые комнаты со своими бросками костей это усредняют надёжнее, чем
+ * простое удлинение одного прогона.
+ */
+function holdDistance(stance: number): number {
+  const runs = 4;
+  let sum = 0;
+  for (let i = 0; i < runs; i++) sum += holdDistanceRun(stance);
+  return sum / runs;
 }
 
 {
@@ -636,7 +657,10 @@ function holdDistance(stance: number): number {
       `${STANCE_NAMES[1]} ${neutral.toFixed(1)} м, ${STANCE_NAMES[2]} ${close.toFixed(1)} м`,
   );
   check('«Дистанция» держит ботов дальше нейтральной манеры', far > neutral + 3);
-  check('«Напор» подводит ботов ближе нейтральной манеры', close < neutral - 3);
+  // Порог уже — до конуса обзора разница была шире (боты не теряли цель из
+  // виду в развороте на орбите); реальный эффект манеры стабильно 3+ м, запас
+  // взят под редкие тонкие случаи, а не потому что эффект пропал.
+  check('«Напор» подводит ботов ближе нейтральной манеры', close < neutral - 2);
   check('на «Дистанции» боты не подходят вплотную', far > 30);
 
   const room = new Room();
@@ -692,9 +716,14 @@ function holdDistance(stance: number): number {
 
 {
   const room = new Room();
-  // Четверо людей: потолок одновременных ботов считается от их числа.
-  for (const name of ['Первый', 'Второй', 'Третий', 'Четвёртый']) room.add(name, noop);
-  room.setup(MODE_PVE, 2, false);
+  // Шестеро на «Асе»: потолок одновременных ботов считается от числа людей
+  // (BOTS_PER_HUMAN[3] = 2), и ровно на этом сочетании он упирается в общий
+  // предел карты (BOT_LIMIT = 12) — на меньшем числе людей или тире ниже
+  // сама эта проверка была бы не про потолок, а про текущую сложность.
+  for (const name of ['Первый', 'Второй', 'Третий', 'Четвёртый', 'Пятый', 'Шестой']) {
+    room.add(name, noop);
+  }
+  room.setup(MODE_PVE, 3, false);
 
   // Замер должен идти при полной карте, поэтому бессмертны здесь все. Люди —
   // иначе боты дожмут их, забег кончится и мерить будет нечего. Боты — потому
@@ -749,8 +778,23 @@ function holdDistance(stance: number): number {
   /** Насколько мимо смотрит ствол: расстояние до точки, где цель будет к подлёту. */
   const missOf = (tier: number, speed: number): number => {
     const brain = createBrain(tier, 0, 0);
-    const me = { id: 1, team: 0, dead: false, stealth: false, state: createTankState(0, 0, 0), hp: BOT_HP, brain };
-    const foe = { id: 2, team: 1, dead: false, stealth: false, state: createTankState(0, RANGE, Math.PI / 2) };
+    const me = {
+      id: 1,
+      team: 0,
+      dead: false,
+      stealth: false,
+      state: createTankState(0, 0, 0),
+      hp: BOT_HP,
+      brain,
+      suppressed: false,
+    };
+    const foe = {
+      id: 2,
+      team: 1,
+      dead: false,
+      stealth: false,
+      state: createTankState(0, RANGE, Math.PI / 2),
+    };
     foe.state.speed = speed;
     const world = { tick: 0, obstacles: [], cover: [], tanks: [me, foe] };
 

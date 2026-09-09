@@ -313,15 +313,15 @@ function slab(
 }
 
 /**
- * Доля шага до попадания в танк, или null. Танк — круг, снаряд — точка с радиусом,
- * то есть это пересечение отрезка с окружностью суммарного радиуса.
+ * Доля шага до пересечения отрезка (снаряда) с окружностью радиуса r вокруг
+ * (cx, cz), или null. Общая математика для попадания (sweepTank, r = танк +
+ * снаряд) и для «прошёл рядом, но не задел» (см. room.ts) с увеличенным r.
  */
-export function sweepTank(shell: ShellState, dt: number, tank: TankState): number | null {
+export function sweepCircle(shell: ShellState, dt: number, cx: number, cz: number, r: number): number | null {
   const dx = shell.vx * dt;
   const dz = shell.vz * dt;
-  const px = shell.x - tank.x;
-  const pz = shell.z - tank.z;
-  const r = TANK_RADIUS + SHELL_RADIUS;
+  const px = shell.x - cx;
+  const pz = shell.z - cz;
 
   const a = dx * dx + dz * dz;
   if (a < 1e-12) return null;
@@ -338,6 +338,11 @@ export function sweepTank(shell: ShellState, dt: number, tank: TankState): numbe
   if (till < 0 || from > 1) return null;
   from = Math.max(from, 0);
   return from;
+}
+
+/** Доля шага до попадания в танк, или null. Танк — круг, снаряд — точка с радиусом. */
+export function sweepTank(shell: ShellState, dt: number, tank: TankState): number | null {
+  return sweepCircle(shell, dt, tank.x, tank.z, TANK_RADIUS + SHELL_RADIUS);
 }
 
 /** Достаточно ли полого снаряд задел грань, чтобы отскочить, а не взорваться. */

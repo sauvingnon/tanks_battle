@@ -1,4 +1,4 @@
-import { MAP_HALF, SHELL_HEIGHT } from './constants.js';
+import { MAP_HALF, SHELL_HEIGHT, TANK_RADIUS } from './constants.js';
 import type { Box } from './types.js';
 
 /**
@@ -570,6 +570,72 @@ export function spawnPoint(index: number, id = 0): { x: number; z: number; angle
  */
 export function coverBoxes(obstacles: Box[]): Box[] {
   return obstacles.filter((box) => box.h >= SHELL_HEIGHT);
+}
+
+/**
+ * Диаметр танка 4.8 м (TANK_RADIUS*2) плюс запас — иначе он физически не
+ * влезет в блок целиком, что бы мы ни включили. Низких блоков тоньше/уже
+ * этого порога (парапеты траншей, ряды контейнеров депо) кустами не считаем:
+ * они остаются как раньше — непроходимой низкой стеной, не держащей снаряд.
+ */
+const BUSH_MIN_SIZE = 6;
+
+/** Единый критерий куста для физики, ботов и клиентского рендера. */
+export function isBush(box: Box): boolean {
+  return box.h < SHELL_HEIGHT && box.w >= BUSH_MIN_SIZE && box.d >= BUSH_MIN_SIZE;
+}
+
+/** Кусты карты — низкие блоки, в которые танк способен заехать целиком и спрятаться. */
+export function bushBoxes(obstacles: Box[]): Box[] {
+  return obstacles.filter(isBush);
+}
+
+/** Тот же список препятствий, но без кустов — по нему едет танк: кусты не мешают. */
+export function passableObstacles(obstacles: Box[]): Box[] {
+  return obstacles.filter((box) => !isBush(box));
+}
+
+/**
+ * Индекс куста (в том же порядке, что и bushBoxes), внутри объёма которого
+ * физически находится точка (x, z), иначе -1. Только для клиентского рендера
+ * (см. Scene3D.setActiveBush): решает, какой именно куст сейчас облепляет
+ * камеру от первого лица изнутри — на видимость для ботов это не влияет
+ * вовсе (там своя, более широкая проверка — bushBlockers).
+ */
+export function bushIndexAt(bushes: Box[], x: number, z: number): number {
+  return bushes.findIndex((b) => Math.abs(x - b.x) <= b.w / 2 && Math.abs(z - b.z) <= b.d / 2);
+}
+
+/**
+ * Насколько нужно подойти к кусту вплотную, чтобы его листва перестала
+ * слепить (см. bushBlockers) — не только «уже в нём», но и «зацепил хоть
+ * одной гранью корпуса» или «прижался почти вплотную»: TANK_RADIUS покрывает
+ * первое (край круга танка уже внутри прямоугольника), а запас сверху —
+ * второе, вплотную снаружи.
+ */
+const BUSH_PROXIMITY = TANK_RADIUS * 2;
+
+/**
+ * Кусты-блокираторы обзора для смотрящего, который сейчас стоит в точке
+ * (x, z): все кусты карты, кроме тех, что рядом — ближе BUSH_PROXIMITY до
+ * границы прямоугольника (внутрь тоже считается, там расстояние 0). Не
+ * строгое «внутри» — иначе танк, заехавший в куст только краем корпуса или
+ * просто прижавшийся к нему вплотную, слепил бы сам себя собственной
+ * листвой: формально не «в кусте», но луч из его же текущей позиции всё
+ * равно проходил бы через тот самый куст. Из своего куста и вплотную к нему
+ * наружу видно нормально: маскировка не должна слепить того, кто в ней (или
+ * прямо у неё) сидит.
+ *
+ * Только для ИИ ботов (см. bot.ts, hasShot) — на экран игрока кусты не
+ * влияют, человек всегда видит то же, что видел бы без них.
+ */
+export function bushBlockers(bushes: Box[], x: number, z: number): Box[] {
+  if (bushes.length === 0) return bushes;
+  return bushes.filter((b) => {
+    const dx = Math.max(0, Math.abs(x - b.x) - b.w / 2);
+    const dz = Math.max(0, Math.abs(z - b.z) - b.d / 2);
+    return Math.hypot(dx, dz) > BUSH_PROXIMITY;
+  });
 }
 
 export function spawnCount(id = 0): number {

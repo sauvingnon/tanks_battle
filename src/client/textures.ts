@@ -167,14 +167,99 @@ export function armorTexture(renderer: THREE.WebGLRenderer): THREE.CanvasTexture
 }
 
 /**
+ * Фасад небольшого дома: штукатурка с редкими горизонтальными швами облицовки.
+ * Окна не рисуются в текстуре — у каждого дома они уже стоят геометрией в
+ * правильном масштабе. Иначе повторяющиеся крошечные окна превращали дом с
+ * одной входной дверью в странную многоэтажку.
+ */
+export function houseWallTexture(renderer: THREE.WebGLRenderer): THREE.CanvasTexture {
+  const canvas = noiseCanvas(0x1a2b3c, 3, 0.9, 0.2, (ctx) => {
+    // Неглубокие ряды облицовки: текстура даёт материал стены, а не архитектуру.
+    ctx.strokeStyle = 'rgba(62, 49, 35, 0.18)';
+    ctx.lineWidth = 2;
+    const course = 38;
+    for (let y = 0; y < SIZE; y += course) {
+      ctx.beginPath();
+      ctx.moveTo(0, y + 0.5);
+      ctx.lineTo(SIZE, y + 0.5);
+      ctx.stroke();
+    }
+    // Короткие сдвинутые швы убирают ощущение бесконечных досок и при этом
+    // не складываются в сетку окон при повторе текстуры.
+    ctx.strokeStyle = 'rgba(62, 49, 35, 0.1)';
+    ctx.lineWidth = 1;
+    for (let row = 0; row < Math.ceil(SIZE / course); row++) {
+      const y = row * course;
+      const offset = row % 2 === 0 ? 22 : 58;
+      for (let x = offset; x < SIZE; x += 72) {
+        ctx.beginPath();
+        ctx.moveTo(x + 0.5, y + 2);
+        ctx.lineTo(x + 0.5, y + course - 2);
+        ctx.stroke();
+      }
+    }
+  });
+  return toTexture(canvas, renderer);
+}
+
+/** Доски ящика: вертикальные пазы и редкие сучки. */
+export function crateTexture(renderer: THREE.WebGLRenderer): THREE.CanvasTexture {
+  const canvas = noiseCanvas(0xfeed5, 3, 0.82, 0.28, (ctx, random) => {
+    const planks = 5;
+    ctx.strokeStyle = 'rgba(0, 0, 0, 0.22)';
+    ctx.lineWidth = 2;
+    for (let i = 1; i < planks; i++) {
+      const x = (SIZE / planks) * i;
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, SIZE);
+      ctx.stroke();
+    }
+    ctx.strokeStyle = 'rgba(0, 0, 0, 0.3)';
+    for (let i = 0; i < 6; i++) {
+      const x = random() * SIZE;
+      const y = random() * SIZE;
+      const r = 3 + random() * 4;
+      ctx.beginPath();
+      ctx.ellipse(x, y, r, r * 1.6, 0, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+  });
+  return toTexture(canvas, renderer);
+}
+
+/**
+ * Низкое укрытие — куст: поверх мелкой органической крупы разбросаны тёмные и
+ * светлые пятна-листья вперемешку, чтобы на глаз это читалось как заросли, а
+ * не просто перекрашенная плита. Высота блока (h < SHELL_HEIGHT) по-прежнему
+ * единственное, что решает «сквозь это простреливается» — цвет тут не сигнал.
+ */
+export function scrubTexture(renderer: THREE.WebGLRenderer): THREE.CanvasTexture {
+  const canvas = noiseCanvas(0x5eaf00d, 5, 0.82, 0.5, (ctx, random) => {
+    for (let i = 0; i < 90; i++) {
+      const x = random() * SIZE;
+      const y = random() * SIZE;
+      const r = 5 + random() * 10;
+      ctx.fillStyle = `rgba(${random() > 0.5 ? '20,30,10' : '210,220,150'}, ${0.1 + random() * 0.16})`;
+      ctx.beginPath();
+      ctx.ellipse(x, y, r, r * (0.6 + random() * 0.5), random() * Math.PI, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  });
+  return toTexture(canvas, renderer);
+}
+
+/**
  * Растягивает UV коробки так, чтобы клетка текстуры была `tile` метров на любой
  * грани. Без этого одна и та же текстура на блоке 4×4 и на стене 140×2 выглядит
  * то крупой, то размазанным пятном: у BoxGeometry все шесть граней размечены
  * от нуля до единицы независимо от того, сколько в них метров.
  *
- * Порядок граней в BoxGeometry: +X, -X, +Y, -Y, +Z, -Z, по четыре вершины.
+ * Порядок граней в BoxGeometry и RoundedBoxGeometry: +X, -X, +Y, -Y, +Z, -Z.
  * У боковых граней в развёртке лежат (глубина, высота), у крышек — (ширина,
- * глубина), у передней и задней — (ширина, высота).
+ * глубина), у передней и задней — (ширина, высота). RoundedBoxGeometry дробит
+ * каждую грань на большее число вершин, поэтому размер грани вычисляем по
+ * атрибуту, а не зашиваем четыре вершины.
  */
 export function scaleBoxUv(
   geometry: THREE.BufferGeometry,
@@ -185,6 +270,7 @@ export function scaleBoxUv(
 ): void {
   const uv = geometry.getAttribute('uv');
   if (!uv) return;
+  if (uv.count % 6 !== 0) return;
 
   const spans: Array<[number, number]> = [
     [depth, height], // +X
@@ -195,10 +281,11 @@ export function scaleBoxUv(
     [width, height], // -Z
   ];
 
+  const verticesPerFace = uv.count / 6;
   for (let face = 0; face < 6; face++) {
     const [su, sv] = spans[face];
-    for (let i = 0; i < 4; i++) {
-      const at = face * 4 + i;
+    for (let i = 0; i < verticesPerFace; i++) {
+      const at = face * verticesPerFace + i;
       uv.setXY(at, uv.getX(at) * (su / tile), uv.getY(at) * (sv / tile));
     }
   }

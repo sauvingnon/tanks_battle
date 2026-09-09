@@ -420,6 +420,95 @@ body {
   color: #ff9c8b;
 }
 
+/* --- Экспедиция: выбор улучшения --- */
+
+#expedition {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgba(8, 12, 18, 0.48);
+  pointer-events: auto;
+}
+
+.expedition-card-shell {
+  width: min(680px, 100%);
+  padding: 22px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--panel);
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.32);
+  text-align: center;
+}
+
+.expedition-card-shell > b,
+.expedition-card-shell > span {
+  display: block;
+}
+
+.expedition-card-shell > b {
+  font-size: 22px;
+}
+
+.expedition-card-shell > span {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+#expedition-stats {
+  margin-top: 12px;
+  color: var(--accent);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+#expedition-cards {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  margin-top: 18px;
+}
+
+.expedition-card {
+  display: flex;
+  min-height: 108px;
+  flex-direction: column;
+  gap: 8px;
+  justify-content: center;
+  padding: 14px 10px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+}
+
+.expedition-card:hover,
+.expedition-card:focus-visible {
+  border-color: var(--accent);
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.expedition-card span {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+@media (max-width: 620px) {
+  #expedition-cards {
+    grid-template-columns: 1fr;
+  }
+
+  .expedition-card {
+    min-height: 0;
+    text-align: center;
+  }
+}
+
 /* --- Настройки боя --- */
 
 #setup-toggle {

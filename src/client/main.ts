@@ -20,7 +20,10 @@ import {
   STANCE_NAMES,
   STANCE_NEUTRAL,
   MODE_DM,
+  MODE_EXPEDITION,
   MODE_PVE,
+  EXPEDITION_UPGRADES,
+  expeditionPower,
   MAP_HALF,
   MUZZLE_OFFSET,
   RELOAD_S,
@@ -31,13 +34,14 @@ import {
   type GameMode,
   type Ruleset,
 } from '../shared/constants.js';
-import { coverBoxes, MAP_NAMES } from '../shared/map.js';
+import { bushBoxes, bushIndexAt, coverBoxes, passableObstacles, MAP_NAMES } from '../shared/map.js';
 import { clamp, lerpAngle, sweepShell } from '../shared/sim.js';
 import type { RoomConfig, ServerMessage, WaveState } from '../shared/protocol.js';
 import {
   BOOM_GROUND,
   BOOM_HIT,
   BOOM_KILL,
+  BOOM_NEAR,
   BOOM_RICOCHET,
   type Boom,
   type BoomKind,
@@ -52,7 +56,7 @@ import {
 import { Controls } from './controls.js';
 import { Net } from './net.js';
 import { SelfPrediction } from './prediction.js';
-import { BONUS_COLORS, Scene3D } from './render.js';
+import { BONUS_COLORS, Scene3D, TRACER_LENGTH } from './render.js';
 
 const el = <T extends HTMLElement>(id: string): T => {
   const node = document.getElementById(id);
@@ -93,6 +97,8 @@ const players = new Map<number, PlayerInfo>();
 const self = new SelfPrediction();
 /** Блоки, которые держат снаряд: нужны метке прицела. Пересобираются со сменой карты. */
 let cover: Box[] = [];
+/** Кусты карты — только чтобы просветлить листву вокруг камеры от первого лица (см. drawSelf), больше ни на что на клиенте не влияют. */
+let bushes: Box[] = [];
 /** Половина стороны текущей карты, м: метка прицела упирается в ту же стену, что снаряд. */
 let mapHalf = MAP_HALF;
 
@@ -105,18 +111,36 @@ interface BufferedSnapshot {
 /** Снапшоты храним, чтобы рисовать чужие танки с задержкой и интерполяцией. */
 const snapshots: BufferedSnapshot[] = [];
 
+interface InterpFrame {
+  from: BufferedSnapshot;
+  to: BufferedSnapshot;
+  t: number;
+}
+
+/**
+ * Пара соседних снапшотов вокруг renderTime плюс доля между ними. Общий шаг
+ * для отрисовки чужих танков и для выбора точки, куда смотрит камера-наблюдатель
+ * (drawSelf), — обоим нужен один и тот же момент интерполяции.
+ */
+function interpFrame(renderTime: number): InterpFrame | null {
+  while (snapshots.length > 2 && snapshots[1].time <= renderTime) snapshots.shift();
+  if (snapshots.length === 0) return null;
+
+  let index = snapshots.length - 1;
+  while (index > 0 && snapshots[index].time > renderTime) index--;
+
+  const from = snapshots[index];
+  const to = snapshots[index + 1] ?? from;
+  const span = to.time - from.time;
+  const t = span > 1e-3 ? clamp((renderTime - from.time) / span, 0, 1) : 1;
+  return { from, to, t };
+}
+
 /**
  * Взрывы ждут своей очереди столько же, сколько чужие танки: иначе вспышка
  * появлялась бы на 100 мс раньше, чем танк доедет до места попадания.
  */
 const pendingBooms: Array<{ at: number; boom: Boom }> = [];
-
-/**
- * Подбитые, которых сервер уже удалил из комнаты. Ждут той же задержки, что и
- * взрывы: сообщение о гибели приходит на 100 мс раньше, чем картинка мира до
- * этого момента доедет, и без очереди бот загорался бы до попадания по нему.
- */
-const pendingWrecks: Array<{ at: number; id: number }> = [];
 
 /** id снарядов, которые мы уже видели: по новым рисуем вспышку выстрела. */
 const knownShells = new Set<number>();
@@ -131,16 +155,30 @@ const BOOM_SHAKE: Record<BoomKind, number> = {
   [BOOM_HIT]: 0.45,
   [BOOM_KILL]: 0.75,
   [BOOM_RICOCHET]: 0.11,
+  // Мимо, но чувствительно — заметно сильнее рикошета, но без урона это не попадание.
+  [BOOM_NEAR]: 0.32,
 };
 /** Дальше этого взрыв уже не чувствуется, м. */
 const SHAKE_RANGE = 26;
 /** Отдача собственной пушки. Заметна, но целиться не мешает. */
 const SELF_SHOT_SHAKE = 0.42;
 
-/** Своя перезарядка считается локально — она нужна только для полоски в HUD. */
+/** Локальное окно отката: сервер всё равно остаётся источником истины. */
 let reloadUntil = 0;
 /** Длина текущего отката, мс: с бонусом «Заряжание» он короче. */
 let reloadSpan = RELOAD_S * 1000;
+/** Пока запрос огня не подтверждён снапшотом, новый не отправляем. */
+let firePending = false;
+/**
+ * Снапшот с подтверждённым q обычно приходит за один-два тика. Таймаут нужен
+ * только как страховка: сервер мог отклонить запрос на самой границе отката,
+ * и без него клиент навсегда считал бы, что всё ещё ждёт подтверждения.
+ */
+const FIRE_ACK_TIMEOUT_MS = 550;
+let firePendingUntil = 0;
+/** Счётчик выстрелов, реально принятых сервером. */
+let myShotCount = 0;
+let shotCountReady = false;
 let myHp = MAX_HP;
 let myDead = false;
 let respawnAt = 0;
@@ -181,6 +219,7 @@ const STANCE_HINTS = [
 const MODE_NAMES: Record<GameMode, string> = {
   [MODE_DM]: 'Все против всех',
   [MODE_PVE]: 'Против ботов',
+  [MODE_EXPEDITION]: 'Экспедиция',
 };
 
 const RULES_NAMES: Record<Ruleset, string> = {
@@ -205,6 +244,7 @@ let myEffects = 0;
  */
 const effectUntil = new Array<number>(BONUS_KINDS).fill(0);
 let wave: WaveState = { wave: 0, phase: 'break', left: 0, until: 0, best: 0 };
+let expeditionBasePower = 1;
 /** Момент, когда кончится передышка или экран итогов: сервер прислал остаток в секундах. */
 let waveUntilAt = 0;
 /** До какого момента висит плашка «Волна N»; в паузах она держится сама. */
@@ -225,12 +265,13 @@ function handleMessage(msg: ServerMessage): void {
   switch (msg.t) {
     case 'welcome': {
       selfId = msg.id;
-      self.obstacles = msg.map.obstacles;
+      self.obstacles = passableObstacles(msg.map.obstacles);
       self.half = msg.map.half;
       mapHalf = msg.map.half;
       cover = coverBoxes(msg.map.obstacles);
+      bushes = bushBoxes(msg.map.obstacles);
       if (!worldBuilt) {
-        scene.buildWorld(msg.map.half, msg.map.obstacles);
+        scene.buildWorld(msg.map.half, msg.map.obstacles, msg.mapId);
         worldBuilt = true;
       }
       for (const info of msg.players) addPlayer(info);
@@ -242,22 +283,22 @@ function handleMessage(msg: ServerMessage): void {
     case 'map':
       // Карту строит сервер, клиент только пересобирает по ней сцену и свои
       // препятствия для предсказания.
-      self.obstacles = msg.obstacles;
+      self.obstacles = passableObstacles(msg.obstacles);
       self.half = msg.half;
       mapHalf = msg.half;
       cover = coverBoxes(msg.obstacles);
-      scene.buildWorld(msg.half, msg.obstacles);
+      bushes = bushBoxes(msg.obstacles);
+      scene.buildWorld(msg.half, msg.obstacles, msg.id);
       worldBuilt = true;
       break;
     case 'joined':
       addPlayer(msg.player);
       break;
     case 'left':
+      // Настоящий уход: гибель как таковая сюда не попадает (см. protocol.ts) —
+      // остов уже отыграл своё через обычный dead-флаг снапшота, тут только уборка.
       players.delete(msg.id);
-      // Подбитый уходит со сцены не сразу: он ещё должен догореть, и попасть в
-      // тот же момент, что и его взрыв, — иначе остов вспыхивает раньше выстрела.
-      if (msg.killed) pendingWrecks.push({ at: performance.now() + INTERP_DELAY_MS, id: msg.id });
-      else scene.removeTank(msg.id);
+      scene.removeTank(msg.id);
       updateHud();
       break;
     case 'config':
@@ -331,6 +372,8 @@ function applyConfig(next: RoomConfig): void {
   bonusesOn = next.bonuses;
   stance = next.stance;
   hostId = next.hostId;
+  expeditionBasePower = mode === MODE_EXPEDITION ? wave.power ?? expeditionPower(wave.wave) : 1;
+  refreshSelfBoost();
 
   if (!bonusesOn) {
     effectUntil.fill(0);
@@ -340,6 +383,9 @@ function applyConfig(next: RoomConfig): void {
   if (mode !== wasMode) bannerHideAt = 0;
   // Подписи зависят и от правил, и от режима: в «Все против всех» товарищей нет.
   if (first || rules !== wasRules || mode !== wasMode) applyPlates();
+  // В реализме вид от первого лица включается принудительно (см. fpvForced) —
+  // в аркаде возвращается личный выбор игрока, если он его вообще делал.
+  if (first || rules !== wasRules) setFpv(rules === RULES_REAL || fpvManual === 'on', false);
 
   // О смене настроек говорим всем в ленте: панель открыта не у каждого, а знать,
   // что именно поменялось и когда это сработает, надо обоим.
@@ -366,11 +412,12 @@ function applyConfig(next: RoomConfig): void {
 
   renderSetup();
   updateModeChip();
+  renderExpeditionChoices();
 }
 
 /** Когда выбранная сложность вступит в силу. Сервер меняет её на границе волн. */
 function whenDifficulty(): string {
-  if (mode !== MODE_PVE) return 'вступит в силу в режиме «Против ботов»';
+  if (mode !== MODE_PVE && mode !== MODE_EXPEDITION) return 'вступит в силу в режиме с ботами';
   if (wave.phase !== 'fight') return 'с ближайшей волны';
   return `с волны ${wave.wave + 1}`;
 }
@@ -379,12 +426,43 @@ function applyWave(next: WaveState): void {
   // Плашку показываем только на смене волны: во время боя сообщение приходит
   // на каждого вышедшего бота, и она мигала бы весь бой.
   const started = next.phase === 'fight' && next.wave !== wave.wave;
+  const previousUpgradeCount = wave.upgrades?.length ?? 0;
   wave = next;
+  if (mode === MODE_EXPEDITION && (next.upgrades?.length ?? 0) > previousUpgradeCount) {
+    const id = next.upgrades?.[next.upgrades.length - 1];
+    const upgrade = id === undefined ? undefined : EXPEDITION_UPGRADES[id];
+    if (upgrade) pushFeed(`Улучшение команды: ${upgrade.name}`, 'is-setup');
+  }
+  expeditionBasePower = mode === MODE_EXPEDITION ? next.power ?? expeditionPower(next.wave) : 1;
+  refreshSelfBoost();
+  renderExpeditionChoices();
   waveUntilAt = performance.now() + next.until * 1000;
   if (started) bannerHideAt = performance.now() + 3000;
   updateModeChip();
   // В подписи настроек стоит номер следующей волны — он только что изменился.
   if (!setupPanel.hidden) renderSetup();
+}
+
+function refreshSelfBoost(): void {
+  const upgradeSpeed =
+    mode === MODE_EXPEDITION
+      ? (wave.upgrades ?? []).reduce(
+          (value, id) => value * (EXPEDITION_UPGRADES[id]?.speed ?? 1),
+          1,
+        )
+      : 1;
+  self.boost =
+    expeditionBasePower *
+    upgradeSpeed *
+    (hasEffect(myEffects, BONUS_SPEED) ? BONUS_SPEED_MUL : 1);
+}
+
+function expeditionReloadMultiplier(): number {
+  if (mode !== MODE_EXPEDITION) return 1;
+  return (wave.upgrades ?? []).reduce(
+    (value, id) => value * (EXPEDITION_UPGRADES[id]?.reload ?? 1),
+    1,
+  );
 }
 
 function onSnapshot(
@@ -412,8 +490,23 @@ function onSnapshot(
   const mask = mine.f ?? 0;
   if (mask !== myEffects) {
     myEffects = mask;
-    self.boost = hasEffect(mask, BONUS_SPEED) ? BONUS_SPEED_MUL : 1;
+    refreshSelfBoost();
     updateEffectsHud();
+  }
+
+  // Серверный счётчик подтверждает запрос и снимает блокировку следующего.
+  // Саму отдачу мы уже показали в момент нажатия: ждать снапшот здесь нельзя —
+  // тогда пушка и корпус отзываются с задержкой сети, а первый q после входа
+  // вообще может стать исходным значением без видимого выстрела.
+  if (mine.q !== undefined) {
+    if (!shotCountReady) {
+      myShotCount = mine.q;
+      shotCountReady = true;
+    } else if (mine.q > myShotCount) {
+      myShotCount = mine.q;
+      firePending = false;
+      firePendingUntil = 0;
+    }
   }
 
   if (mine.h !== myHp) {
@@ -424,7 +517,14 @@ function onSnapshot(
   if (Boolean(mine.d) !== myDead) {
     myDead = Boolean(mine.d);
     self.alive = !myDead;
-    if (myDead) respawnAt = now + RESPAWN_S * 1000;
+    if (myDead) {
+      respawnAt = now + RESPAWN_S * 1000;
+      // Запрос, отправленный прямо перед попаданием, больше не должен
+      // блокировать огонь после респавна, если сервер его не принял.
+      firePending = false;
+      firePendingUntil = 0;
+      reloadUntil = 0;
+    }
     updateDeathScreen();
   }
 
@@ -459,16 +559,22 @@ function frame(now: number): void {
 
       // Перезарядку считает сервер; локальный таймер нужен, чтобы полоска в HUD
       // не дёргалась и чтобы не спамить в сеть заведомо холостыми выстрелами.
-      const wantFire = controls.fire && !myDead && now >= reloadUntil;
+      if (firePending && now >= firePendingUntil) firePending = false;
+      const wantFire = controls.fire && !myDead && !firePending && now >= reloadUntil;
       if (wantFire) {
-        // Бонус «Заряжание» укорачивает откат — полоска должна знать об этом,
-        // иначе она поедет вдвое медленнее, чем пушка на самом деле готова.
-        reloadSpan = RELOAD_S * 1000 * (hasEffect(myEffects, BONUS_RELOAD) ? BONUS_RELOAD_MUL : 1);
+        // Отдача должна совпасть с нажатием, а не с приходом снапшота: иначе
+        // ствол и подвеска выглядят сломанными при любом пинге. Сервер всё ещё
+        // решает, появится ли снаряд; q выше лишь подтвердит этот запрос.
+        reloadSpan =
+          RELOAD_S *
+          1000 *
+          expeditionReloadMultiplier() *
+          (hasEffect(myEffects, BONUS_RELOAD) ? BONUS_RELOAD_MUL : 1);
         reloadUntil = now + reloadSpan;
-        // Свой выстрел показываем сразу, не дожидаясь снапшота: та же перезарядка
-        // считается и на сервере, так что отказать он может только в спорный тик.
         scene.tankFired(selfId);
         scene.addShake(SELF_SHOT_SHAKE);
+        firePending = true;
+        firePendingUntil = now + FIRE_ACK_TIMEOUT_MS;
       }
 
       const input = self.step(controls.throttle, controls.steer, controls.yaw, wantFire);
@@ -479,8 +585,9 @@ function frame(now: number): void {
 
   self.decay(dt);
 
-  drawSelf(dt);
-  drawOthers(now - INTERP_DELAY_MS);
+  const renderTime = now - INTERP_DELAY_MS;
+  drawSelf(dt, renderTime);
+  drawOthers(renderTime);
   playBooms(now);
   scene.render(dt);
   updateSpeed();
@@ -489,11 +596,8 @@ function frame(now: number): void {
   updateBanner(now);
 }
 
-/** Взрывы и остовы, у которых подошло время. */
+/** Взрывы, у которых подошло время. */
 function playBooms(now: number): void {
-  while (pendingWrecks.length > 0 && pendingWrecks[0].at <= now) {
-    scene.removeTank(pendingWrecks.shift()!.id, true);
-  }
   while (pendingBooms.length > 0 && pendingBooms[0].at <= now) {
     const { boom } = pendingBooms.shift()!;
     scene.boom(boom.x, boom.z, boom.k);
@@ -507,7 +611,7 @@ function playBooms(now: number): void {
   }
 }
 
-function drawSelf(dt: number): void {
+function drawSelf(dt: number, renderTime: number): void {
   // alpha — доля времени до следующего шага симуляции: кадр рисуется между шагами,
   // иначе на скорости картинка идёт ступеньками по 30 Гц.
   const state = self.sample(stepAccumulator / DT);
@@ -519,14 +623,76 @@ function drawSelf(dt: number): void {
   selfX = state.x;
   selfZ = state.z;
   scene.updateTank(selfId, state.x, state.z, state.angle, state.turret);
-  if (topView) scene.updateTopCamera(state.x, state.z, controls.distance, dt);
-  else scene.updateCamera(state.x, state.z, controls.yaw, controls.pitch, dt, controls.distance);
+
+  // Мёртвый в PvE смотрит не в свою неподвижную точку, а на живого товарища —
+  // иначе спектатор всю волну глядит в один и тот же кусок земли.
+  const camera = myDead && (mode === MODE_PVE || mode === MODE_EXPEDITION) ? spectateCamera(renderTime) : null;
+  setSpectateTarget(camera?.id ?? 0);
+  const camX = camera?.x ?? state.x;
+  const camZ = camera?.z ?? state.z;
+
+  if (topView) scene.updateTopCamera(camX, camZ, controls.distance, dt);
+  // Камера в FPV крутится свободно и мгновенно за мышью — это глаза, а не
+  // ствол. Честность с ботом не в скорости взгляда, а в том, что реально
+  // стреляет ствол: он и так доворачивается с TURRET_RATE, независимо от
+  // камеры (см. updateTank выше — рисуется по настоящему state.turret), и
+  // выстрел раньше, чем довернётся, всё равно уйдёт мимо. Синхронизировать с
+  // ним ещё и обзор было лишним — так живой человек головой не смотрит.
+  else if (fpv) scene.updateFirstPersonCamera(camX, camZ, controls.yaw, controls.pitch, dt);
+  else scene.updateCamera(camX, camZ, controls.yaw, controls.pitch, dt, controls.distance);
+  // Куст, внутри которого физически камера, целиком прячется — иначе взгляд
+  // от первого лица упирается в стену из десятков полупрозрачных кубиков
+  // подряд, а это на глаз неотличимо от сплошной (см. setActiveBush).
+  scene.setActiveBush(fpv && !topView ? bushIndexAt(bushes, camX, camZ) : -1);
   drawAim(state.x, state.z, state.turret);
 }
 
 /** Своё последнее нарисованное положение: по нему считается дальность маскировки. */
 let selfX = 0;
 let selfZ = 0;
+
+/** id товарища, на которого сейчас переключена камера; 0 — камера на себе. */
+let spectateId = 0;
+
+/**
+ * Ближайший живой союзник и его положение на текущий момент интерполяции —
+ * той же формулой, что рисует чужие танки в drawOthers, чтобы камера ехала за
+ * той же сглаженной точкой, а не дёргалась отдельно от самого танка на экране.
+ */
+function spectateCamera(renderTime: number): { id: number; x: number; z: number } | null {
+  const frame = interpFrame(renderTime);
+  if (!frame) return null;
+  const me = players.get(selfId);
+  if (!me) return null;
+
+  let bestId = 0;
+  let bestDist = Infinity;
+  for (const [id, entry] of frame.to.entries) {
+    if (id === selfId || entry.d !== 0) continue;
+    const info = players.get(id);
+    if (!info || !alliedTeams(mode, me.team, info.team)) continue;
+    const dist = Math.hypot(entry.x - selfX, entry.z - selfZ);
+    if (dist < bestDist) {
+      bestDist = dist;
+      bestId = id;
+    }
+  }
+  if (bestId === 0) return null;
+
+  const target = frame.to.entries.get(bestId)!;
+  const start = frame.from.entries.get(bestId) ?? target;
+  const t = frame.t;
+  return { id: bestId, x: start.x + (target.x - start.x) * t, z: start.z + (target.z - start.z) * t };
+}
+
+/** Подпись «смотришь за …» в карточке смерти: видна, только пока камера чужая. */
+function setSpectateTarget(id: number): void {
+  if (id === spectateId) return;
+  spectateId = id;
+  const info = id !== 0 ? players.get(id) : undefined;
+  deathSpectate.hidden = !info;
+  if (info) deathSpectate.textContent = `Смотришь за игроком ${info.name}`;
+}
 
 /** Докуда добьёт метка прицела, если на пути ничего нет, м. */
 const AIM_RANGE = 140;
@@ -572,17 +738,9 @@ function drawAim(x: number, z: number, turret: number): void {
 }
 
 function drawOthers(renderTime: number): void {
-  // Выбрасываем снапшоты, которые уже не нужны для интерполяции.
-  while (snapshots.length > 2 && snapshots[1].time <= renderTime) snapshots.shift();
-  if (snapshots.length === 0) return;
-
-  let index = snapshots.length - 1;
-  while (index > 0 && snapshots[index].time > renderTime) index--;
-
-  const from = snapshots[index];
-  const to = snapshots[index + 1] ?? from;
-  const span = to.time - from.time;
-  const t = span > 1e-3 ? clamp((renderTime - from.time) / span, 0, 1) : 1;
+  const frame = interpFrame(renderTime);
+  if (!frame) return;
+  const { from, to, t } = frame;
 
   for (const [id, target] of to.entries) {
     if (!players.has(id)) continue; // снапшот обогнал сообщение joined
@@ -590,6 +748,8 @@ function drawOthers(renderTime: number): void {
     // но его полоска и видимость живут по тем же данным, что и у остальных.
     scene.setTankHealth(id, target.h, target.d === 0, players.get(id)?.bot ? BOT_HP : MAX_HP);
     // Свой танк под маскировкой видно всегда: прятать его от себя незачем.
+    // Кусты на экран не влияют — они рвут обзор только у ИИ ботов (see bot.ts):
+    // человек всегда видит всех, кого видел бы без кустов вовсе.
     scene.setTankStealth(
       id,
       id !== selfId &&
@@ -621,9 +781,20 @@ function drawShells(from: BufferedSnapshot, to: BufferedSnapshot, t: number): vo
 
   const list = to.shells.map((shell) => {
     const start = previous.get(shell.i);
+    const ownerFrom = from.entries.get(shell.o) ?? to.entries.get(shell.o);
+    const ownerTo = to.entries.get(shell.o) ?? ownerFrom;
+    const ownerX = ownerFrom && ownerTo ? ownerFrom.x + (ownerTo.x - ownerFrom.x) * t : null;
+    const ownerZ = ownerFrom && ownerTo ? ownerFrom.z + (ownerTo.z - ownerFrom.z) * t : null;
+    const muzzleX = ownerX === null ? null : ownerX + Math.sin(shell.a) * MUZZLE_OFFSET;
+    const muzzleZ = ownerZ === null ? null : ownerZ + Math.cos(shell.a) * MUZZLE_OFFSET;
+    // Пока снаряд не отлетел от дула, хвост не может быть длиннее пути,
+    // который уже пройден: иначе трассер рисовался бы внутри орудия.
+    const trailAt = (x: number, z: number) =>
+      muzzleX === null || muzzleZ === null ? TRACER_LENGTH : Math.min(TRACER_LENGTH, Math.hypot(x - muzzleX, z - muzzleZ));
     if (!start) {
-      // Первый кадр снаряда: показываем выстрел у ствола стрелявшего. Свой уже
-      // отыгран в момент нажатия — второй раз его рисовать нечего.
+      // Первый кадр снаряда начинается прямо у дула, а не в первой уже
+      // продвинутой серверной позиции. За интервал снапшота он догоняет
+      // авторитетную точку — без телепорта трассера на пару метров вперёд.
       if (!knownShells.has(shell.i)) {
         knownShells.add(shell.i);
         // Танк стрелявшего мог ещё не доехать сообщением joined; тогда остаётся
@@ -636,18 +807,32 @@ function drawShells(from: BufferedSnapshot, to: BufferedSnapshot, t: number): vo
           );
         }
       }
-      return { id: shell.i, x: shell.x, z: shell.z, angle: shell.a };
+      if (muzzleX !== null && muzzleZ !== null) {
+        const x = muzzleX + (shell.x - muzzleX) * t;
+        const z = muzzleZ + (shell.z - muzzleZ) * t;
+        return {
+          id: shell.i,
+          x,
+          z,
+          angle: shell.a,
+          trail: trailAt(x, z),
+        };
+      }
+      return { id: shell.i, x: shell.x, z: shell.z, angle: shell.a, trail: trailAt(shell.x, shell.z) };
     }
     // Между снапшотами был отскок: прямая от старой точки к новой срезала бы угол,
     // и снаряд на кадр-другой ушёл бы в стену. Показываем сразу новое положение.
     if (start.b !== shell.b) {
-      return { id: shell.i, x: shell.x, z: shell.z, angle: shell.a };
+      return { id: shell.i, x: shell.x, z: shell.z, angle: shell.a, trail: trailAt(shell.x, shell.z) };
     }
+    const x = start.x + (shell.x - start.x) * t;
+    const z = start.z + (shell.z - start.z) * t;
     return {
       id: shell.i,
-      x: start.x + (shell.x - start.x) * t,
-      z: start.z + (shell.z - start.z) * t,
+      x,
+      z,
       angle: shell.a,
+      trail: trailAt(x, z),
     };
   });
 
@@ -672,11 +857,15 @@ const deathScreen = el('death');
 const deathTimer = el('death-timer');
 const deathNote = el('death-note');
 const deathRespawn = el('death-respawn');
+const deathSpectate = el('death-spectate');
 const hudMode = el('hud-mode');
 const hudFx = el('hud-fx');
 const banner = el('wave-banner');
 const bannerTitle = el('wave-title');
 const bannerSub = el('wave-sub');
+const expeditionPanel = el('expedition');
+const expeditionCards = el('expedition-cards');
+const expeditionStats = el('expedition-stats');
 const setupPanel = el('setup');
 const setupNote = el('setup-note');
 const setupToggle = el<HTMLButtonElement>('setup-toggle');
@@ -689,8 +878,10 @@ const setupStances = el('setup-stances');
 const setupBonuses = el<HTMLInputElement>('setup-bonuses');
 const setupBloom = el<HTMLInputElement>('setup-bloom');
 const setupTop = el<HTMLInputElement>('setup-top');
+const setupFpv = el<HTMLInputElement>('setup-fpv');
 const hintChase = el('hint-chase');
 const hintTopView = el('hint-top');
+const hintFpvView = el('hint-fpv');
 const aimStick = el('aim');
 const hintMap = el('hint-map');
 const hintMode = el('hint-mode');
@@ -700,6 +891,32 @@ const hintStance = el('hint-stance');
 const hintBonuses = el('hint-bonuses');
 const hintBloom = el('hint-bloom');
 const hintView = el('hint-view');
+
+function renderExpeditionChoices(): void {
+  const show = mode === MODE_EXPEDITION && wave.phase === 'upgrade' && (wave.choices?.length ?? 0) > 0;
+  expeditionPanel.hidden = !show;
+  if (!show) return;
+  const speed = expeditionBasePower * (wave.upgrades ?? []).reduce(
+    (value, id) => value * (EXPEDITION_UPGRADES[id]?.speed ?? 1),
+    1,
+  );
+  const damage = (wave.upgrades ?? []).reduce(
+    (value, id) => value * (EXPEDITION_UPGRADES[id]?.damage ?? 1),
+    1,
+  );
+  const reload = expeditionReloadMultiplier();
+  expeditionStats.textContent =
+    `Сейчас: ход ${Math.round(speed * 100)}% · урон ${Math.round(damage * 100)}% · перезарядка ${Math.round(reload * 100)}%`;
+  expeditionCards.replaceChildren();
+  for (const choice of wave.choices ?? []) {
+    const card = document.createElement('button');
+    card.type = 'button';
+    card.className = 'expedition-card';
+    card.innerHTML = `<b>${choice.name}</b><span>${choice.description}</span>`;
+    card.addEventListener('click', () => net.sendUpgrade(choice.id), { once: true });
+    expeditionCards.appendChild(card);
+  }
+}
 
 function updateHud(): void {
   // Ботов в «в бою» не считаем: это счётчик живых людей.
@@ -720,10 +937,11 @@ function updateModeChip(): void {
     return;
   }
   if (wave.phase === 'fight') {
-    hudMode.textContent = `${map} · волна ${wave.wave} · осталось ${wave.left}`;
+    const power = mode === MODE_EXPEDITION ? ` · сила ${Math.round((wave.power ?? 1) * 100)}%` : '';
+    hudMode.textContent = `${map} · волна ${wave.wave} · осталось ${wave.left}${power}`;
     return;
   }
-  hudMode.textContent = `${map} · ${wave.phase === 'break' ? 'передышка' : 'забег окончен'}`;
+  hudMode.textContent = `${map} · ${wave.phase === 'upgrade' ? 'мастерская' : wave.phase === 'break' ? 'передышка' : wave.victory ? 'экспедиция завершена' : 'забег окончен'}`;
 }
 
 /** Кэш последней надписи: плашка обновляется каждый кадр, а меняется раз в секунду. */
@@ -731,7 +949,7 @@ let bannerShown = '';
 
 function updateBanner(now: number): void {
   const visible =
-    mode === MODE_PVE && wave.wave > 0 && (wave.phase !== 'fight' || now < bannerHideAt);
+    (mode === MODE_PVE || mode === MODE_EXPEDITION) && wave.wave > 0 && (wave.phase !== 'fight' || now < bannerHideAt);
   if (!visible) {
     if (!banner.hidden) {
       banner.hidden = true;
@@ -747,12 +965,17 @@ function updateBanner(now: number): void {
   if (wave.phase === 'fight') {
     title = `Волна ${wave.wave}`;
     sub = `противников: ${wave.left}`;
+  } else if (wave.phase === 'upgrade') {
+    title = 'Мастерская';
+    sub = 'выбери улучшение для всей команды';
   } else if (wave.phase === 'break') {
     title = `Волна ${wave.wave} зачищена`;
     sub = `следующая через ${left} · павшие возвращаются в строй`;
   } else {
-    title = 'Забег окончен';
-    sub = `дошли до волны ${wave.wave} · рекорд ${wave.best} · заново через ${left}`;
+    title = wave.victory ? 'Экспедиция завершена' : 'Забег окончен';
+    sub = wave.victory
+      ? `10 волн пройдено · заново через ${left}`
+      : `дошли до волны ${wave.wave} · рекорд ${wave.best} · заново через ${left}`;
   }
 
   const key = `${title}|${sub}`;
@@ -779,6 +1002,7 @@ MAP_NAMES.forEach((label, index) => {
 for (const [value, label] of [
   [MODE_DM, 'Все против всех'],
   [MODE_PVE, 'Против ботов'],
+  [MODE_EXPEDITION, 'Экспедиция'],
 ] as Array<[GameMode, string]>) {
   const button = document.createElement('button');
   button.type = 'button';
@@ -841,14 +1065,37 @@ setupBloom.addEventListener('change', () => {
  */
 let topView =
   (localStorage.getItem('tanks:view') ?? (controls.isTouch ? 'top' : 'chase')) === 'top';
+
+/**
+ * Вид от первого лица — от прицела башни, буквально вид игрока и бота почти
+ * на равных: то же ограниченное поле зрения, тот же довод ствола (взгляд
+ * идёт за реальным углом башни, см. drawSelf).
+ *
+ * В «Реализме» вид от третьего лица прямо запрещён — камера над танком
+ * видит то, чего бот никогда не увидит, а весь смысл вида в равенстве.
+ * Поэтому там fpv не личный выбор, а требование правил: fpvForced() всегда
+ * побеждает. Личный выбор (fpvManual) при этом никуда не девается — просто
+ * ждёт, пока правила снова станут аркадными, и тогда возвращает то, что
+ * игрок выбрал сам (клавишей F или чекбоксом).
+ */
+let fpvManual = localStorage.getItem('tanks:fpv'); // 'on' | 'off' | null — null, пока не тронуто руками
+// Настоящее значение (принудительно в реализме, личный выбор в аркаде)
+// выставляет applyConfig() сразу же на первом 'welcome'.
+let fpv = fpvManual === 'on';
 applyView();
+
+/** В «Реализме» вид от третьего лица запрещён: играть с камерой над танком нечестно. */
+function fpvForced(): boolean {
+  return rules === RULES_REAL;
+}
 
 function applyView(): void {
   controls.setTopView(topView);
   scene.setTopView(topView);
   aimStick.hidden = !topView;
-  hintChase.hidden = topView;
+  hintChase.hidden = topView || fpv;
   hintTopView.hidden = !topView;
+  hintFpvView.hidden = topView || !fpv;
 }
 
 function setTopView(on: boolean): void {
@@ -859,7 +1106,21 @@ function setTopView(on: boolean): void {
   renderSetup();
 }
 
+function setFpv(on: boolean, manual: boolean): void {
+  // Выключить нельзя, пока правила это запрещают — ни с клавиши, ни чекбоксом.
+  if (!on && fpvForced()) return;
+  if (manual) {
+    fpvManual = on ? 'on' : 'off';
+    localStorage.setItem('tanks:fpv', fpvManual);
+  }
+  if (on === fpv) return;
+  fpv = on;
+  applyView();
+  renderSetup();
+}
+
 setupTop.addEventListener('change', () => setTopView(setupTop.checked));
+setupFpv.addEventListener('change', () => setFpv(setupFpv.checked, true));
 
 function renderSetup(): void {
   const isHost = selfId !== 0 && selfId === hostId;
@@ -871,15 +1132,21 @@ function renderSetup(): void {
 
   // Про волны — только там, где волны есть. В «Все против всех» это пять строк
   // не о том, и панель без них заметно короче.
-  setupNote.hidden = mode !== MODE_PVE;
+  setupNote.hidden = mode !== MODE_PVE && mode !== MODE_EXPEDITION;
 
-  // Две галки в панели, которые работают у всех: они не про бой.
+  // Три галки в панели, которые работают у всех: они не про бой.
   setupTop.checked = topView;
+  setupFpv.checked = fpv;
+  setupFpv.disabled = topView || fpvForced();
   hintView.textContent = topView
     ? controls.isTouch
       ? 'Карта под тобой, север сверху. Левый палец — ход, правый — башня; уведи его дальше от центра, и танк стреляет.'
       : 'Карта под тобой, север сверху. Курсор наводит башню, мышь не захватывается.'
-    : 'Выключено: камера за танком. На телефоне обзор придётся крутить пальцем — тем же, которым стреляешь.';
+    : fpv
+      ? fpvForced()
+        ? 'Включён правилами «Реализм» и не выключается: камера сидит у башни и доворачивается не быстрее самой башни — тем же обзором, что и у бота.'
+        : 'Камера сидит у башни и смотрит только туда, куда наводишь, — ни кругового обзора, ни вида на себя со стороны, как у бота.'
+      : 'Выключено: камера за танком. На телефоне обзор придётся крутить пальцем — тем же, которым стреляешь.';
 
   setupBloom.checked = bloomOn;
   hintBloom.textContent = bloomOn
@@ -898,14 +1165,14 @@ function renderSetup(): void {
     button.classList.toggle('is-on', button.dataset.rules === rules);
     button.disabled = !isHost;
   }
-  const pending = mode === MODE_PVE && activeDifficulty !== difficulty;
+  const pending = (mode === MODE_PVE || mode === MODE_EXPEDITION) && activeDifficulty !== difficulty;
   for (const button of setupDiffs.querySelectorAll('button')) {
     const tier = Number(button.dataset.diff);
     button.classList.toggle('is-on', tier === difficulty);
     // Пока выбор не вступил в силу, отдельно помечаем то, по чему идёт бой.
     button.classList.toggle('is-live', pending && tier === activeDifficulty);
     // Сложность имеет смысл только в режиме ботов.
-    button.disabled = !isHost || mode !== MODE_PVE;
+    button.disabled = !isHost || (mode !== MODE_PVE && mode !== MODE_EXPEDITION);
   }
 
   for (const button of setupStances.querySelectorAll('button')) {
@@ -922,7 +1189,7 @@ function renderSetup(): void {
     ? 'Срабатывает сразу: выключение уберёт ящики и снимет действующие усиления.'
     : 'Срабатывает сразу: ящики начнут появляться на карте.';
 
-  if (mode !== MODE_PVE) {
+  if (mode !== MODE_PVE && mode !== MODE_EXPEDITION) {
     hintDiff.textContent = 'Работает только в режиме «Против ботов».';
   } else if (pending) {
     hintDiff.textContent =
@@ -949,6 +1216,7 @@ window.addEventListener('keydown', (event) => {
   if (hud.hidden) return; // до входа в бой настраивать нечего
   if (event.code === 'KeyM') toggleSetup();
   else if (event.code === 'KeyV') setTopView(!topView);
+  else if (event.code === 'KeyF') setFpv(!fpv, true);
 });
 
 function updateHealthHud(): void {
@@ -1040,7 +1308,7 @@ function updateReloadHud(now: number): void {
 
 function updateDeathScreen(now = performance.now()): void {
   // Итоги забега показывает плашка волны — две карточки разом были бы лишними.
-  const show = myDead && !(mode === MODE_PVE && wave.phase === 'over');
+  const show = myDead && !((mode === MODE_PVE || mode === MODE_EXPEDITION) && wave.phase === 'over');
   deathScreen.hidden = !show;
   if (!show) {
     respawnShown = '';
@@ -1048,12 +1316,12 @@ function updateDeathScreen(now = performance.now()): void {
   }
 
   // В режиме ботов жизнь одна на волну, поэтому обратного отсчёта нет.
-  const byWave = mode === MODE_PVE;
+  const byWave = mode === MODE_PVE || mode === MODE_EXPEDITION;
   deathRespawn.hidden = byWave;
   deathNote.hidden = !byWave;
 
   const text = byWave
-    ? wave.phase === 'break'
+    ? wave.phase === 'break' || wave.phase === 'upgrade'
       ? 'В строю со следующей волной'
       : 'В строю, когда волна будет зачищена'
     : String(Math.max(0, Math.ceil((respawnAt - now) / 1000)));
@@ -1109,6 +1377,7 @@ function showOverlay(message: string, isError = false): void {
   setupToggle.hidden = true;
   setupPanel.hidden = true;
   banner.hidden = true;
+  expeditionPanel.hidden = true;
   joinButton.disabled = false;
   joinButton.textContent = 'Переподключиться';
   setStatus(message, isError);
@@ -1120,7 +1389,6 @@ function resetWorld(): void {
   players.clear();
   snapshots.length = 0;
   pendingBooms.length = 0;
-  pendingWrecks.length = 0;
   knownShells.clear();
   scene.clearShells();
   selfId = 0;
@@ -1130,8 +1398,16 @@ function resetWorld(): void {
   worldBuilt = false;
   myHp = MAX_HP;
   myDead = false;
+  spectateId = 0;
+  deathSpectate.hidden = true;
   reloadUntil = 0;
+  reloadSpan = RELOAD_S * 1000;
+  firePending = false;
+  firePendingUntil = 0;
+  myShotCount = 0;
+  shotCountReady = false;
   wave = { wave: 0, phase: 'break', left: 0, until: 0, best: 0 };
+  expeditionBasePower = 1;
   bannerHideAt = 0;
   myEffects = 0;
   effectUntil.fill(0);
@@ -1140,6 +1416,7 @@ function resetWorld(): void {
   updateHealthHud();
   updateDeathScreen();
   self.reset();
+  expeditionPanel.hidden = true;
 }
 
 form.addEventListener('submit', (event) => {

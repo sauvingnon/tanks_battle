@@ -59,10 +59,25 @@ export const BONUS_COLORS = [0x6ad46a, 0xff7a4d, 0xffd24d, 0x4db8ff, 0xb388ff];
 export const COLOR_GROUND = 0x39412f;
 export const COLOR_WALL = 0x4a5160;
 export const COLOR_BOX = 0x6d6357;
-/** Низкое укрытие: заметно теплее обычного блока — «за этим не спрячешься». */
-export const COLOR_LOW_BOX = 0x8a6a3f;
+/**
+ * Низкое укрытие — куст из мелких листовых кубиков (см. Scene3D.buildBush):
+ * палитра тонов на кубик, а не один цвет на блок — так кластер не выглядит
+ * плоской крашеной коробкой. «Сквозь это простреливается» по-прежнему решает
+ * высота блока (h < SHELL_HEIGHT), цвет тут не игровой сигнал, а вид объекта.
+ */
+export const LEAF_COLORS = [0x4f8f3a, 0x5fa844, 0x3f7a2e, 0x5a9c48];
 export const COLOR_TRACK = 0x23262b;
 export const COLOR_METAL = 0x3a3f47;
+
+/**
+ * Декоративная разбивка «полных» укрытий (h ≥ SHELL_HEIGHT) по силуэту: стены
+ * остаются COLOR_BOX, из квадратных блоков покрупнее лепится домик, из мелких —
+ * ящик. Ни один из трёх не меняет игровую механику — она вся уже решена высотой
+ * блока, эта палитра только про то, как он выглядит.
+ */
+export const COLOR_HOUSE_WALL = 0x9c8f6e;
+export const COLOR_ROOF = 0x5c3a30;
+export const COLOR_CRATE = 0x7d5a36;
 
 /**
  * Всё, что красится обычной краской и светиться не должно. Список нужен не для
@@ -71,12 +86,15 @@ export const COLOR_METAL = 0x3a3f47;
  */
 export const PAINTED_COLORS = [
   ...PALETTE,
+  ...LEAF_COLORS,
   COLOR_GROUND,
   COLOR_WALL,
   COLOR_BOX,
-  COLOR_LOW_BOX,
   COLOR_TRACK,
   COLOR_METAL,
+  COLOR_HOUSE_WALL,
+  COLOR_ROOF,
+  COLOR_CRATE,
 ];
 
 /** sRGB -> линейное пространство, в котором и живёт вся арифметика света. */
