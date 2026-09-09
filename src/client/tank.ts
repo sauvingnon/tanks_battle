@@ -170,7 +170,7 @@ export function buildTankGeometry(): TankGeometry {
   for (const side of [-1, 1]) {
     const x = side * TRACK_SIDE;
     // Матовая подложка уходит за подвижные звенья и держит тёмный контур ленты.
-    running.push(at(box(0.54, 0.6, 3.62), x, 0.55, 0));
+    running.push(at(box(0.32, 0.6, 3.62), x, 0.55, 0));
     wheels.push(at(wheel(0.43, 0.52), x, 0.55, 1.68));
     wheels.push(at(wheel(0.43, 0.52), x, 0.55, -1.68));
     for (const z of [-1.08, -0.36, 0.36, 1.08]) wheels.push(at(wheel(0.28, 0.48, 12), x, 0.38, z));
