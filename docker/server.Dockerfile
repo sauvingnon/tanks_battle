@@ -19,6 +19,7 @@ RUN npm ci --omit=dev && npm cache clean --force
 
 COPY --from=build /app/dist-server ./dist-server
 
+RUN mkdir -p /app/data && chown node:node /app/data
 USER node
 EXPOSE 8080
 

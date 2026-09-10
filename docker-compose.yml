@@ -12,6 +12,8 @@ services:
     # Игровой цикл однопоточный: одного ядра ему хватает с большим запасом.
     cpus: 1.0
     mem_limit: 1g
+    volumes:
+      - leaderboard-data:/app/data
 
   web:
     build:
@@ -28,3 +30,6 @@ services:
     volumes:
       - ./docker/nginx-tls.conf:/etc/nginx/conf.d/default.conf:ro
       - /etc/letsencrypt:/etc/letsencrypt:ro
+
+volumes:
+  leaderboard-data:

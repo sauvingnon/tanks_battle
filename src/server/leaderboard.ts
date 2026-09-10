@@ -10,7 +10,7 @@ import type { LeaderboardEntry } from '../shared/protocol.js';
  * человек, что и вчера, и совпадение ников путает статистику. Для первой
  * версии это принятый компромисс — заводить настоящие аккаунты того не стоит.
  */
-const FILE = fileURLToPath(new URL('../../data/leaderboard.json', import.meta.url));
+const FILE = fileURLToPath(new URL('../data/leaderboard.json', import.meta.url));
 mkdirSync(dirname(FILE), { recursive: true });
 
 interface Stats {
