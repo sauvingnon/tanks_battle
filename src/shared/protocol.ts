@@ -2,6 +2,7 @@ import type { ExpeditionUpgrade, GameMode, Ruleset } from './constants.js';
 import type {
   Boom,
   Box,
+  HitFx,
   PlayerInfo,
   SnapshotBonus,
   SnapshotEntry,
@@ -107,6 +108,8 @@ export type ServerMessage =
       /** Пусто в большинстве тиков, поэтому поля необязательные — экономия трафика. */
       shells?: SnapshotShell[];
       booms?: Boom[];
+      /** Сумма урона по каждому попаданию этого тика — снаряд или таран. */
+      hits?: HitFx[];
       /** Ящики на карте; поле есть, только когда бонусы включены и что-то лежит. */
       bonuses?: SnapshotBonus[];
     }

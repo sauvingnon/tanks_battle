@@ -41,11 +41,11 @@ import {
   BOOM_GROUND,
   BOOM_HIT,
   BOOM_KILL,
-  BOOM_NEAR,
   BOOM_RICOCHET,
   type Boom,
   type BoomKind,
   type Box,
+  type HitFx,
   type PlayerInfo,
   type ShellState,
   type SnapshotBonus,
@@ -142,6 +142,9 @@ function interpFrame(renderTime: number): InterpFrame | null {
  */
 const pendingBooms: Array<{ at: number; boom: Boom }> = [];
 
+/** Цифры урона ждут ту же задержку, что и взрывы — по той же причине. */
+const pendingHits: Array<{ at: number; hit: HitFx }> = [];
+
 /** id снарядов, которые мы уже видели: по новым рисуем вспышку выстрела. */
 const knownShells = new Set<number>();
 
@@ -155,8 +158,6 @@ const BOOM_SHAKE: Record<BoomKind, number> = {
   [BOOM_HIT]: 0.45,
   [BOOM_KILL]: 0.75,
   [BOOM_RICOCHET]: 0.11,
-  // Мимо, но чувствительно — заметно сильнее рикошета, но без урона это не попадание.
-  [BOOM_NEAR]: 0.32,
 };
 /** Дальше этого взрыв уже не чувствуется, м. */
 const SHAKE_RANGE = 26;
@@ -311,7 +312,7 @@ function handleMessage(msg: ServerMessage): void {
       onPickup(msg.id, msg.kind);
       break;
     case 'snapshot':
-      onSnapshot(msg.players, msg.ack, msg.shells ?? [], msg.booms ?? [], msg.bonuses ?? []);
+      onSnapshot(msg.players, msg.ack, msg.shells ?? [], msg.booms ?? [], msg.hits ?? [], msg.bonuses ?? []);
       break;
     case 'kill':
       pushKillFeed(msg.killer, msg.victim);
@@ -470,6 +471,7 @@ function onSnapshot(
   ack: number,
   shells: SnapshotShell[],
   booms: Boom[],
+  hits: HitFx[],
   bonuses: SnapshotBonus[],
 ): void {
   const now = performance.now();
@@ -481,6 +483,7 @@ function onSnapshot(
 
   // Взрывы показываем в тот же момент, в который до места дойдёт картинка мира.
   for (const boom of booms) pendingBooms.push({ at: now + INTERP_DELAY_MS, boom });
+  for (const hit of hits) pendingHits.push({ at: now + INTERP_DELAY_MS, hit });
 
   const mine = map.get(selfId);
   if (!mine) return;
@@ -589,6 +592,7 @@ function frame(now: number): void {
   drawSelf(dt, renderTime);
   drawOthers(renderTime);
   playBooms(now);
+  playHits(now);
   scene.render(dt);
   updateSpeed();
   updateReloadHud(now);
@@ -608,6 +612,14 @@ function playBooms(now: number): void {
 
     // Отметка о попадании — только стрелявшему и только по живой цели.
     if (boom.o === selfId && (boom.k === BOOM_HIT || boom.k === BOOM_KILL)) showHitmarker();
+  }
+}
+
+/** Цифры урона, у которых подошло время всплыть. */
+function playHits(now: number): void {
+  while (pendingHits.length > 0 && pendingHits[0].at <= now) {
+    const { hit } = pendingHits.shift()!;
+    scene.damageNumber(hit.x, hit.z, hit.amount);
   }
 }
 
@@ -1389,6 +1401,7 @@ function resetWorld(): void {
   players.clear();
   snapshots.length = 0;
   pendingBooms.length = 0;
+  pendingHits.length = 0;
   knownShells.clear();
   scene.clearShells();
   selfId = 0;

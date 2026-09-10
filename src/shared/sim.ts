@@ -5,6 +5,10 @@ import {
   BUMP_GRAZE,
   clamp,
   FRICTION,
+  HIT_ZONE_COS,
+  HIT_ZONE_FRONT_MUL,
+  HIT_ZONE_REAR_MUL,
+  HIT_ZONE_SIDE_MUL,
   MAP_HALF,
   MAX_BOUNCES,
   MAX_REVERSE,
@@ -354,6 +358,22 @@ export function canRicochet(shell: ShellState, hit: ShellHit): boolean {
 
   const cos = Math.abs(shell.vx * hit.nx + shell.vz * hit.nz) / speed;
   return cos < RICOCHET_MAX_COS;
+}
+
+/**
+ * Множитель урона по зоне попадания. Летит туда же, куда едет цель — вошёл
+ * со спины (корма тоньше, урон выше); летит навстречу — в лоб (толще, ниже).
+ * Скорость снаряда на нуле (только теоретически) не даёт зоны — не в кого
+ * было целиться прицельно, урон нейтральный.
+ */
+export function hitZoneDamageMul(shell: ShellState, targetAngle: number): number {
+  const speed = Math.hypot(shell.vx, shell.vz);
+  if (speed < 1e-6) return HIT_ZONE_SIDE_MUL;
+
+  const cos = (shell.vx * Math.sin(targetAngle) + shell.vz * Math.cos(targetAngle)) / speed;
+  if (cos <= -HIT_ZONE_COS) return HIT_ZONE_FRONT_MUL;
+  if (cos >= HIT_ZONE_COS) return HIT_ZONE_REAR_MUL;
+  return HIT_ZONE_SIDE_MUL;
 }
 
 /** Отражает снаряд от грани и гасит часть скорости. Мутирует shell. */

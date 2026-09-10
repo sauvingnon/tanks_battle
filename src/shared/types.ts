@@ -58,13 +58,11 @@ export const BOOM_GROUND = 0; // снаряд разбился о препятс
 export const BOOM_HIT = 1; // попадание в танк
 export const BOOM_KILL = 2; // танк уничтожен
 export const BOOM_RICOCHET = 3; // снаряд чиркнул по стене и полетел дальше
-export const BOOM_NEAR = 4; // снаряд прошёл рядом с танком, не задев — подавление
 export type BoomKind =
   | typeof BOOM_GROUND
   | typeof BOOM_HIT
   | typeof BOOM_KILL
-  | typeof BOOM_RICOCHET
-  | typeof BOOM_NEAR;
+  | typeof BOOM_RICOCHET;
 
 /** Событие взрыва за тик (короткие ключи — трафик). */
 export interface Boom {
@@ -73,6 +71,13 @@ export interface Boom {
   k: BoomKind;
   /** id стрелявшего — по нему клиент рисует себе отметку о попадании. */
   o: number;
+}
+
+/** Событие попадания за тик: сколько именно урона снял этот удар. */
+export interface HitFx {
+  x: number;
+  z: number;
+  amount: number;
 }
 
 /** Команды. Огонь по своим включён, так что команда — это только «за кого играешь». */

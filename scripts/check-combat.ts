@@ -7,6 +7,9 @@
  */
 import {
   DT,
+  HIT_ZONE_FRONT_MUL,
+  HIT_ZONE_REAR_MUL,
+  HIT_ZONE_SIDE_MUL,
   MAX_BOUNCES,
   MAX_HP,
   MAX_SPEED,
@@ -16,6 +19,7 @@ import {
   RESPAWN_S,
   RICOCHET_SPEED_KEEP,
   SHELL_DAMAGE,
+  SHELL_DAMAGE_SPREAD,
   SHELL_LIFETIME,
   SHELL_SPEED,
   TANK_RADIUS,
@@ -37,6 +41,11 @@ import { Room, type Player } from '../src/server/room.js';
 
 const checks: Array<[string, boolean]> = [];
 const check = (label: string, ok: boolean) => checks.push([label, ok]);
+
+// Урон снаряда теперь плавает: точное «снял ровно SHELL_DAMAGE» больше не
+// гарантировано, проверки ниже сравнивают с границами разброса.
+const SHELL_DAMAGE_MIN = Math.round(SHELL_DAMAGE * (1 - SHELL_DAMAGE_SPREAD));
+const SHELL_DAMAGE_MAX = Math.round(SHELL_DAMAGE * (1 + SHELL_DAMAGE_SPREAD));
 
 /** Ставит танк в заданную точку и разворачивает корпус и башню по углу. */
 function place(player: Player, x: number, z: number, angle: number): void {
@@ -78,7 +87,9 @@ const noop = () => {};
   const target = room.add('Мишень', noop);
   // Свободный коридор: на x = 30 между z = 40 и z = 55 препятствий нет.
   place(shooter, 30, 40, 0); // угол 0 смотрит в +Z
-  place(target, 30, 58, Math.PI);
+  // Цель развёрнута бортом — зона попадания нейтральная (×1), тест про сам факт
+  // урона и его разброс, а не про зоны (см. блок 9а).
+  place(target, 30, 58, Math.PI / 2);
 
   const booms = run(room, 1, [shooter]);
   check('выстрел рождает снаряд', room.shellCount === 1);
@@ -86,7 +97,10 @@ const noop = () => {};
 
   // 18 м на 62 м/с — примерно 9 тиков; берём с запасом.
   const flight = run(room, 15);
-  check('снаряд снял 25 HP', target.hp === MAX_HP - SHELL_DAMAGE);
+  check(
+    'снаряд снял урон в пределах разброса',
+    target.hp >= MAX_HP - SHELL_DAMAGE_MAX && target.hp <= MAX_HP - SHELL_DAMAGE_MIN,
+  );
   check('было событие попадания', flight.includes(BOOM_HIT));
   check('снаряд исчез после попадания', room.shellCount === 0);
   check('стрелявший цел', shooter.hp === MAX_HP);
@@ -119,13 +133,23 @@ const noop = () => {};
   let kills: Array<{ killer: string; victim: string }> = [];
   const reloadTicks = Math.round(RELOAD_S * TICK_HZ);
 
-  for (let shot = 0; shot < 4; shot++) {
-    // Танки могли сдвинуться от расталкивания — возвращаем на позиции.
-    place(shooter, 30, 40, 0);
-    place(target, 30, 58, Math.PI);
-    run(room, 1, [shooter]);
-    run(room, reloadTicks);
-    kills = kills.concat(room.drainKills());
+  // Урон снаряда теперь берёт разброс из Math.random() на каждом выстреле;
+  // здесь важна не сама рулетка (её гоняет проверка №1), а то, что урон
+  // копится и убивает — поэтому на время серии он зафиксирован на среднем.
+  const realRandom = Math.random;
+  Math.random = () => 0.5;
+  try {
+    for (let shot = 0; shot < 4; shot++) {
+      // Танки могли сдвинуться от расталкивания — возвращаем на позиции. Цель
+      // бортом к стрелку — зона нейтральная, серия проверяет только накопление HP.
+      place(shooter, 30, 40, 0);
+      place(target, 30, 58, Math.PI / 2);
+      run(room, 1, [shooter]);
+      run(room, reloadTicks);
+      kills = kills.concat(room.drainKills());
+    }
+  } finally {
+    Math.random = realRandom;
   }
 
   check('четыре попадания = 0 HP', target.hp === 0);
@@ -176,10 +200,13 @@ const noop = () => {};
   check('низкий блок не попал в список укрытий', room.cover.length === 0);
 
   place(shooter, 0, 40, 0);
-  place(target, 0, 58, Math.PI);
+  place(target, 0, 58, Math.PI / 2); // бортом — зона нейтральная
   run(room, 1, [shooter]);
   run(room, 15);
-  check('снаряд прошёл над низким укрытием', target.hp === MAX_HP - SHELL_DAMAGE);
+  check(
+    'снаряд прошёл над низким укрытием',
+    target.hp >= MAX_HP - SHELL_DAMAGE_MAX && target.hp <= MAX_HP - SHELL_DAMAGE_MIN,
+  );
 
   // А проехать сквозь него по-прежнему нельзя: столкновения считаются по всем блокам.
   place(shooter, 0, 40, 0);
@@ -292,14 +319,50 @@ const noop = () => {};
   const room = new Room();
   const shooter = room.add('Стрелок', noop);
   const target = room.add('Мишень', noop);
-  target.hp = SHELL_DAMAGE; // добиваем с одного выстрела
+  target.hp = SHELL_DAMAGE_MIN - 1; // добиваем с одного выстрела даже при минимальном броске урона
   place(shooter, 30, 40, 0);
-  place(target, 30, 58, Math.PI);
+  place(target, 30, 58, Math.PI / 2); // бортом — зона нейтральная, не занижает гарантию добивания
 
   run(room, 1, [shooter]);
   const booms = run(room, 15);
   check('смерть приходит событием BOOM_KILL', booms.includes(BOOM_KILL));
   check('обычного попадания при добивании нет', !booms.includes(BOOM_HIT));
+}
+
+// --- 9а. Зона попадания: лоб слабее, борт нейтрально, корма сильнее ---
+{
+  // Разброс фиксируем на среднем — интересуют чистые зональные коэффициенты,
+  // сам разброс уже проверен в блоке №1.
+  const realRandom = Math.random;
+  Math.random = () => 0.5;
+  let front = 0;
+  let side = 0;
+  let rear = 0;
+  try {
+    // Стрелок всегда бьёт в +Z с одной и той же позиции; меняется только то,
+    // куда развёрнута корпусом цель.
+    const dealt = (targetAngle: number): number => {
+      const room = new Room();
+      const shooter = room.add('Стрелок', noop);
+      const target = room.add('Мишень', noop);
+      place(shooter, 30, 40, 0);
+      place(target, 30, 58, targetAngle);
+      run(room, 1, [shooter]);
+      run(room, 15);
+      return MAX_HP - target.hp;
+    };
+
+    front = dealt(Math.PI); // цель смотрит на стрелка — снаряд входит в лоб
+    side = dealt(Math.PI / 2); // цель бортом к выстрелу
+    rear = dealt(0); // цель смотрит туда же, куда летит снаряд, — вход со спины
+  } finally {
+    Math.random = realRandom;
+  }
+
+  check('лоб бьёт слабее базового урона', front === Math.round(SHELL_DAMAGE * HIT_ZONE_FRONT_MUL));
+  check('борт не меняет базовый урон', side === Math.round(SHELL_DAMAGE * HIT_ZONE_SIDE_MUL));
+  check('корма бьёт сильнее базового урона', rear === Math.round(SHELL_DAMAGE * HIT_ZONE_REAR_MUL));
+  check('лоб < борта < кормы', front < side && side < rear);
 }
 
 // --- 10. Скольжение вдоль грани ---

@@ -71,7 +71,6 @@ import {
   BOOM_GROUND,
   BOOM_HIT,
   BOOM_KILL,
-  BOOM_NEAR,
   BOOM_RICOCHET,
   type Box,
   type BoomKind,
@@ -261,6 +260,13 @@ const LABEL_HEIGHT = 3.7;
 /** Дальше этого ники не рисуем — всё равно нечитаемо, а DOM грузится. */
 const LABEL_MAX_DISTANCE = 160;
 
+/** Сколько висит цифра урона, с. */
+const DAMAGE_NUMBER_LIFE = 1.1;
+/** На сколько метров цифра всплывает за свою жизнь. */
+const DAMAGE_NUMBER_RISE = 2.4;
+/** Доля жизни, после которой цифра гаснет, а не стоит в полную силу. */
+const DAMAGE_NUMBER_FADE_FROM = 0.55;
+
 /**
  * Как выглядит вспышка: radius — размер шара, life — сколько живёт, ring — кольцо
  * по земле, cone — длина направленного языка пламени, rise — с какой скоростью
@@ -288,8 +294,6 @@ const BOOM_PRESETS: Record<BoomKind, EffectPreset> = {
   [BOOM_KILL]: { radius: 4.2, life: 0.75, color: 0xff8a3c, ring: true, glow: GLOW_KILL },
   // Рикошет — короткая белая искра: снаряд жив и полетел дальше, взрыва не было.
   [BOOM_RICOCHET]: { radius: 0.9, life: 0.16, color: 0xfff4c8, glow: GLOW_RICOCHET },
-  // Близкий разрыв: не огонь, а холодная короткая вспышка воздуха рядом с бортом.
-  [BOOM_NEAR]: { radius: 1.1, life: 0.18, color: 0xd8e6ff, glow: GLOW_RICOCHET },
 };
 
 /** На какой высоте рвануло: у земли, по корпусу танка или на высоте полёта снаряда. */
@@ -298,7 +302,6 @@ const BOOM_HEIGHT: Record<BoomKind, number> = {
   [BOOM_HIT]: 1.4,
   [BOOM_KILL]: 1.4,
   [BOOM_RICOCHET]: SHELL_HEIGHT,
-  [BOOM_NEAR]: SHELL_HEIGHT,
 };
 
 /**
@@ -481,6 +484,18 @@ export interface TankHandle {
   hp: number;
 }
 
+/** Одна всплывающая цифра урона: DOM-узел плюс мировая точка, от которой он растёт. */
+interface DamageNumberHandle {
+  el: HTMLElement;
+  x: number;
+  z: number;
+  /** Высота старта; сама цифра всплывает вверх на DAMAGE_NUMBER_RISE. */
+  baseY: number;
+  /** Небольшой случайный снос в сторону — иначе очередь попаданий рисует числа стопкой. */
+  driftX: number;
+  age: number;
+}
+
 interface ShellHandle {
   /** Снаряд и его трассер ездят вместе, поэтому это группа, а не меш. */
   group: THREE.Group;
@@ -657,6 +672,9 @@ export class Scene3D {
    */
   private bushMeshes: THREE.InstancedMesh[] = [];
   private activeBush = -1;
+
+  /** Всплывающие цифры урона — DOM-элементы поверх сцены, как и ники. */
+  private readonly damageNumbers: DamageNumberHandle[] = [];
 
   /** Рабочие векторы для дульной вспышки: считается она несколько раз в секунду. */
   private readonly muzzlePoint = new THREE.Vector3();
@@ -1791,6 +1809,64 @@ export class Scene3D {
   }
 
   /**
+   * Цифра урона над местом попадания: всплывает и гаснет, как ники — DOM поверх
+   * канваса, а не спрайт в сцене, иначе текст на ходу мылился бы точно так же,
+   * как мылились бы ники через CSS2DRenderer (см. updateLabels).
+   */
+  damageNumber(x: number, z: number, amount: number): void {
+    const el = document.createElement('div');
+    el.className = 'dmg-number';
+    el.textContent = String(amount);
+    this.labelContainer.appendChild(el);
+    this.damageNumbers.push({
+      el,
+      x,
+      z,
+      baseY: LABEL_HEIGHT,
+      driftX: (Math.random() * 2 - 1) * 0.8,
+      age: 0,
+    });
+  }
+
+  /** Поднимает и гасит цифры урона; отработавшие убирает из DOM. */
+  private updateDamageNumbers(dt: number): void {
+    if (this.damageNumbers.length === 0) return;
+    this.active.updateMatrixWorld();
+
+    for (let i = this.damageNumbers.length - 1; i >= 0; i--) {
+      const dn = this.damageNumbers[i];
+      dn.age += dt;
+      if (dn.age >= DAMAGE_NUMBER_LIFE) {
+        dn.el.remove();
+        this.damageNumbers.splice(i, 1);
+        continue;
+      }
+
+      const t = dn.age / DAMAGE_NUMBER_LIFE;
+      // Взлёт быстрый вначале и гасит ход к концу — не равномерный подъём.
+      const ease = 1 - (1 - t) * (1 - t);
+      const y = dn.baseY + DAMAGE_NUMBER_RISE * ease;
+
+      this.projected.set(dn.x + dn.driftX * t, y, dn.z);
+      this.projected.project(this.active);
+      if (this.projected.z < -1 || this.projected.z > 1) {
+        dn.el.style.opacity = '0';
+        continue;
+      }
+
+      const x = Math.round((this.projected.x * 0.5 + 0.5) * this.viewWidth);
+      const yPx = Math.round((-this.projected.y * 0.5 + 0.5) * this.viewHeight);
+      const opacity = t < DAMAGE_NUMBER_FADE_FROM ? 1 : 1 - (t - DAMAGE_NUMBER_FADE_FROM) / (1 - DAMAGE_NUMBER_FADE_FROM);
+      // Лёгкий наезд масштабом в первый миг — попадание «выбивает» цифру, а не
+      // просто рисует её.
+      const scale = t < 0.15 ? 0.6 + 0.4 * (t / 0.15) : 1;
+
+      dn.el.style.transform = `translate(${x}px, ${yPx}px) translate(-50%, -50%) scale(${scale.toFixed(2)})`;
+      dn.el.style.opacity = opacity.toFixed(2);
+    }
+  }
+
+  /**
    * Качнуть танк, в который прилетело. Кого именно задело, снапшот не сообщает —
    * и не нужно: снаряд взрывается ровно на границе круга цели, то есть в 2.7 м
    * от её центра, поэтому ближайший танк и есть тот самый. Заодно из места
@@ -2098,6 +2174,7 @@ export class Scene3D {
     if (this.bloomOn) this.composer.render();
     else this.renderer.render(this.scene, this.active);
     this.updateLabels();
+    this.updateDamageNumbers(dt);
   }
 
   /**

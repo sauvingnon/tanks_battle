@@ -35,6 +35,7 @@
   RELOAD_S,
   RESPAWN_S,
   SHELL_DAMAGE,
+  SHELL_DAMAGE_SPREAD,
   SHELL_RADIUS,
   TANK_RADIUS,
   TICK_HZ,
@@ -58,6 +59,7 @@ import {
   bounceShell,
   canRicochet,
   clamp,
+  hitZoneDamageMul,
   resolveTankCollisions,
   spawnShell,
   stepShell,
@@ -71,7 +73,6 @@ import {
   BOOM_GROUND,
   BOOM_HIT,
   BOOM_KILL,
-  BOOM_NEAR,
   BOOM_RICOCHET,
   TEAM_BOTS,
   TEAM_PLAYERS,
@@ -80,6 +81,7 @@ import {
   type Boom,
   type BoomKind,
   type Box,
+  type HitFx,
   type Input,
   type PlayerInfo,
   type ShellState,
@@ -266,6 +268,8 @@ export class Room {
 
   /** События одного тика: очищаются в начале update(), забираются после. */
   private booms: Boom[] = [];
+  /** Сумма урона по каждому попаданию — снаряд ли, таран ли, клиент рисует цифрой. */
+  private hits: HitFx[] = [];
   private kills: KillEvent[] = [];
 
   /** emit рассылает сообщение всем людям в комнате; в тестах его можно не давать. */
@@ -365,6 +369,7 @@ export class Room {
   update(): void {
     this.tick++;
     this.booms = [];
+    this.hits = [];
 
     if (isCoopMode(this.mode)) this.updateWave();
     if (this.bonusesOn) this.updateBonuses();
@@ -606,12 +611,9 @@ export class Room {
       if (grazed.length > 0) {
         const shooter = this.players.get(shell.owner);
         for (const near of grazed) {
-          this.suppress(near);
           // Трассер прошёл рядом — заметно и без прямого попадания, даже если
           // стрелявший был далеко и звук выстрела туда не долетел (см. tryFire).
           if (shooter) this.notice(near, shooter);
-          // Взрыв рисуем у задетого танка, а не у снаряда — иначе тряхнёт не там, где реально свистнуло.
-          this.booms.push({ x: near.state.x, z: near.state.z, k: BOOM_NEAR, o: shell.owner });
         }
       }
 
@@ -677,13 +679,16 @@ export class Room {
     return near;
   }
 
-  /** Близкий разрыв (или уцелевшее попадание) на время сбивает точность и трясёт камеру. */
+  /** Уцелевшее попадание на время сбивает точность. */
   private suppress(target: Player): void {
     target.suppressedUntil = this.tick + SUPPRESS_TICKS;
   }
 
   private damage(victim: Player, shell: ShellState): void {
-    if (this.hurt(victim, shell.dmg ?? SHELL_DAMAGE, shell.owner)) return;
+    // Зона считается по курсу корпуса в момент попадания, а не по башне: бронирует
+    // корпус, и башня, довёрнутая в сторону, зону не меняет.
+    const amount = Math.round((shell.dmg ?? SHELL_DAMAGE) * hitZoneDamageMul(shell, victim.state.angle));
+    if (this.hurt(victim, amount, shell.owner)) return;
     this.boom(shell, BOOM_HIT);
   }
 
@@ -708,6 +713,10 @@ export class Room {
     // и второго из них искать в комнате уже поздно.
     const killer = this.players.get(killerId);
     const killerName = name ?? killer?.name ?? this.ghosts.get(killerId) ?? 'Неизвестный';
+
+    // Цифра всплывает там, где сейчас стоит жертва, — не там, где снаряд взорвался
+    // (у тарана взрыва вовсе нет), и одна точка годится и на выстрел, и на таран.
+    this.hits.push({ x: victim.state.x, z: victim.state.z, amount });
 
     victim.hp -= amount;
     if (victim.hp > 0) {
@@ -1234,6 +1243,11 @@ export class Room {
   /** Взрывы этого тика. */
   get boomEvents(): Boom[] {
     return this.booms;
+  }
+
+  /** Попадания этого тика — сумма урона на каждое. */
+  get hitEvents(): HitFx[] {
+    return this.hits;
   }
 
   /** Забирает накопленные фраги: вызывать раз за тик после update(). */
