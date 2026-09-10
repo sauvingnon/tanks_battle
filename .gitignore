@@ -2,6 +2,7 @@ node_modules/
 dist/
 dist-server/
 out/
+data/
 *.log
 .env
 .DS_Store
