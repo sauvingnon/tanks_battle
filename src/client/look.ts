@@ -11,10 +11,10 @@
  * Яркость сцены. Крутить эти четыре числа, если картинка кажется тёмной или
  * пересвеченной; оттенки света задаются отдельно и их менять не нужно.
  */
-export const EXPOSURE = 1.18; // общая экспозиция поверх тонмаппинга
-export const SUN_INTENSITY = 2.7; // прямой свет: даёт блики и тени
-export const AMBIENT_INTENSITY = 2.0; // заполняющий свет: насколько черны тени
-export const FILL_INTENSITY = 0.5; // подсветка с теневой стороны
+export const EXPOSURE = 1.3; // общая экспозиция поверх тонмаппинга
+export const SUN_INTENSITY = 2.85; // прямой свет: даёт блики и тени
+export const AMBIENT_INTENSITY = 2.2; // заполняющий свет: насколько черны тени
+export const FILL_INTENSITY = 0.72; // подсветка с теневой стороны
 
 // --- Свечение ---
 
@@ -54,18 +54,29 @@ export const PALETTE = [
 ];
 
 /** Цвета ящиков: ремонт, урон, заряжание, ход, маскировка. Светятся намеренно. */
-export const BONUS_COLORS = [0x6ad46a, 0xff7a4d, 0xffd24d, 0x4db8ff, 0xb388ff];
+export const BONUS_COLORS = [
+  0x6ad46a,
+  0xff7a4d,
+  0xffd24d,
+  0x4db8ff,
+  0xb388ff,
+  0xd8e2ef,
+  0xf05a5a,
+  0xffc857,
+  0x5ce1e6,
+];
 
 export const COLOR_GROUND = 0x39412f;
 export const COLOR_WALL = 0x4a5160;
 export const COLOR_BOX = 0x6d6357;
 /**
- * Низкое укрытие — куст из мелких листовых кубиков (см. Scene3D.buildBush):
- * палитра тонов на кубик, а не один цвет на блок — так кластер не выглядит
- * плоской крашеной коробкой. «Сквозь это простреливается» по-прежнему решает
- * высота блока (h < SHELL_HEIGHT), цвет тут не игровой сигнал, а вид объекта.
+ * Низкое укрытие — кластер приглушённых фасеточных листьев (см. Scene3D.buildBush):
+ * палитра тонов на экземпляр, а не один цвет на блок — так куст поддерживает
+ * низкополигональный стиль карты и не выглядит ярким воксельным пятном.
+ * «Сквозь это простреливается» по-прежнему решает высота блока
+ * (h < SHELL_HEIGHT), цвет тут не игровой сигнал, а вид объекта.
  */
-export const LEAF_COLORS = [0x4f8f3a, 0x5fa844, 0x3f7a2e, 0x5a9c48];
+export const LEAF_COLORS = [0x3f6538, 0x4f7740, 0x304f31, 0x5b8146];
 export const COLOR_TRACK = 0x23262b;
 export const COLOR_METAL = 0x3a3f47;
 
@@ -78,6 +89,11 @@ export const COLOR_METAL = 0x3a3f47;
 export const COLOR_HOUSE_WALL = 0x9c8f6e;
 export const COLOR_ROOF = 0x5c3a30;
 export const COLOR_CRATE = 0x7d5a36;
+export const COLOR_ROAD = 0x2d3336;
+export const COLOR_SIDEWALK = 0x77766d;
+export const COLOR_CAR = 0x8c4e3e;
+export const COLOR_TREE_TRUNK = 0x5b4632;
+export const TREE_LEAF_COLORS = [0x355d38, 0x416f3d, 0x2d5233];
 
 /**
  * Всё, что красится обычной краской и светиться не должно. Список нужен не для
@@ -95,6 +111,11 @@ export const PAINTED_COLORS = [
   COLOR_HOUSE_WALL,
   COLOR_ROOF,
   COLOR_CRATE,
+  COLOR_ROAD,
+  COLOR_SIDEWALK,
+  COLOR_CAR,
+  COLOR_TREE_TRUNK,
+  ...TREE_LEAF_COLORS,
 ];
 
 /** sRGB -> линейное пространство, в котором и живёт вся арифметика света. */

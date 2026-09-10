@@ -27,9 +27,11 @@ import { scaleBoxUv } from './textures.js';
 const ARMOR_TILE = 2;
 
 /** Насколько трак отнесён от оси корпуса. Тот же, что и у следов на земле. */
-export const TRACK_SIDE = 1.7;
+export const TRACK_SIDE = 1.5;
 /** Полка корпуса уже ходовой: не должна закрывать сверху подвижную ленту. */
 const HULL_SHELF_SIDE = 1.45;
+/** Брызговик поднят над увеличенной лентой, чтобы не пересекаться с ней при крене. */
+const HULL_SHELF_Y = 1.3;
 
 /** Высота погона башни над новой низкой палубой корпуса. */
 export const TURRET_Y = 1.4;
@@ -53,14 +55,22 @@ export const MUZZLE_TIP_Z = MUZZLE_OFFSET;
 /** Сколько настоящих звеньев видно на одной гусенице. Два InstancedMesh на танк. */
 export const TRACK_LINK_COUNT = 22;
 
-const TRACK_TOP_Y = 1.04;
-const TRACK_BOTTOM_Y = 0.18;
-const TRACK_CENTER_Y = (TRACK_TOP_Y + TRACK_BOTTOM_Y) / 2;
-const TRACK_RADIUS = (TRACK_TOP_Y - TRACK_BOTTOM_Y) / 2;
-const TRACK_TANGENT_Z = 1.65;
-const TRACK_STRAIGHT = TRACK_TANGENT_Z * 2;
-const TRACK_ARC = Math.PI * TRACK_RADIUS;
-const TRACK_LOOP = TRACK_STRAIGHT * 2 + TRACK_ARC * 2;
+const TRACK_FRONT_Z = 1.68;
+const TRACK_REAR_Z = -1.68;
+const TRACK_FRONT_CENTER_Y = 0.64;
+const TRACK_REAR_CENTER_Y = 0.56;
+const TRACK_FRONT_RADIUS = 0.46;
+const TRACK_REAR_RADIUS = 0.34;
+const TRACK_ROAD_WHEEL_Y = 0.48;
+const TRACK_FRONT_TOP_Y = TRACK_FRONT_CENTER_Y + TRACK_FRONT_RADIUS;
+const TRACK_FRONT_BOTTOM_Y = TRACK_FRONT_CENTER_Y - TRACK_FRONT_RADIUS;
+const TRACK_REAR_TOP_Y = TRACK_REAR_CENTER_Y + TRACK_REAR_RADIUS;
+const TRACK_REAR_BOTTOM_Y = TRACK_REAR_CENTER_Y - TRACK_REAR_RADIUS;
+const TRACK_TOP_LENGTH = Math.hypot(TRACK_FRONT_Z - TRACK_REAR_Z, TRACK_FRONT_TOP_Y - TRACK_REAR_TOP_Y);
+const TRACK_BOTTOM_LENGTH = Math.hypot(TRACK_FRONT_Z - TRACK_REAR_Z, TRACK_FRONT_BOTTOM_Y - TRACK_REAR_BOTTOM_Y);
+const TRACK_FRONT_ARC = Math.PI * TRACK_FRONT_RADIUS;
+const TRACK_REAR_ARC = Math.PI * TRACK_REAR_RADIUS;
+const TRACK_LOOP = TRACK_TOP_LENGTH + TRACK_FRONT_ARC + TRACK_BOTTOM_LENGTH + TRACK_REAR_ARC;
 
 /**
  * Ставит звено на замкнутый контур гусеницы. Верх и низ идут вдоль Z, а у
@@ -75,24 +85,29 @@ export function placeTrackLink(
 ): void {
   let distance = (phase + (index / TRACK_LINK_COUNT) * TRACK_LOOP) % TRACK_LOOP;
   if (distance < 0) distance += TRACK_LOOP;
-  let y = TRACK_TOP_Y;
-  let z = -TRACK_TANGENT_Z;
+  let y = TRACK_REAR_TOP_Y;
+  let z = TRACK_REAR_Z;
   let pitch = 0;
-  if (distance < TRACK_STRAIGHT) {
-    z += distance;
-  } else if ((distance -= TRACK_STRAIGHT) < TRACK_ARC) {
-    const theta = Math.PI / 2 - distance / TRACK_RADIUS;
-    z = TRACK_TANGENT_Z + Math.cos(theta) * TRACK_RADIUS;
-    y = TRACK_CENTER_Y + Math.sin(theta) * TRACK_RADIUS;
+  if (distance < TRACK_TOP_LENGTH) {
+    const t = distance / TRACK_TOP_LENGTH;
+    z = TRACK_REAR_Z + (TRACK_FRONT_Z - TRACK_REAR_Z) * t;
+    y = TRACK_REAR_TOP_Y + (TRACK_FRONT_TOP_Y - TRACK_REAR_TOP_Y) * t;
+    pitch = -Math.atan2(TRACK_FRONT_TOP_Y - TRACK_REAR_TOP_Y, TRACK_FRONT_Z - TRACK_REAR_Z);
+  } else if ((distance -= TRACK_TOP_LENGTH) < TRACK_FRONT_ARC) {
+    const theta = Math.PI / 2 - distance / TRACK_FRONT_RADIUS;
+    z = TRACK_FRONT_Z + Math.cos(theta) * TRACK_FRONT_RADIUS;
+    y = TRACK_FRONT_CENTER_Y + Math.sin(theta) * TRACK_FRONT_RADIUS;
     pitch = Math.PI / 2 - theta;
-  } else if ((distance -= TRACK_ARC) < TRACK_STRAIGHT) {
-    z = TRACK_TANGENT_Z - distance;
-    y = TRACK_BOTTOM_Y;
+  } else if ((distance -= TRACK_FRONT_ARC) < TRACK_BOTTOM_LENGTH) {
+    const t = distance / TRACK_BOTTOM_LENGTH;
+    z = TRACK_FRONT_Z + (TRACK_REAR_Z - TRACK_FRONT_Z) * t;
+    y = TRACK_FRONT_BOTTOM_Y + (TRACK_REAR_BOTTOM_Y - TRACK_FRONT_BOTTOM_Y) * t;
+    pitch = Math.PI + Math.atan2(TRACK_REAR_BOTTOM_Y - TRACK_FRONT_BOTTOM_Y, TRACK_FRONT_Z - TRACK_REAR_Z);
   } else {
-    distance -= TRACK_STRAIGHT;
-    const theta = -Math.PI / 2 + distance / TRACK_RADIUS;
-    z = -TRACK_TANGENT_Z - Math.cos(theta) * TRACK_RADIUS;
-    y = TRACK_CENTER_Y + Math.sin(theta) * TRACK_RADIUS;
+    distance -= TRACK_BOTTOM_LENGTH;
+    const theta = -Math.PI / 2 + distance / TRACK_REAR_RADIUS;
+    z = TRACK_REAR_Z - Math.cos(theta) * TRACK_REAR_RADIUS;
+    y = TRACK_REAR_CENTER_Y + Math.sin(theta) * TRACK_REAR_RADIUS;
     pitch = theta - Math.PI / 2;
   }
   // Подвижная лента сидит поверх катков, ближе к корпусу, а не висит отдельной
@@ -152,14 +167,18 @@ export interface TankGeometry {
 export function buildTankGeometry(): TankGeometry {
   const hull = mergeGeometries([
     // Клиновидный корпус: низкий нос, приподнятая палуба и явная кормовая
-    // ниша. Старый набор параллельных коробок заменён на один читаемый силуэт.
+    // ниша. Носовая кромка теперь читается даже когда ствол смотрит в сторону.
     at(box(2.5, 0.46, 3.72), 0, 0.93, 0),
     at(tilted(box(2.4, 0.72, 0.16), -0.34), 0, 1.12, 1.83),
+    at(box(2.18, 0.22, 0.28), 0, 0.69, 1.82),
     at(box(2.12, 0.28, 1.84), 0, 1.3, 0.15),
     at(box(2.22, 0.24, 1.2), 0, 1.36, -1.22),
+    // Отдельная плоская кормовая броня противопоставляет зад лобовой наклонной
+    // плите и не даёт корпусу выглядеть одинаковым с обеих сторон.
+    at(box(2.16, 0.28, 0.18), 0, 0.84, -1.82),
     // Узкие полки над лентой, не перекрывающие сами траки со стороны камеры.
-    at(box(0.54, 0.12, 3.82), HULL_SHELF_SIDE, 1.18, 0),
-    at(box(0.54, 0.12, 3.82), -HULL_SHELF_SIDE, 1.18, 0),
+    at(box(0.54, 0.12, 3.82), HULL_SHELF_SIDE, HULL_SHELF_Y, 0),
+    at(box(0.54, 0.12, 3.82), -HULL_SHELF_SIDE, HULL_SHELF_Y, 0),
     // Две боковые ячейки и небольшой ящик ЗИП оживляют корму.
     at(box(0.44, 0.22, 0.78), -1.17, 1.3, -1.2),
     at(box(0.44, 0.22, 0.78), 1.17, 1.3, -1.2),
@@ -171,44 +190,56 @@ export function buildTankGeometry(): TankGeometry {
     const x = side * TRACK_SIDE;
     // Матовая подложка уходит за подвижные звенья и держит тёмный контур ленты.
     running.push(at(box(0.32, 0.6, 3.62), x, 0.55, 0));
-    wheels.push(at(wheel(0.43, 0.52), x, 0.55, 1.68));
-    wheels.push(at(wheel(0.43, 0.52), x, 0.55, -1.68));
-    for (const z of [-1.08, -0.36, 0.36, 1.08]) wheels.push(at(wheel(0.28, 0.48, 12), x, 0.38, z));
+    // Спереди крупная ведущая звёздочка, сзади заметно меньший ленивец —
+    // ходовая сама подсказывает направление движения даже без ствола в кадре.
+    wheels.push(at(wheel(TRACK_FRONT_RADIUS, 0.54), x, TRACK_FRONT_CENTER_Y, TRACK_FRONT_Z));
+    wheels.push(at(wheel(TRACK_REAR_RADIUS, 0.5), x, TRACK_REAR_CENTER_Y, TRACK_REAR_Z));
+    // Опорные катки лежат внутри нижней ветви ленты, а не ниже неё: после
+    // увеличения передней звёздочки старое y = 0.38 визуально проваливало их.
+    for (const z of [-1.08, -0.36, 0.36, 1.08]) {
+      wheels.push(at(wheel(0.28, 0.48, 12), x, TRACK_ROAD_WHEEL_Y, z));
+    }
   }
 
   // Металлические акценты корпуса. Они маленькие, но дают танку «сборку»:
-  // фары впереди, буксирные проушины и три полосы моторной решётки сзади.
+  // фары и бампер впереди, буксирные проушины и моторная решётка сзади.
   const hullMetal = mergeGeometries([
     at(box(0.22, 0.13, 0.24), -0.86, 1.26, 1.92),
     at(box(0.22, 0.13, 0.24), 0.86, 1.26, 1.92),
     at(box(0.14, 0.12, 0.42), -0.92, 1.14, 1.8),
     at(box(0.14, 0.12, 0.42), 0.92, 1.14, 1.8),
+    at(box(1.7, 0.12, 0.12), 0, 0.72, 1.96),
     ...[-0.62, -0.2, 0.2, 0.62].map((x) => at(box(0.13, 0.07, 0.62), x, 1.51, -1.2)),
+    at(box(1.55, 0.12, 0.14), 0, 0.86, -1.92),
+    at(new THREE.CylinderGeometry(0.13, 0.13, 0.36, 10).toNonIndexed(), -0.78, 1.43, -1.68),
+    at(new THREE.CylinderGeometry(0.13, 0.13, 0.36, 10).toNonIndexed(), 0.78, 1.43, -1.68),
   ]);
 
   // Дальше всё в координатах башни: её узел сидит на высоте TURRET_Y.
   const turret = mergeGeometries([
-    // Компактная башня с вынесенной кормовой нишей и передними скулами.
-    at(box(1.72, 0.56, 1.62), 0, 0.32, 0),
-    at(tilted(box(1.55, 0.42, 0.15), -0.36), 0, 0.31, 0.88),
-    at(box(1.34, 0.36, 0.72), 0, 0.3, -1.02),
-    at(box(1.12, 0.12, 0.88), 0, 0.66, -0.16),
-    // Маска — часть брони башни, а не отдельный гладкий цилиндр. Широкий
-    // наклонный щит продолжает передние скулы и зрительно «сажает» пушку.
-    at(tilted(box(1.04, 0.58, 0.3), -0.18), 0, MUZZLE_Y, 0.88),
-    at(box(1.18, 0.16, 0.28), 0, MUZZLE_Y - 0.25, 0.84),
+    // Основной объём башни поднимается до линии орудия: ствол проходит через
+    // броню, а не висит над низкой коробкой.
+    at(box(1.8, 0.68, 1.4), 0, 0.34, -0.05),
+    at(tilted(box(1.62, 0.42, 0.2), -0.32), 0, 0.43, 0.76),
+    // Кормовой модуль намеренно поднят и чуть отодвинут назад: он парит над
+    // основной башней отдельной навесной бронёй, а не сливается с ней коробкой.
+    at(box(1.46, 0.24, 0.64), 0, 0.6, -1.12),
+    // Небольшая крыша связывает командирские детали с бронёй, без зазоров.
+    at(box(1.28, 0.12, 0.84), 0, 0.68, -0.2),
+    // Одна компактная маска вокруг оси орудия вместо двух высоких щитов.
+    at(tilted(box(1.02, 0.34, 0.28), -0.12), 0, MUZZLE_Y - 0.04, 0.86),
   ]);
 
   const turretMetal = mergeGeometries([
-    // Под броневым щитом видна лишь механическая цапфа: компактное кольцо,
-    // которое связывает маску с откатной частью орудия.
-    at(alongZ(new THREE.CylinderGeometry(0.28, 0.28, 0.32, 12)), 0, MUZZLE_Y, 1.06),
-    at(new THREE.CylinderGeometry(0.3, 0.3, 0.26, 12), 0.48, 0.77, -0.2),
+    // Под единой маской видна компактная цапфа, а не вторая самостоятельная
+    // маска, поэтому казённик читается частью башни.
+    at(alongZ(new THREE.CylinderGeometry(0.24, 0.24, 0.24, 12)), 0, MUZZLE_Y, 1.04),
+    at(new THREE.CylinderGeometry(0.3, 0.3, 0.16, 12), 0.48, 0.75, -0.2),
     // Люк и прицел на крыше башни.
-    at(new THREE.CylinderGeometry(0.3, 0.3, 0.08, 12), -0.42, 0.72, -0.22),
+    at(new THREE.CylinderGeometry(0.3, 0.3, 0.06, 12), -0.42, 0.75, -0.22),
     // Здесь оставляем обычный индексированный куб: он сливается с цилиндрами
     // маски без промежуточной конвертации и всё равно почти не виден сверху.
-    at(new THREE.BoxGeometry(0.12, 0.18, 0.24), -0.42, 0.84, -0.22),
+    at(new THREE.BoxGeometry(0.12, 0.12, 0.24), -0.42, 0.83, -0.22),
     // Два компактных блока дымовых гранат по бортам башни.
     at(new THREE.CylinderGeometry(0.1, 0.1, 0.25, 8), -0.7, 0.5, -0.58),
     at(new THREE.CylinderGeometry(0.1, 0.1, 0.25, 8), -0.48, 0.5, -0.68),
@@ -217,12 +248,12 @@ export function buildTankGeometry(): TankGeometry {
   ]);
 
   const barrel = mergeGeometries([
-    // Откатная муфта, тонкий ствол и два пояска дают читаемую «механику»
-    // вместо одной трубы. Все части симметричны вокруг того же канала ствола.
-    at(alongZ(new THREE.CylinderGeometry(0.2, 0.16, 0.66, 12)), 0, MUZZLE_Y, 1.37),
-    at(alongZ(new THREE.CylinderGeometry(0.13, 0.15, 2.22, 12)), 0, MUZZLE_Y, 2.81),
-    at(alongZ(new THREE.CylinderGeometry(0.18, 0.18, 0.12, 12)), 0, MUZZLE_Y, 1.78),
-    at(alongZ(new THREE.CylinderGeometry(0.17, 0.17, 0.12, 12)), 0, MUZZLE_Y, 3.62),
+    // Низкий казённик, цельная труба и два тонких пояска — одно орудие,
+    // собранное вокруг линии выстрела, без лишнего второго щита.
+    at(alongZ(new THREE.CylinderGeometry(0.19, 0.16, 0.54, 12)), 0, MUZZLE_Y, 1.35),
+    at(alongZ(new THREE.CylinderGeometry(0.12, 0.14, 2.56, 12)), 0, MUZZLE_Y, 2.82),
+    at(alongZ(new THREE.CylinderGeometry(0.16, 0.16, 0.1, 12)), 0, MUZZLE_Y, 1.65),
+    at(alongZ(new THREE.CylinderGeometry(0.16, 0.16, 0.1, 12)), 0, MUZZLE_Y, 3.62),
     // Конический дульный тормоз с широким основанием — продолжение гранёной
     // маски, а не случайный шарик на конце ствола.
     at(alongZ(new THREE.CylinderGeometry(0.19, 0.24, BRAKE_LENGTH, 12)), 0, MUZZLE_Y, BRAKE_Z),

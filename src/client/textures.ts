@@ -6,8 +6,9 @@
  * забыть про кэш при выкладке. Процедурный шум ничего из этого не требует,
  * весит ноль байт в сборке и рисуется за пару миллисекунд при запуске.
  *
- * Все текстуры серые и светлые: они идут в `map` и умножаются на цвет материала.
- * Так палитра остаётся ровно той же, а поверхность перестаёт быть заливкой.
+ * Большинство текстур серые и светлые: они идут в `map` и умножаются на цвет
+ * материала. Земля — исключение: в неё добавлены редкие приглушённые пятна,
+ * чтобы разные участки поля не выглядели одной заливкой.
  * Заодно умножение только затемняет — то есть запас до порога свечения от этого
  * не сокращается, а растёт.
  */
@@ -125,9 +126,38 @@ function toTexture(canvas: HTMLCanvasElement, renderer: THREE.WebGLRenderer): TH
   return texture;
 }
 
-/** Земля: мелкая крупа с редкими пятнами посветлее. */
+/** Земля: мелкая крупа с редкими плоскими цветными пятнами. */
 export function groundTexture(renderer: THREE.WebGLRenderer): THREE.CanvasTexture {
-  return toTexture(noiseCanvas(0x51ee7, 4, 0.86, 0.42), renderer);
+  const canvas = noiseCanvas(0x51ee7, 4, 0.86, 0.42, (ctx, random) => {
+    // Неровные многоугольники дают спокойную низкополигональную пятнистость,
+    // а не «камуфляж» с резкими кругами. Низкая альфа оставляет шум основным
+    // рисунком и не спорит с тенями от укрытий.
+    const stains = [
+      'rgba(86, 91, 54, 0.11)',
+      'rgba(105, 91, 55, 0.08)',
+      'rgba(48, 62, 49, 0.1)',
+      'rgba(119, 103, 67, 0.06)',
+    ];
+    for (let i = 0; i < 26; i++) {
+      const x = random() * SIZE;
+      const y = random() * SIZE;
+      const radius = 8 + random() * 24;
+      const sides = 5 + ((random() * 3) | 0);
+      ctx.fillStyle = stains[i % stains.length];
+      ctx.beginPath();
+      for (let side = 0; side < sides; side++) {
+        const angle = (side / sides) * Math.PI * 2;
+        const distance = radius * (0.72 + random() * 0.42);
+        const px = x + Math.cos(angle) * distance;
+        const py = y + Math.sin(angle) * distance * (0.65 + random() * 0.45);
+        if (side === 0) ctx.moveTo(px, py);
+        else ctx.lineTo(px, py);
+      }
+      ctx.closePath();
+      ctx.fill();
+    }
+  });
+  return toTexture(canvas, renderer);
 }
 
 /** Бетон блоков и стен: крупнее и контрастнее земли, со швами плит. */
