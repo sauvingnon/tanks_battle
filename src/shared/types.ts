@@ -5,6 +5,22 @@ export interface Box {
   w: number; // размер по X
   d: number; // размер по Z
   h: number; // высота над собственным основанием
+  /** Высота основания для чисто визуальных деталей (по умолчанию 0). */
+  y?: number;
+  /** false — деталь рисуется, но не участвует в физике. */
+  solid?: boolean;
+  /** Визуальный материал для деталей карты; solid=false означает отсутствие физики. */
+  style?:
+    | 'roof'
+    | 'gate'
+    | 'road'
+    | 'sidewalk'
+    | 'pole'
+    | 'car'
+    | 'tree'
+    | 'barrel'
+    | 'pipe'
+    | 'wreck';
 }
 
 /** Полное состояние танка в симуляции. */
@@ -84,6 +100,14 @@ export interface HitFx {
 export const TEAM_PLAYERS = 0;
 export const TEAM_BOTS = 1;
 
+/**
+ * Две стороны командного боя (MODE_TEAM). Число то же самое поле team, что и
+ * везде — смысл ему придаёт только режим: в DM это «просто ярлык», здесь —
+ * настоящий союз без урона по своим (см. isSquadMode/alliedTeams).
+ */
+export const TEAM_ONE = 0;
+export const TEAM_TWO = 1;
+
 export interface PlayerInfo {
   id: number;
   name: string;
@@ -106,8 +130,19 @@ export interface SnapshotEntry {
   d: 0 | 1; // уничтожен
   /** Маска активных бонусов; шлём, только когда она не пуста. */
   f?: number;
+  /** Максимальное здоровье с учётом постоянного BR-модуля брони. */
+  m?: number;
   /** Монотонный счётчик подтверждённых выстрелов; нужен владельцу для отдачи. */
   q?: number;
+}
+
+/** Последняя известная позиция скрытого врага в королевской битве. */
+export interface SnapshotContact {
+  i: number; // id цели
+  x: number;
+  z: number;
+  /** Сколько секунд маркер ещё живёт. */
+  u: number;
 }
 
 /** Ящик с бонусом на карте. */

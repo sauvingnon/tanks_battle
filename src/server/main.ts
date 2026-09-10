@@ -4,9 +4,10 @@ import { extname, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer, type WebSocket } from 'ws';
 
-import { DT, SNAPSHOT_EVERY, TICK_HZ, isMode, isRuleset } from '../shared/constants.js';
+import { DT, MODE_ROYALE, SNAPSHOT_EVERY, TICK_HZ, isMode, isRuleset } from '../shared/constants.js';
 import { decode, encode, type ClientMessage, type ServerMessage } from '../shared/protocol.js';
-import { Room, type Player } from './room.js';
+import * as leaderboard from './leaderboard.js';
+import { Room, type Player, type TeamRoundResult } from './room.js';
 
 const PORT = Number(process.env.PORT ?? 8080);
 const HOST = process.env.HOST ?? '0.0.0.0';
@@ -126,6 +127,7 @@ wss.on('connection', (ws) => {
         players: room.allInfo(),
         ...room.config(),
         wave: room.waveState(),
+        leaderboard: leaderboard.top(),
       });
       broadcastExcept(player.id, { t: 'joined', player: room.info(player) });
       console.log(`[+] ${player.name} (#${player.id}), онлайн: ${room.humanCount}`);
@@ -142,6 +144,8 @@ wss.on('connection', (ws) => {
         msg.map,
         msg.stance,
         isRuleset(msg.rules) ? msg.rules : undefined,
+        msg.teamSize,
+        msg.royaleSquadSize,
       );
       return;
     }
@@ -220,6 +224,18 @@ function isFiniteNumber(v: unknown): v is number {
   return typeof v === 'number' && Number.isFinite(v);
 }
 
+/** Раунд командного боя закончился — пишем исход в доску лидеров и рассылаем новый топ. */
+function applyTeamResult(result: TeamRoundResult): void {
+  leaderboard.recordRound(
+    result.entries.map((entry) => ({
+      name: entry.name,
+      kills: entry.kills,
+      result: result.winner === 'draw' ? 'draw' : entry.team === result.winner ? 'win' : 'loss',
+    })),
+  );
+  broadcast({ t: 'leaderboard', entries: leaderboard.top() });
+}
+
 // --- Игровой цикл ---
 
 const STEP_MS = DT * 1000;
@@ -247,20 +263,26 @@ setInterval(() => {
     broadcast({ t: 'kill', killer: kill.killer, victim: kill.victim });
   }
 
+  const teamResult = room.drainTeamResult();
+  if (teamResult) applyTeamResult(teamResult);
+
   if (room.tickCount % SNAPSHOT_EVERY !== 0) return;
   if (room.humanCount === 0) return;
 
-  // Тяжёлую часть снапшота сериализуем один раз на всех: у игроков различается
-  // только ack. С ботами танков в снапшоте втрое больше, и отдельный
-  // JSON.stringify на каждого клиента был бы самой дорогой строчкой сервера.
-  // Пустые массивы не шлём: снаряды и взрывы бывают в считаных процентах тиков.
-  let tail = `,"tick":${room.tickCount},"players":${JSON.stringify(room.snapshotEntries())}`;
-  if (room.shellCount > 0) tail += `,"shells":${JSON.stringify(room.snapshotShells())}`;
-  if (room.boomEvents.length > 0) tail += `,"booms":${JSON.stringify(room.boomEvents)}`;
-  if (room.bonusCount > 0) tail += `,"bonuses":${JSON.stringify(room.snapshotBonuses())}`;
-
+  // В обычных режимах список танков можно было сериализовать один раз. В BR
+  // список зависит от наблюдателя: сервер обязан не отправлять скрытые цели.
   for (const player of room.players.values()) {
     if (player.brain) continue;
+    // Пустые массивы не шлём: снаряды и взрывы бывают в считаных процентах тиков.
+    const entries = room.snapshotEntries(player);
+    let tail = `,"tick":${room.tickCount},"players":${JSON.stringify(entries)}`;
+    if (room.shellCount > 0) tail += `,"shells":${JSON.stringify(room.snapshotShells(player))}`;
+    if (room.boomEvents.length > 0) tail += `,"booms":${JSON.stringify(room.boomEvents)}`;
+    if (room.hitEvents.length > 0) tail += `,"hits":${JSON.stringify(room.hitEvents)}`;
+    if (room.bonusCount > 0) tail += `,"bonuses":${JSON.stringify(room.snapshotBonuses())}`;
+    const zone = room.royaleZoneState();
+    if (zone) tail += `,"zone":${JSON.stringify(zone)}`;
+    if (room.mode === MODE_ROYALE) tail += `,"contacts":${JSON.stringify(room.snapshotContacts(player))}`;
     // ack — целое из input.seq | 0, так что подстановка в строку безопасна.
     player.send(`{"t":"snapshot","ack":${player.ack}${tail}}`);
   }

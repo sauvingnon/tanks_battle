@@ -14,6 +14,14 @@
   BONUS_SPEED_MUL,
   BONUS_STEALTH,
   BONUS_DURATION_S,
+  ROYALE_LOOT_ARMOR,
+  ROYALE_LOOT_ARMOR_HP,
+  ROYALE_LOOT_DAMAGE,
+  ROYALE_LOOT_DAMAGE_MUL,
+  ROYALE_LOOT_RELOAD,
+  ROYALE_LOOT_RELOAD_MUL,
+  ROYALE_LOOT_SPEED,
+  ROYALE_LOOT_SPEED_MUL,
   DT,
   MAX_BOUNCES,
   BOT_HP,
@@ -26,6 +34,13 @@
   MAX_TIER,
   MODE_DM,
   MODE_EXPEDITION,
+  MODE_ROYALE,
+  MODE_TEAM,
+  isSquadMode,
+  isTeamBattleSize,
+  TEAM_BATTLE_ROUND_S,
+  TEAM_BATTLE_OVER_S,
+  type TeamBattleSize,
   EXPEDITION_WAVES,
   EXPEDITION_UPGRADE_COUNT,
   EXPEDITION_UPGRADES,
@@ -44,6 +59,17 @@
   WAVE_OVER_S,
   WAVE_SPAWN_DELAY_S,
   WRECK_HEIGHT,
+  ROYALE_SQUAD_COUNT,
+  ROYALE_SQUAD_SIZE,
+  ROYALE_START_COUNTDOWN_S,
+  isRoyaleSquadSize,
+  ROYALE_ZONE_FINAL_RADIUS,
+  ROYALE_ZONE_REST_S,
+  ROYALE_ZONE_SHRINK_S,
+  ROYALE_ZONE_START_WAIT_S,
+  ROYALE_ZONE_DAMAGE_S,
+  ROYALE_SHOT_REVEAL_RANGE,
+  ROYALE_SIGHT_RANGE,
   waveConcurrent,
   waveElite,
   waveQuota,
@@ -51,10 +77,11 @@
   isRuleset,
   RULES_ARCADE,
   type GameMode,
+  type RoyaleSquadSize,
   type Ruleset,
 } from '../shared/constants.js';
-import { buildScene, bushBoxes, coverBoxes, isMapId, passableObstacles, spawnPoint } from '../shared/map.js';
-import type { RoomConfig, ServerMessage, WavePhase, WaveState } from '../shared/protocol.js';
+import { buildScene, bushBoxes, bushIndexAt, coverBoxes, isMapId, passableObstacles, ROYALE_MAP_ID, spawnCount, spawnPoint } from '../shared/map.js';
+import type { RoomConfig, RoyaleZoneState, ServerMessage, WavePhase, WaveState } from '../shared/protocol.js';
 import {
   bounceShell,
   canRicochet,
@@ -75,7 +102,9 @@ import {
   BOOM_KILL,
   BOOM_RICOCHET,
   TEAM_BOTS,
+  TEAM_ONE,
   TEAM_PLAYERS,
+  TEAM_TWO,
   createTankState,
   type BonusState,
   type Boom,
@@ -86,16 +115,18 @@ import {
   type PlayerInfo,
   type ShellState,
   type SnapshotBonus,
+  type SnapshotContact,
   type SnapshotEntry,
   type SnapshotShell,
   type TankState,
 } from '../shared/types.js';
-import { botName, botSpawn, createBrain, think, type BotBrain } from './bot.js';
+import { botName, botSpawn, createBrain, hasShot, think, type BotBrain, type BotZone } from './bot.js';
 
 /** Перезарядка и респавн считаются в тиках, чтобы жить в тех же часах, что и симуляция. */
 const RELOAD_TICKS = Math.round(RELOAD_S * TICK_HZ);
 const RESPAWN_TICKS = Math.round(RESPAWN_S * TICK_HZ);
 const RAM_COOLDOWN_TICKS = Math.round(RAM_COOLDOWN_S * TICK_HZ);
+const ROYALE_VISION_REFRESH_TICKS = Math.round(5 * TICK_HZ);
 
 /** Насколько дальше настоящего радиуса попадания снаряд ещё считается «прошёл рядом», м. */
 const NEAR_MISS_MARGIN = 2.2;
@@ -130,6 +161,10 @@ export interface Player {
   waiting: boolean;
   /** Тик окончания каждого бонусного эффекта; 0 — эффекта нет. Индекс — вид бонуса. */
   fx: number[];
+  /** Постоянные модули BR: биты соответствуют ROYALE_LOOT_*; не таймеры. */
+  royaleLootMask: number;
+  /** Добавка к максимуму здоровья от бронепластин BR. */
+  royaleArmor: number;
   /** Кэш эффекта «Маскировка» на этот тик: его читает ИИ каждого бота. */
   stealth: boolean;
   state: TankState;
@@ -147,6 +182,8 @@ export interface Player {
   deaths: number;
   /** Монотонный счётчик реально принятых сервером выстрелов. */
   shots: number;
+  /** Последний выстрел: в BR вспышка на короткое время раскрывает танк. */
+  lastShotAt: number;
   /** Очередь необработанных инпутов. */
   queue: Input[];
   /** seq последнего инпута, применённого сервером — клиент по нему делает реконсиляцию. */
@@ -161,12 +198,38 @@ export interface KillEvent {
   victim: string;
 }
 
+/** Итог только что законченного раунда командного боя — для доски лидеров. */
+export interface TeamRoundResult {
+  winner: number | 'draw';
+  entries: { name: string; team: number; kills: number }[];
+}
+
 /** Цвета людей и ботов не пересекаются: врага видно по корпусу, а не только по нику. */
 const HUMAN_COLORS = [0, 3, 1, 4, 6, 7, 2];
 const BOT_COLOR = 5;
 
 /** Никуда не отправляем: у бота нет сокета, но интерфейс Player общий. */
 const NO_SEND = (): void => {};
+
+/**
+ * Фиксированные контейнеры «Рубежа». Координаты уже в масштабе карты 900×900;
+ * при запуске на тестовой карте они масштабируются к её размеру и проверяются
+ * на свободное место. Числа задают районы, а не случайную россыпь по полю.
+ */
+const ROYALE_LOOT_LAYOUT: Array<[number, number, number]> = [
+  [0, 0, BONUS_HEAL],
+  [-160, 128, ROYALE_LOOT_ARMOR],
+  [160, 128, ROYALE_LOOT_DAMAGE],
+  [-160, -128, ROYALE_LOOT_RELOAD],
+  [160, -128, ROYALE_LOOT_SPEED],
+  [0, 240, BONUS_HEAL],
+  [0, -240, BONUS_HEAL],
+  [240, 0, ROYALE_LOOT_DAMAGE],
+  [-240, 0, ROYALE_LOOT_RELOAD],
+  [-112, 240, ROYALE_LOOT_ARMOR],
+  [128, -240, ROYALE_LOOT_SPEED],
+  [224, 176, BONUS_HEAL],
+];
 
 /**
  * Одна комната на весь сервер. Карта общая, все видят всех; режим и сложность
@@ -249,6 +312,59 @@ export class Room {
   private upgradeChoices: number[] = [];
   private victory = false;
 
+  // --- Состояние королевской битвы ---
+  private royaleStarted = false;
+  private royaleOver = false;
+  private royalePhase: 'countdown' | 'fight' | 'over' = 'countdown';
+  private royalePhaseUntil = 0;
+  private royaleZone: {
+    x: number;
+    z: number;
+    r: number;
+    fromX: number;
+    fromZ: number;
+    fromR: number;
+    nextX: number;
+    nextZ: number;
+    nextR: number;
+    phase: RoyaleZoneState['phase'];
+    step: number;
+    endsAt: number;
+  } = {
+    x: 0,
+    z: 0,
+    r: 0,
+    fromX: 0,
+    fromZ: 0,
+    fromR: 0,
+    nextX: 0,
+    nextZ: 0,
+    nextR: 0,
+    phase: 'safe',
+    step: 0,
+    endsAt: 0,
+  };
+  /** Командная память о последнем контакте: team -> enemy id -> point + expiry. */
+  private readonly royaleContacts = new Map<number, Map<number, { x: number; z: number; until: number }>>();
+  /** Общий засвет сквада: команда -> враги, которых видит хотя бы один союзник. */
+  private readonly royaleVision = new Map<number, Set<number>>();
+  private royaleVisionTick = -Infinity;
+
+  // --- Состояние командного боя ---
+  private teamStarted = false;
+  /** Выбор хоста: сколько человек и ботов на стороне, 5 или 10. */
+  teamSize: TeamBattleSize = 5;
+  /** Формат отряда BR: 1 — соло, 2 — дуо, 4 — сквад. */
+  royaleSquadSize: RoyaleSquadSize = ROYALE_SQUAD_SIZE;
+  private teamPhase: 'fight' | 'over' = 'fight';
+  /** Тик, на котором кончится экран итогов и начнётся новый раунд. */
+  private teamPhaseUntil = 0;
+  /** Тик, на котором раунд обрывается ничьёй, если бой ещё не решён. */
+  private teamRoundEndsAt = 0;
+  private teamWinner: number | 'draw' | null = null;
+  /** Итог только что законченного раунда — на один drain, как kills. */
+  private teamResult: TeamRoundResult | null = null;
+
   /**
    * Живой список танков для ИИ. Именно объект, а не players.values(): итератор
    * одноразовый, а think() проходит по танкам несколько раз за тик.
@@ -286,8 +402,13 @@ export class Room {
       this.hostId = player.id;
       this.emitConfig();
     }
-    // Волна уже идёт — новичок ждёт её конца, иначе он выпал бы в гущу боя.
-    if (isCoopMode(this.mode) && this.phase === 'fight') player.waiting = true;
+    // Волна или раунд уже идут — новичок ждёт конца, иначе он выпал бы в гущу боя.
+    if (
+      (isCoopMode(this.mode) && this.phase === 'fight') ||
+      (this.mode === MODE_TEAM && this.teamPhase === 'fight')
+    ) {
+      player.waiting = true;
+    }
     if (player.waiting) player.dead = true;
 
     return player;
@@ -307,6 +428,8 @@ export class Room {
       brain: null,
       waiting: false,
       fx: new Array<number>(BONUS_KINDS).fill(0),
+      royaleLootMask: 0,
+      royaleArmor: 0,
       stealth: false,
       state: this.spawnState(spawn),
       hp: MAX_HP,
@@ -318,6 +441,7 @@ export class Room {
       kills: 0,
       deaths: 0,
       shots: 0,
+      lastShotAt: -Infinity,
       queue: [],
       ack: 0,
       last: { seq: 0, throttle: 0, steer: 0, turret: spawn.angle },
@@ -372,6 +496,8 @@ export class Room {
     this.hits = [];
 
     if (isCoopMode(this.mode)) this.updateWave();
+    if (this.mode === MODE_ROYALE) this.updateRoyale();
+    if (this.mode === MODE_TEAM) this.updateTeamBattle();
     if (this.bonusesOn) this.updateBonuses();
     this.refreshWrecks();
 
@@ -381,7 +507,24 @@ export class Room {
         continue;
       }
       // Ждущий конца волны не возрождается по таймеру — его поднимет сама волна.
-      if (player.dead && !player.waiting && this.tick >= player.respawnAt) this.respawn(player);
+      // В BR и в командном бою жизнь одна на раунд — respawnAt тут не действует.
+      if (
+        player.dead &&
+        !player.waiting &&
+        this.mode !== MODE_ROYALE &&
+        this.mode !== MODE_TEAM &&
+        this.tick >= player.respawnAt
+      ) {
+        this.respawn(player);
+      }
+
+      // До сигнала старта состав уже виден, но никто не может случайно
+      // уехать со спавна или открыть огонь во время предстартового отсчёта.
+      if (this.mode === MODE_ROYALE && this.royalePhase !== 'fight') {
+        player.queue.length = 0;
+        player.last.fire = false;
+        continue;
+      }
 
       // Часы клиента и сервера идут независимо, поэтому очередь то пустеет, то копится.
       // Если накопилось — разгребаем по два инпута за тик: каждый всё равно применяется
@@ -443,6 +586,7 @@ export class Room {
       const a = alive[hit.a];
       const b = alive[hit.b];
       if (a.brain && b.brain) continue;
+      if (isSquadMode(this.mode) && a.team === b.team) continue;
       // Пауза общая на танк, а не на пару: иначе в свалке трое разом снимали бы
       // с одного полный урон каждый тик, и таран решал бы бой без единого выстрела.
       if (this.tick < a.ramAt || this.tick < b.ramAt) continue;
@@ -468,10 +612,363 @@ export class Room {
     }
   }
 
+  /**
+   * Случайная точка на карте под очередной центр круга: без оглядки на стены
+   * и застройку — попасть в здание нормально, это осознанная случайность,
+   * а не курируемый список удачных мест. Вызывается на каждом этапе
+   * сжатия, поэтому и центр каждый раз новый, а не только один раз на матч.
+   */
+  private randomZoneCenter(): { x: number; z: number } {
+    const radius = this.half - 20;
+    const angle = Math.random() * Math.PI * 2;
+    const r = Math.sqrt(Math.random()) * radius; // равномерно по площади, не по радиусу
+    return { x: Math.cos(angle) * r, z: Math.sin(angle) * r };
+  }
+
+  /** Подготовить сквады выбранного размера для первого запуска BR. Возрождений здесь нет. */
+  private startRoyale(): void {
+    this.royaleStarted = true;
+    this.royaleOver = false;
+    this.royalePhase = 'countdown';
+    this.royalePhaseUntil = this.tick + Math.round(ROYALE_START_COUNTDOWN_S * TICK_HZ);
+    this.royaleVision.clear();
+    this.royaleVisionTick = -Infinity;
+
+    // Центр круга — случайная точка карты, и на каждом этапе сжатия она
+    // новая: иначе разные районы «Рубежа» ничего не решают — маршрут разный,
+    // а финал всегда один. Может попасть в застройку — это честная
+    // случайность, а не курируемый список удачных мест.
+    const { x: centerX, z: centerZ } = this.randomZoneCenter();
+    // Стартовый круг обязан накрывать все реальные точки высадки, даже если
+    // случайный центр зоны оказался в другом районе. Иначе танк честно
+    // десантировался бы сразу вне безопасной зоны и получал бы урон до старта.
+    let farthestSpawn = 0;
+    for (let i = 0; i < spawnCount(this.mapId); i++) {
+      const spawn = spawnPoint(i, this.mapId);
+      farthestSpawn = Math.max(farthestSpawn, Math.hypot(spawn.x - centerX, spawn.z - centerZ));
+    }
+    const startRadius = Math.max(ROYALE_ZONE_FINAL_RADIUS + 1, this.half - 12, farthestSpawn + 10);
+    this.royaleZone = {
+      x: centerX,
+      z: centerZ,
+      r: startRadius,
+      fromX: centerX,
+      fromZ: centerZ,
+      fromR: startRadius,
+      nextX: centerX,
+      nextZ: centerZ,
+      nextR: Math.max(ROYALE_ZONE_FINAL_RADIUS, startRadius * 0.58),
+      phase: 'safe',
+      step: 0,
+      endsAt: 0,
+    };
+    this.spawnRoyaleLoot();
+
+    // Люди распределяются по сквадам по порядку входа. В соло каждый получает
+    // отдельную команду, в дуо — по два места, в скваде — до четырёх.
+    const humans = [...this.players.values()].filter((player) => !player.brain).sort((a, b) => a.id - b.id);
+    humans.forEach((player, index) => {
+      const team = Math.floor(index / this.royaleSquadSize);
+      player.team = team;
+      // Перемещаем людей на ту же компактную точку, которую получат их
+      // союзные боты. Иначе бот-напарник был бы рядом с игроком только по
+      // team id, но физически оставался на обычном одиночном спавне.
+      this.respawn(player, this.royaleSquadSpawn(team, index % this.royaleSquadSize));
+    });
+
+    // Заполняем все четыре сквада ботами, включая свободные места в людском.
+    for (let team = 0; team < ROYALE_SQUAD_COUNT; team++) {
+      while (this.countTeam(team) < this.royaleSquadSize) this.spawnRoyaleBot(team);
+    }
+    this.emitWave();
+  }
+
+  private spawnRoyaleBot(team: number): void {
+    const index = this.botCounter++;
+    const bot = this.create(
+      botName(index),
+      team,
+      this.royaleSquadSpawn(team, this.countTeam(team)),
+      NO_SEND,
+    );
+    const tier = Math.min(MAX_TIER, this.difficulty + (team === TEAM_PLAYERS ? 0 : Math.random() < 0.25 ? 1 : 0));
+    bot.brain = createBrain(tier, this.tick, index);
+    bot.hp = BOT_HP;
+    this.players.set(bot.id, bot);
+    this.emit({ t: 'joined', player: this.info(bot) });
+  }
+
+  /**
+   * Компактная формация высадки одного BR-сквада.
+   *
+   * Обычный botSpawn специально ищет дальнюю от врагов точку — для командного
+   * боя это полезно, но в BR он разбрасывал союзников по всей карте. Здесь у
+   * каждого сквада свой якорь на внешнем кольце карты, а его участники стоят
+   * рядом с ним, сохраняя небольшую дистанцию между корпусами.
+   */
+  private royaleSquadSpawn(team: number, member: number): { x: number; z: number; angle: number } {
+    const slots = this.royaleSquadSize === 1
+      ? [[0, 0]]
+      : this.royaleSquadSize === 2
+        ? [[-3.2, 0], [3.2, 0]]
+        : [[-3.2, -2.8], [3.2, -2.8], [-3.2, 2.8], [3.2, 2.8]];
+    const slot = slots[Math.min(member, slots.length - 1)];
+    const total = spawnCount(this.mapId);
+    const firstAnchor = Math.floor((team * total) / ROYALE_SQUAD_COUNT);
+
+    // Ищем ближайший к своему сектору якорь, вокруг которого вся формация
+    // помещается на свободном физическом месте. Это сохраняет совместимость
+    // с картами, где рядом с одной из точек позже появятся новые здания.
+    for (let offset = 0; offset < total; offset++) {
+      const anchor = spawnPoint(firstAnchor + offset, this.mapId);
+      const length = Math.hypot(anchor.x, anchor.z) || 1;
+      const inwardX = -anchor.x / length;
+      const inwardZ = -anchor.z / length;
+      const tangentX = -inwardZ;
+      const tangentZ = inwardX;
+      const formation = slots.map(([lateral, depth]) => ({
+        x: anchor.x + tangentX * lateral + inwardX * depth,
+        z: anchor.z + tangentZ * lateral + inwardZ * depth,
+      }));
+      if (formation.every((point) => this.royaleSpawnIsFree(point.x, point.z))) {
+        return { x: formation[Math.min(member, formation.length - 1)].x, z: formation[Math.min(member, formation.length - 1)].z, angle: anchor.angle };
+      }
+    }
+
+    // Точки BR заранее расставлены на свободном кольце, поэтому сюда можно
+    // попасть только при необычной пользовательской карте. Даже тогда
+    // сохраняем группировку, вместо возврата к раздельным botSpawn-точкам.
+    const anchor = spawnPoint(firstAnchor, this.mapId);
+    const length = Math.hypot(anchor.x, anchor.z) || 1;
+    const inwardX = -anchor.x / length;
+    const inwardZ = -anchor.z / length;
+    const tangentX = -inwardZ;
+    const tangentZ = inwardX;
+    return {
+      x: anchor.x + tangentX * slot[0] + inwardX * slot[1],
+      z: anchor.z + tangentZ * slot[0] + inwardZ * slot[1],
+      angle: anchor.angle,
+    };
+  }
+
+  /** Проверяет, не заводит ли формация танк в физический блок или за край. */
+  private royaleSpawnIsFree(x: number, z: number): boolean {
+    if (Math.abs(x) > this.half - TANK_RADIUS || Math.abs(z) > this.half - TANK_RADIUS) return false;
+    return this.moveObstacles.every((box) =>
+      Math.abs(x - box.x) > box.w / 2 + TANK_RADIUS && Math.abs(z - box.z) > box.d / 2 + TANK_RADIUS,
+    );
+  }
+
+  private countTeam(team: number): number {
+    let count = 0;
+    for (const player of this.players.values()) if (player.team === team) count++;
+    return count;
+  }
+
+  /**
+   * Машина раунда командного боя: одна жизнь на раунд, до полного уничтожения
+   * одной из сторон или до истечения TEAM_BATTLE_ROUND_S — тогда ничья.
+   */
+  private updateTeamBattle(): void {
+    if (this.humanCount === 0) {
+      if (this.teamStarted) this.clearBots();
+      this.teamStarted = false;
+      this.teamWinner = null;
+      return;
+    }
+
+    if (!this.teamStarted || this.teamPhase !== 'fight') {
+      if (this.teamStarted && this.tick < this.teamPhaseUntil) return;
+      this.startTeamRound();
+      return;
+    }
+
+    const { a, b } = this.teamAliveCounts();
+    if (a === 0 || b === 0) {
+      this.teamWinner = a === 0 && b === 0 ? 'draw' : a === 0 ? TEAM_TWO : TEAM_ONE;
+      this.endTeamRound();
+      return;
+    }
+    if (this.tick >= this.teamRoundEndsAt) {
+      this.teamWinner = 'draw';
+      this.endTeamRound();
+    }
+  }
+
+  /**
+   * Стартует (или начинает заново) раунд: разводит текущих людей по двум
+   * сторонам через одного по возрастанию id — стабильно, без выбора игрока, и
+   * при каждом реванше тасует стороны заново, — и добивает ботами до teamSize
+   * с каждой стороны.
+   */
+  private startTeamRound(): void {
+    this.clearBots();
+    this.teamStarted = true;
+    this.teamPhase = 'fight';
+    this.teamRoundEndsAt = this.tick + Math.round(TEAM_BATTLE_ROUND_S * TICK_HZ);
+    this.teamWinner = null;
+    this.resetScores();
+
+    const humans = [...this.players.values()].filter((p) => !p.brain).sort((a, b) => a.id - b.id);
+    humans.forEach((player, index) => {
+      player.team = index % 2 === 0 ? TEAM_ONE : TEAM_TWO;
+      player.waiting = false;
+      this.respawn(player, botSpawn(this.tanks, player.team, this.spawnCounter++, this.mapId));
+    });
+
+    for (const team of [TEAM_ONE, TEAM_TWO]) {
+      while (this.countTeam(team) < this.teamSize) this.spawnTeamBot(team);
+    }
+    this.emitWave();
+  }
+
+  private spawnTeamBot(team: number): void {
+    const index = this.botCounter++;
+    const bot = this.create(botName(index), team, botSpawn(this.tanks, team, index, this.mapId), NO_SEND);
+    bot.brain = createBrain(this.difficulty, this.tick, index);
+    bot.hp = BOT_HP;
+    this.players.set(bot.id, bot);
+    this.emit({ t: 'joined', player: this.info(bot) });
+  }
+
+  /** Итог раунда — участникам-людям, доска лидеров считает его уже сама. */
+  private endTeamRound(): void {
+    const entries = [...this.players.values()]
+      .filter((p) => !p.brain)
+      .map((p) => ({ name: p.name, team: p.team, kills: p.kills }));
+    this.teamResult = { winner: this.teamWinner!, entries };
+    this.teamPhase = 'over';
+    this.teamPhaseUntil = this.tick + Math.round(TEAM_BATTLE_OVER_S * TICK_HZ);
+    this.emitWave();
+  }
+
+  private teamAliveCounts(): { a: number; b: number } {
+    let a = 0;
+    let b = 0;
+    for (const player of this.players.values()) {
+      if (player.dead) continue;
+      if (player.team === TEAM_ONE) a++;
+      else if (player.team === TEAM_TWO) b++;
+    }
+    return { a, b };
+  }
+
+  /** Забирает итог только что законченного раунда; вызывать раз за тик, как drainKills. */
+  drainTeamResult(): TeamRoundResult | null {
+    const result = this.teamResult;
+    this.teamResult = null;
+    return result;
+  }
+
+  /** Машина матча BR: один старт, затем зона, урон снаружи и проверка победителя. */
+  private updateRoyale(): void {
+    if (this.humanCount === 0) {
+      if (this.royaleStarted) this.clearBots();
+      this.royaleContacts.clear();
+      this.royaleVision.clear();
+      this.royaleVisionTick = -Infinity;
+      this.royaleStarted = false;
+      this.royaleOver = false;
+      this.royalePhase = 'countdown';
+      this.royalePhaseUntil = 0;
+      return;
+    }
+    if (!this.royaleStarted) this.startRoyale();
+    if (this.royaleOver) return;
+
+    if (this.royalePhase === 'countdown') {
+      if (this.tick < this.royalePhaseUntil) return;
+      this.royalePhase = 'fight';
+      this.royalePhaseUntil = 0;
+      this.royaleZone.endsAt = this.tick + Math.round(ROYALE_ZONE_START_WAIT_S * TICK_HZ);
+      this.emitWave();
+    }
+
+    this.updateRoyaleZone();
+    this.refreshRoyaleVision();
+    const damage = Math.max(1, Math.round(this.royaleZoneDamage() * DT));
+    for (const player of this.players.values()) {
+      if (player.dead) continue;
+      if (Math.hypot(player.state.x - this.royaleZone.x, player.state.z - this.royaleZone.z) > this.royaleZone.r) {
+        this.hurt(player, damage, -1, 'Зона');
+      }
+    }
+
+    const aliveTeams = new Set<number>();
+    for (const player of this.players.values()) if (!player.dead) aliveTeams.add(player.team);
+    if (aliveTeams.size <= 1) {
+      this.royaleOver = true;
+      this.royalePhase = 'over';
+      this.royalePhaseUntil = 0;
+      this.royaleZone.phase = 'over';
+      this.royaleZone.endsAt = 0;
+      this.emitWave();
+    }
+  }
+
+  private updateRoyaleZone(): void {
+    const zone = this.royaleZone;
+    if (zone.phase === 'over' || zone.phase === 'final') return;
+
+    if (zone.phase === 'safe') {
+      if (this.tick < zone.endsAt) return;
+      zone.phase = 'shrinking';
+      zone.fromR = zone.r;
+      zone.fromX = zone.x;
+      zone.fromZ = zone.z;
+      zone.nextR = Math.max(ROYALE_ZONE_FINAL_RADIUS, zone.r * 0.58);
+      // Следующий центр — снова случайная точка карты, не привязанная к
+      // текущей: круг может дёрнуться в любую сторону на каждом этапе.
+      const next = this.randomZoneCenter();
+      zone.nextX = next.x;
+      zone.nextZ = next.z;
+      zone.endsAt = this.tick + Math.round(ROYALE_ZONE_SHRINK_S * TICK_HZ);
+    }
+
+    if (zone.phase !== 'shrinking') return;
+    const duration = Math.round(ROYALE_ZONE_SHRINK_S * TICK_HZ);
+    const startedAt = zone.endsAt - duration;
+    const progress = clamp((this.tick - startedAt) / duration, 0, 1);
+    zone.r = zone.fromR + (zone.nextR - zone.fromR) * progress;
+    zone.x = zone.fromX + (zone.nextX - zone.fromX) * progress;
+    zone.z = zone.fromZ + (zone.nextZ - zone.fromZ) * progress;
+    if (progress < 1) return;
+
+    zone.r = zone.nextR;
+    zone.x = zone.nextX;
+    zone.z = zone.nextZ;
+    zone.step++;
+    if (zone.r <= ROYALE_ZONE_FINAL_RADIUS + 0.01) {
+      zone.phase = 'final';
+      zone.endsAt = 0;
+    } else {
+      zone.phase = 'safe';
+      zone.endsAt = this.tick + Math.round(ROYALE_ZONE_REST_S * TICK_HZ);
+    }
+  }
+
+  private royaleZoneDamage(): number {
+    return ROYALE_ZONE_DAMAGE_S[Math.min(this.royaleZone.step, ROYALE_ZONE_DAMAGE_S.length - 1)];
+  }
+
+  royaleZoneState(): RoyaleZoneState | undefined {
+    if (this.mode !== MODE_ROYALE || !this.royaleStarted || this.royalePhase !== 'fight') return undefined;
+    return {
+      x: round(this.royaleZone.x),
+      z: round(this.royaleZone.z),
+      r: round(this.royaleZone.r),
+      nextR: round(this.royaleZone.nextR),
+      until: this.royaleZone.endsAt > 0 ? Math.max(0, (this.royaleZone.endsAt - this.tick) / TICK_HZ) : 0,
+      phase: this.royaleZone.phase,
+      damage: this.royaleZoneDamage(),
+    };
+  }
+
   /** Шаг бота: думает сам, дальше едет и стреляет по общим правилам. */
   private stepBot(bot: Player): void {
     // Труп не думает и не едет: иначе он рулил бы по инерции последнего инпута.
     if (bot.dead) return;
+    if (this.mode === MODE_ROYALE && this.royalePhase !== 'fight') return;
     bot.last = think(
       {
         id: bot.id,
@@ -492,6 +989,7 @@ export class Room {
         shells: this.shells,
         stance: this.stance,
         half: this.half,
+        zone: this.mode === MODE_ROYALE ? this.botZoneState() : undefined,
       },
     );
     stepTank(bot.state, bot.last, DT, this.liveObstacles, 1, this.half);
@@ -501,19 +999,39 @@ export class Room {
     }
   }
 
+  private botZoneState(): BotZone | undefined {
+    if (!this.royaleStarted) return undefined;
+    return {
+      x: this.royaleZone.x,
+      z: this.royaleZone.z,
+      r: this.royaleZone.r,
+      nextR: this.royaleZone.nextR,
+      until: this.royaleZone.endsAt > 0 ? Math.max(0, (this.royaleZone.endsAt - this.tick) / TICK_HZ) : 0,
+      phase: this.royaleZone.phase,
+    };
+  }
+
   private tryFire(player: Player): void {
     if (this.tick < player.readyAt) return;
-    const rush = player.fx[BONUS_RELOAD] > this.tick ? BONUS_RELOAD_MUL : 1;
+    const rush = this.mode === MODE_ROYALE
+      ? (player.royaleLootMask & (1 << ROYALE_LOOT_RELOAD) ? ROYALE_LOOT_RELOAD_MUL : 1)
+      : player.fx[BONUS_RELOAD] > this.tick ? BONUS_RELOAD_MUL : 1;
     const expeditionReload = player.brain ? 1 : this.expeditionStats().reload;
     player.readyAt = this.tick + Math.max(1, Math.round(RELOAD_TICKS * rush * expeditionReload));
 
     const shell = spawnShell(this.nextShellId++, player.id, player.state);
     player.shots++;
+    player.lastShotAt = this.tick;
     // Урон считаем здесь, а не при попадании: снаряд после выстрела живёт сам по себе.
     const power =
-      (player.fx[BONUS_DAMAGE] > this.tick ? BONUS_DAMAGE_MUL : 1) *
+      (this.mode === MODE_ROYALE
+        ? (player.royaleLootMask & (1 << ROYALE_LOOT_DAMAGE) ? ROYALE_LOOT_DAMAGE_MUL : 1)
+        : player.fx[BONUS_DAMAGE] > this.tick ? BONUS_DAMAGE_MUL : 1) *
       (player.brain ? 1 : this.expeditionStats().damage);
-    shell.dmg = Math.round(SHELL_DAMAGE * power);
+    // Разброс берётся на выстреле, а не на попадании: снаряд после этого несёт
+    // свой урон сам, и рикошет не перекатывает кубик заново.
+    const spread = 1 + (Math.random() * 2 - 1) * SHELL_DAMAGE_SPREAD;
+    shell.dmg = Math.round(SHELL_DAMAGE * power * spread);
     this.shells.push(shell);
     // Переполнение возможно только при явном флуде — жертвуем самым старым снарядом.
     if (this.shells.length > MAX_SHELLS) this.shells.shift();
@@ -647,10 +1165,12 @@ export class Room {
     limit: number,
   ): { player: Player; t: number } | null {
     let best: { player: Player; t: number } | null = null;
+    const shooter = this.players.get(shell.owner);
     for (const target of this.players.values()) {
       if (target.dead) continue;
       // В себя можно попасть только рикошетом: иначе снаряд убивал бы стрелка на вылете.
       if (target.id === shell.owner && shell.bounces === 0) continue;
+      if (isSquadMode(this.mode) && shooter && target.team === shooter.team) continue;
 
       const t = sweepTank(shell, dt, target.state);
       if (t === null || t > limit) continue;
@@ -755,10 +1275,12 @@ export class Room {
     return createTankState(spawn.x, spawn.z, spawn.angle);
   }
 
-  private respawn(player: Player): void {
-    const spawn = spawnPoint(this.spawnCounter++, this.mapId);
+  private respawn(
+    player: Player,
+    spawn: { x: number; z: number; angle: number } = spawnPoint(this.spawnCounter++, this.mapId),
+  ): void {
     player.state = this.spawnState(spawn);
-    player.hp = player.brain ? BOT_HP : MAX_HP;
+    player.hp = this.maxHealth(player);
     player.dead = false;
     player.readyAt = this.tick;
     // seq не сбрасываем: клиент продолжает свою нумерацию, ack должен остаться в её шкале.
@@ -770,25 +1292,41 @@ export class Room {
 
   /** Множитель хода от бонуса «Ход»; клиент подставляет в предсказание то же число. */
   private boost(player: Player): number {
-    const bonus = player.fx[BONUS_SPEED] > this.tick ? BONUS_SPEED_MUL : 1;
+    const bonus = this.mode === MODE_ROYALE
+      ? (player.royaleLootMask & (1 << ROYALE_LOOT_SPEED) ? ROYALE_LOOT_SPEED_MUL : 1)
+      : player.fx[BONUS_SPEED] > this.tick ? BONUS_SPEED_MUL : 1;
     return bonus * (player.brain || this.mode !== MODE_EXPEDITION ? 1 : this.expeditionStats().speed);
   }
 
-  private expeditionStats(): { speed: number; damage: number; reload: number } {
+  private maxHealth(player: Player): number {
+    const base = player.brain ? BOT_HP : MAX_HP;
+    if (this.mode === MODE_ROYALE) return base + player.royaleArmor;
+    if (player.brain) return BOT_HP;
+    if (this.mode !== MODE_EXPEDITION) return MAX_HP;
+    return Math.round(MAX_HP * this.expeditionStats().health);
+  }
+
+  private expeditionStats(): { speed: number; damage: number; reload: number; health: number } {
     let speed = expeditionPower(this.wave);
     let damage = 1;
     let reload = 1;
+    let health = 1;
     for (const id of this.expeditionUpgrades) {
       const upgrade = EXPEDITION_UPGRADES[id];
       if (!upgrade) continue;
       speed *= upgrade.speed;
       damage *= upgrade.damage;
       reload *= upgrade.reload;
+      health *= upgrade.health;
     }
-    return { speed, damage, reload };
+    return { speed, damage, reload, health };
   }
 
   private updateBonuses(): void {
+    if (this.mode === MODE_ROYALE) {
+      this.updateRoyaleLoot();
+      return;
+    }
     // Маскировку кэшируем один раз за тик: её читает ИИ каждого бота по всем целям.
     for (const player of this.players.values()) {
       player.stealth = player.fx[BONUS_STEALTH] > this.tick;
@@ -818,16 +1356,96 @@ export class Room {
   }
 
   private applyBonus(player: Player, kind: number): void {
+    if (this.mode === MODE_ROYALE) {
+      this.applyRoyaleLoot(player, kind);
+      return;
+    }
     if (kind === BONUS_HEAL) {
-      // Потолок берётся по самому танку: у бота он свой, и общий MAX_HP вылечил
-      // бы его выше собственного максимума. Ящики боты не подбирают, но правило
+      // Потолок берётся по самому танку: у бота он свой, а в экспедиции у команды
+      // может быть увеличен карточкой «Бронекапсула». Ящики боты не подбирают, но правило
       // должно быть верным само по себе, а не за счёт того, что не срабатывает.
-      player.hp = Math.min(player.brain ? BOT_HP : MAX_HP, player.hp + BONUS_HEAL_HP);
+      player.hp = Math.min(this.maxHealth(player), player.hp + BONUS_HEAL_HP);
     } else {
       // Второй ящик того же вида не складывается, а отсчитывает срок заново.
       player.fx[kind] = this.tick + Math.round(BONUS_DURATION_S[kind] * TICK_HZ);
     }
     this.emit({ t: 'pickup', id: player.id, kind });
+  }
+
+  /** BR-лут постоянен до конца матча; ремонт остаётся единственным расходником. */
+  private applyRoyaleLoot(player: Player, kind: number): void {
+    if (kind !== BONUS_HEAL && (player.royaleLootMask & (1 << kind)) !== 0) return;
+    if (kind === BONUS_HEAL) {
+      player.hp = Math.min(this.maxHealth(player), player.hp + BONUS_HEAL_HP);
+    } else if (kind === ROYALE_LOOT_ARMOR) {
+      player.royaleLootMask |= 1 << kind;
+      player.royaleArmor = ROYALE_LOOT_ARMOR_HP;
+      player.hp += ROYALE_LOOT_ARMOR_HP;
+    } else {
+      player.royaleLootMask |= 1 << kind;
+    }
+    this.emit({ t: 'pickup', id: player.id, kind });
+  }
+
+  /**
+   * Контейнеры стоят весь матч и не респавнятся. Подбирать их могут и люди, и
+   * боты: спор идёт за конкретную точку, а не за случайный временный эффект.
+   */
+  private updateRoyaleLoot(): void {
+    const reach = TANK_RADIUS + BONUS_RADIUS;
+    for (const player of this.players.values()) {
+      if (player.dead) continue;
+      for (let i = this.bonuses.length - 1; i >= 0; i--) {
+        const loot = this.bonuses[i];
+        if (Math.hypot(loot.x - player.state.x, loot.z - player.state.z) > reach) continue;
+        if (loot.kind !== BONUS_HEAL && (player.royaleLootMask & (1 << loot.kind)) !== 0) continue;
+        this.bonuses.splice(i, 1);
+        this.applyRoyaleLoot(player, loot.kind);
+      }
+    }
+  }
+
+  private spawnRoyaleLoot(): void {
+    this.bonuses.length = 0;
+    const scale = this.half / 450;
+    for (const [baseX, baseZ, kind] of ROYALE_LOOT_LAYOUT) {
+      const spot = this.royaleLootSpot(baseX * scale, baseZ * scale);
+      if (!spot) continue;
+      this.bonuses.push({
+        id: this.nextBonusId++,
+        kind,
+        x: spot.x,
+        z: spot.z,
+        until: Number.MAX_SAFE_INTEGER,
+      });
+    }
+    this.bonusAt = Number.MAX_SAFE_INTEGER;
+  }
+
+  /** Сдвигает задуманный контейнер к ближайшему свободному месту в том же POI. */
+  private royaleLootSpot(x: number, z: number): { x: number; z: number } | null {
+    const attempts: Array<[number, number]> = [[0, 0]];
+    // Некоторые POI имеют контейнеры/стены ровно в своей геометрической
+    // середине. Ищем свободный двор в радиусе района, не превращая точку в
+    // случайный спавн: сначала ближайшие клетки, потом более дальний край.
+    for (let radius = 8; radius <= 48; radius += 8) {
+      attempts.push(
+        [radius, 0], [-radius, 0], [0, radius], [0, -radius],
+        [radius, radius], [-radius, radius], [radius, -radius], [-radius, -radius],
+      );
+    }
+    const pad = BONUS_RADIUS + TANK_RADIUS;
+    for (const [dx, dz] of attempts) {
+      const candidate = { x: x + dx, z: z + dz };
+      if (Math.abs(candidate.x) > this.half - 8 || Math.abs(candidate.z) > this.half - 8) continue;
+      if (this.obstacles.some((box) =>
+        Math.abs(candidate.x - box.x) < box.w / 2 + pad &&
+        Math.abs(candidate.z - box.z) < box.d / 2 + pad,
+      )) continue;
+      if (this.bonuses.some((bonus) => Math.hypot(bonus.x - candidate.x, bonus.z - candidate.z) < 22)) continue;
+      return candidate;
+    }
+    return null;
   }
 
   private spawnBonus(): void {
@@ -872,6 +1490,8 @@ export class Room {
     this.bonusAt = this.tick;
     for (const player of this.players.values()) {
       player.fx.fill(0);
+      player.royaleLootMask = 0;
+      player.royaleArmor = 0;
       player.stealth = false;
     }
   }
@@ -881,6 +1501,7 @@ export class Room {
     for (let kind = 0; kind < BONUS_KINDS; kind++) {
       if (player.fx[kind] > this.tick) mask |= 1 << kind;
     }
+    if (this.mode === MODE_ROYALE) mask |= player.royaleLootMask;
     return mask;
   }
 
@@ -902,6 +1523,8 @@ export class Room {
     map?: number,
     stance?: number,
     rules?: Ruleset,
+    teamSize?: number,
+    royaleSquadSize?: number,
   ): void {
     if (typeof difficulty === 'number' && Number.isFinite(difficulty)) {
       this.difficulty = clamp(Math.round(difficulty), 0, MAX_TIER);
@@ -913,9 +1536,12 @@ export class Room {
       if (!bonuses) this.clearBonuses();
     }
 
-    const newMap = isMapId(map) && map !== this.mapId;
+    // BR получает отдельную крупную карту по умолчанию. Явный выбор карты
+    // остаётся возможным для будущих тестовых матчей.
+    const requestedMap = isMapId(map) ? map : mode === MODE_ROYALE ? ROYALE_MAP_ID : undefined;
+    const newMap = requestedMap !== undefined && requestedMap !== this.mapId;
     if (newMap) {
-      this.mapId = map;
+      this.mapId = requestedMap!;
       this.scene = buildScene(this.mapId);
       this.obstacles = this.scene.obstacles;
       this.half = this.scene.half;
@@ -929,6 +1555,10 @@ export class Room {
 
     const newMode = mode !== undefined && mode !== this.mode;
     if (newMode) this.mode = mode;
+    if (newMode && this.mode === MODE_ROYALE && !this.bonusesOn) {
+      this.bonusesOn = true;
+      this.bonusAt = this.tick;
+    }
 
     // Смена правил перезапускает бой по той же причине, что и смена режима: это
     // не настройка внутри боя, а другой бой. Заодно снимает неприятность, когда
@@ -936,7 +1566,20 @@ export class Room {
     const newRules = isRuleset(rules) && rules !== this.rules;
     if (newRules) this.rules = rules;
 
-    if (newMap || newMode || newRules) this.restart();
+    // Размер команды сам по себе не боец — перезапускает бой, только пока мы в нём.
+    const newTeamSize = isTeamBattleSize(teamSize) && teamSize !== this.teamSize;
+    if (newTeamSize) this.teamSize = teamSize!;
+
+    const newRoyaleSquadSize = isRoyaleSquadSize(royaleSquadSize) && royaleSquadSize !== this.royaleSquadSize;
+    if (newRoyaleSquadSize) this.royaleSquadSize = royaleSquadSize!;
+
+    if (
+      newMap ||
+      newMode ||
+      newRules ||
+      (newTeamSize && this.mode === MODE_TEAM) ||
+      (newRoyaleSquadSize && this.mode === MODE_ROYALE)
+    ) this.restart();
 
     this.emitConfig();
   }
@@ -954,6 +1597,18 @@ export class Room {
     this.runDifficulty = this.difficulty;
     this.phase = 'break';
     this.phaseUntil = this.tick;
+    this.royaleStarted = false;
+    this.royaleOver = false;
+    this.royalePhase = 'countdown';
+    this.royalePhaseUntil = 0;
+    this.royaleContacts.clear();
+    this.royaleVision.clear();
+    this.royaleVisionTick = -Infinity;
+    this.royaleZone.phase = 'safe';
+    this.royaleZone.endsAt = 0;
+    this.teamStarted = false;
+    this.teamWinner = null;
+    this.teamResult = null;
     // Возрождаем всех, а не только павших: на новой карте старые координаты могут
     // оказаться внутри блока, и танк вытолкнет неизвестно куда.
     for (const player of this.players.values()) {
@@ -1028,7 +1683,7 @@ export class Room {
       if (player.brain) continue;
       player.waiting = false;
       if (player.dead) this.respawn(player);
-      player.hp = MAX_HP;
+      player.hp = this.maxHealth(player);
     }
     this.emitWave();
     // Панель настроек должна погасить пометку «ждёт следующей волны».
@@ -1086,7 +1741,7 @@ export class Room {
       if (player.brain) continue;
       player.waiting = false;
       if (player.dead) this.respawn(player);
-      player.hp = MAX_HP;
+      player.hp = this.maxHealth(player);
     }
     this.phase = 'break';
     this.phaseUntil = this.tick + Math.round(2 * TICK_HZ);
@@ -1151,18 +1806,41 @@ export class Room {
 
   waveState(): WaveState {
     const expedition = this.mode === MODE_EXPEDITION;
+    const team = this.mode === MODE_TEAM;
+    const phase = team ? this.teamPhase : this.phase;
+    const until = team
+      ? Math.max(0, (this.teamPhaseUntil - this.tick) / TICK_HZ)
+      : this.phase === 'fight'
+        ? 0
+        : Math.max(0, (this.phaseUntil - this.tick) / TICK_HZ);
     return {
       wave: this.wave,
-      phase: this.phase,
+      phase,
       left: this.quotaLeft + this.botCount,
-      until: this.phase === 'fight' ? 0 : Math.max(0, (this.phaseUntil - this.tick) / TICK_HZ),
+      until,
       best: this.best,
       ...(expedition
         ? {
             power: expeditionPower(this.wave),
+            health: this.expeditionStats().health,
             upgrades: [...this.expeditionUpgrades],
             choices: this.upgradeChoices.map((id) => EXPEDITION_UPGRADES[id]),
             victory: this.victory,
+          }
+        : {}),
+      ...(team
+        ? {
+            teamSize: this.teamSize,
+            winner: this.teamWinner ?? undefined,
+          }
+        : {}),
+      ...(this.mode === MODE_ROYALE
+        ? {
+            royalePhase: this.royaleStarted ? this.royalePhase : undefined,
+            royaleUntil:
+              this.royaleStarted && this.royalePhaseUntil > 0
+                ? Math.max(0, (this.royalePhaseUntil - this.tick) / TICK_HZ)
+                : 0,
           }
         : {}),
     };
@@ -1188,6 +1866,8 @@ export class Room {
       stance: this.stance,
       bonuses: this.bonusesOn,
       hostId: this.hostId,
+      teamSize: this.teamSize,
+      royaleSquadSize: this.royaleSquadSize,
     };
   }
 
@@ -1205,10 +1885,25 @@ export class Room {
     return n;
   }
 
-  /** Снапшот общий для всех, кроме поля ack — оно у каждого своё. */
-  snapshotEntries(): SnapshotEntry[] {
+  /**
+   * Снапшот обычных режимов общий. В BR он собирается для конкретного игрока:
+   * сервер не отдаёт координаты непросвеченных живых врагов даже в сетевом пакете.
+   * Остовы приходят всегда: они остаются физическими препятствиями и не могут
+   * превращаться в невидимую стену.
+   */
+  snapshotEntries(viewer?: Player): SnapshotEntry[] {
     const entries: SnapshotEntry[] = [];
     for (const p of this.players.values()) {
+      if (viewer && this.mode === MODE_ROYALE && !p.dead && !this.royaleVisible(viewer, p)) continue;
+      if (
+        viewer &&
+        this.mode === MODE_ROYALE &&
+        p.id !== viewer.id &&
+        p.team !== viewer.team &&
+        !p.dead
+      ) {
+        this.rememberRoyaleContact(viewer.team, p);
+      }
       const mask = this.bonusesOn ? this.effectMask(p) : 0;
       entries.push({
         i: p.id,
@@ -1219,6 +1914,7 @@ export class Room {
         s: round(p.state.speed),
         h: p.hp,
         d: p.dead ? 1 : 0,
+        m: this.maxHealth(p),
         // Поле есть только у тех, у кого эффект реально висит — экономия трафика.
         ...(mask === 0 ? {} : { f: mask }),
         // Счётчик нужен клиенту, чтобы отдача и вспышка означали именно
@@ -1229,15 +1925,117 @@ export class Room {
     return entries;
   }
 
-  snapshotShells(): SnapshotShell[] {
-    return this.shells.map((s) => ({
+  private rememberRoyaleContact(team: number, target: Player): void {
+    let contacts = this.royaleContacts.get(team);
+    if (!contacts) {
+      contacts = new Map();
+      this.royaleContacts.set(team, contacts);
+    }
+    contacts.set(target.id, {
+      x: target.state.x,
+      z: target.state.z,
+      until: this.tick + Math.round(5 * TICK_HZ),
+    });
+  }
+
+  /** Контакты, которые ещё не истекли и уже снова не стали видимыми. */
+  snapshotContacts(viewer: Player): SnapshotContact[] {
+    if (this.mode !== MODE_ROYALE) return [];
+    const contacts = this.royaleContacts.get(viewer.team);
+    if (!contacts) return [];
+
+    const out: SnapshotContact[] = [];
+    for (const [id, contact] of contacts) {
+      const target = this.players.get(id);
+      if (!target || target.dead || this.tick >= contact.until) {
+        contacts.delete(id);
+        continue;
+      }
+      if (this.royaleVisible(viewer, target)) {
+        contacts.delete(id);
+        continue;
+      }
+      out.push({
+        i: id,
+        x: round(contact.x),
+        z: round(contact.z),
+        u: Math.max(0, round((contact.until - this.tick) / TICK_HZ)),
+      });
+    }
+    return out;
+  }
+
+  private royaleVisible(viewer: Player, target: Player): boolean {
+    if (viewer.id === target.id || viewer.team === target.team) return true;
+    this.refreshRoyaleVision();
+    return this.royaleVision.get(viewer.team)?.has(target.id) ?? false;
+  }
+
+  /** Пересчитывает лучи обзора только раз в 5 секунд и делит результат со сквадом. */
+  private refreshRoyaleVision(): void {
+    if (this.mode !== MODE_ROYALE || !this.royaleStarted) return;
+    if (this.tick - this.royaleVisionTick < ROYALE_VISION_REFRESH_TICKS) return;
+
+    const observers = new Map<number, Player[]>();
+    for (const player of this.players.values()) {
+      if (player.dead) continue;
+      const allies = observers.get(player.team);
+      if (allies) allies.push(player);
+      else observers.set(player.team, [player]);
+    }
+
+    this.royaleVision.clear();
+    for (const [team, allies] of observers) {
+      const visible = new Set<number>();
+      for (const target of this.players.values()) {
+        if (target.dead || target.team === team) continue;
+        if (allies.some((ally) => this.royaleVisibleFrom(ally, target))) visible.add(target.id);
+      }
+      this.royaleVision.set(team, visible);
+    }
+    this.royaleVisionTick = this.tick;
+  }
+
+  /** Принудительный сброс для смены состояния мира и детерминированных проверок. */
+  invalidateRoyaleVision(): void {
+    this.royaleVisionTick = -Infinity;
+  }
+
+  /** Индивидуальный луч, используемый только при обновлении общего кэша. */
+  private royaleVisibleFrom(viewer: Player, target: Player): boolean {
+    if (target.dead) return false;
+    const distance = Math.hypot(target.state.x - viewer.state.x, target.state.z - viewer.state.z);
+    if (distance <= 22) return true;
+    const recentShot = this.tick - target.lastShotAt <= 2 * TICK_HZ;
+    if (target.stealth && distance > 22) return recentShot && distance <= ROYALE_SHOT_REVEAL_RANGE;
+
+    const targetBush = bushIndexAt(this.bushes, target.state.x, target.state.z);
+    const viewerBush = bushIndexAt(this.bushes, viewer.state.x, viewer.state.z);
+    if (targetBush >= 0 && targetBush !== viewerBush && recentShot && distance <= ROYALE_SHOT_REVEAL_RANGE) {
+      // Выстрел выдаёт куст, но здание всё ещё сохраняет укрытие.
+      return hasShot(viewer.state, target.state, this.cover, undefined, this.half, ROYALE_SHOT_REVEAL_RANGE);
+    }
+    if (recentShot && distance <= ROYALE_SHOT_REVEAL_RANGE) {
+      return hasShot(viewer.state, target.state, this.cover, this.bushes, this.half, ROYALE_SHOT_REVEAL_RANGE);
+    }
+    return distance <= ROYALE_SIGHT_RANGE && hasShot(viewer.state, target.state, this.cover, this.bushes, this.half, ROYALE_SIGHT_RANGE);
+  }
+
+  snapshotShells(viewer?: Player): SnapshotShell[] {
+    return this.shells
+      .filter((s) => {
+        if (!viewer || this.mode !== MODE_ROYALE) return true;
+        const owner = this.players.get(s.owner);
+        return owner !== undefined && this.royaleVisible(viewer, owner);
+      })
+      .map((s) => ({
       i: s.id,
       o: s.owner,
       x: round(s.x),
       z: round(s.z),
       a: round(Math.atan2(s.vx, s.vz)),
       b: s.bounces,
-    }));
+      }));
   }
 
   /** Взрывы этого тика. */

@@ -172,15 +172,26 @@ export const MAX_SHELLS = 120;
 export const MODE_DM = 'dm';
 /** Все против ботов: волны, одна жизнь на волну. */
 export const MODE_PVE = 'pve';
-/** Забег на 10 волн с развитием танка между волнами. */
+/** Забег на 15 волн с развитием танка между волнами. */
 export const MODE_EXPEDITION = 'expedition';
-export type GameMode = typeof MODE_DM | typeof MODE_PVE | typeof MODE_EXPEDITION;
+/** Королевская битва: команды, одна жизнь и сжимающаяся зона. */
+export const MODE_ROYALE = 'royale';
+/** Командный бой: 5×5 или 10×10, одна жизнь на раунд, до уничтожения или до таймера. */
+export const MODE_TEAM = 'team';
+export type GameMode =
+  | typeof MODE_DM
+  | typeof MODE_PVE
+  | typeof MODE_EXPEDITION
+  | typeof MODE_ROYALE
+  | typeof MODE_TEAM;
 
 export function isMode(v: unknown): v is GameMode {
-  return v === MODE_DM || v === MODE_PVE || v === MODE_EXPEDITION;
+  return (
+    v === MODE_DM || v === MODE_PVE || v === MODE_EXPEDITION || v === MODE_ROYALE || v === MODE_TEAM
+  );
 }
 
-export const EXPEDITION_WAVES = 10;
+export const EXPEDITION_WAVES = 15;
 export const EXPEDITION_UPGRADE_COUNT = 3;
 
 /** Сила базового танка в экспедиции: сначала слабее, к финалу сильнее. */
@@ -189,7 +200,7 @@ export function expeditionPower(wave: number): number {
   if (wave === 2) return 0.9;
   if (wave === 3) return 0.96;
   if (wave <= 5) return 1;
-  return Math.min(1.28, 1 + (wave - 5) * 0.07);
+  return Math.min(1.5, 1 + (wave - 5) * 0.08);
 }
 
 export interface ExpeditionUpgrade {
@@ -199,22 +210,48 @@ export interface ExpeditionUpgrade {
   speed: number;
   damage: number;
   reload: number;
+  health: number;
 }
 
-/** Небольшой фиксированный пул — его легко расширить новыми картами. */
+/** Фиксированный пул командных улучшений: один выбор действует до конца забега. */
 export const EXPEDITION_UPGRADES: ExpeditionUpgrade[] = [
-  // Бонусы намеренно ощущаются сразу: одна карта должна быть заметнее
-  // косметического прироста, но суммарная сила всё ещё растёт постепенно.
-  { id: 0, name: 'Усиленная ходовая', description: '+12% скорость и ускорение', speed: 1.12, damage: 1, reload: 1 },
-  { id: 1, name: 'Стабилизатор', description: '+18% урон снаряда', speed: 1, damage: 1.18, reload: 1 },
-  { id: 2, name: 'Быстрый досылатель', description: '-16% перезарядка', speed: 1, damage: 1, reload: 0.84 },
-  { id: 3, name: 'Форсаж', description: '+10% скорость и ускорение', speed: 1.1, damage: 1, reload: 1 },
-  { id: 4, name: 'Тяжёлый боеприпас', description: '+14% урон снаряда', speed: 1, damage: 1.14, reload: 1 },
+  // Каждая карточка должна ощущаться уже с первого выбора, но сочетания всё
+  // ещё складываются постепенно, а не превращают первую половину забега в чит.
+  { id: 0, name: 'Усиленная ходовая', description: '+20% скорость и ускорение', speed: 1.2, damage: 1, reload: 1, health: 1 },
+  { id: 1, name: 'Стабилизатор', description: '+28% урон снаряда', speed: 1, damage: 1.28, reload: 1, health: 1 },
+  { id: 2, name: 'Быстрый досылатель', description: '-25% перезарядка', speed: 1, damage: 1, reload: 0.75, health: 1 },
+  { id: 3, name: 'Форсаж', description: '+18% скорость и ускорение', speed: 1.18, damage: 1, reload: 1, health: 1 },
+  { id: 4, name: 'Тяжёлый боеприпас', description: '+24% урон снаряда', speed: 1, damage: 1.24, reload: 1, health: 1 },
+  { id: 5, name: 'Бронекапсула', description: '+25% максимальное здоровье', speed: 1, damage: 1, reload: 1, health: 1.25 },
 ];
 
 export function isCoopMode(mode: GameMode): boolean {
   return mode === MODE_PVE || mode === MODE_EXPEDITION;
 }
+
+/**
+ * В королевской битве и в командном бою один номер команды означает союзников
+ * (в скваде или в стороне 5×5/10×10) — в отличие от DM, где номер команды не
+ * значит ничего, кроме «за кого играешь».
+ */
+export function isSquadMode(mode: GameMode): boolean {
+  return mode === MODE_ROYALE || mode === MODE_TEAM;
+}
+
+// --- Командный бой ---
+
+/** Размеры команды на выбор хоста: 5×5 или 10×10. */
+export const TEAM_BATTLE_SIZES = [5, 10] as const;
+export type TeamBattleSize = (typeof TEAM_BATTLE_SIZES)[number];
+
+export function isTeamBattleSize(v: unknown): v is TeamBattleSize {
+  return v === 5 || v === 10;
+}
+
+/** Раунд длится не дольше этого — дальше ничья, даже если бой не решён. */
+export const TEAM_BATTLE_ROUND_S = 300;
+/** Экран итогов раунда висит столько, прежде чем начнётся следующий раунд. */
+export const TEAM_BATTLE_OVER_S = 12;
 
 // --- Правила боя ---
 
@@ -245,8 +282,33 @@ export function isRuleset(v: unknown): v is Ruleset {
  * реалистичных правилах загорается только в режиме против ботов.
  */
 export function alliedTeams(mode: GameMode, a: number, b: number): boolean {
-  return isCoopMode(mode) && a === b;
+  return (isCoopMode(mode) || isSquadMode(mode)) && a === b;
 }
+
+// --- Королевская битва ---
+
+/** Максимальный размер команды в первой версии режима. */
+export const ROYALE_SQUAD_SIZE = 4;
+/** Форматы отряда в BR: соло, дуо и полный сквад. */
+export const ROYALE_SQUAD_SIZES = [1, 2, 4] as const;
+export type RoyaleSquadSize = (typeof ROYALE_SQUAD_SIZES)[number];
+
+export function isRoyaleSquadSize(v: unknown): v is RoyaleSquadSize {
+  return v === 1 || v === 2 || v === 4;
+}
+/** Сколько команд всего заполняем ботами, если людей в комнате мало. */
+export const ROYALE_SQUAD_COUNT = 4;
+/** Короткий предстартовый отсчёт после заполнения состава BR. */
+export const ROYALE_START_COUNTDOWN_S = 5;
+export const ROYALE_ZONE_START_WAIT_S = 45;
+export const ROYALE_ZONE_SHRINK_S = 35;
+export const ROYALE_ZONE_REST_S = 28;
+export const ROYALE_ZONE_FINAL_RADIUS = 22;
+export const ROYALE_ZONE_DAMAGE_S = [28, 42, 62, 90, 130] as const;
+/** Дальность обычного визуального засвета цели в BR, м. */
+export const ROYALE_SIGHT_RANGE = 145;
+/** Дальность краткого раскрытия после выстрела в BR, м. */
+export const ROYALE_SHOT_REVEAL_RANGE = 190;
 
 /** Четыре уровня сложности; индекс — он же стартовый тир ботов. */
 export const DIFFICULTY_NAMES = ['Новичок', 'Средний', 'Ветеран', 'Ас'];
@@ -379,6 +441,27 @@ export const BONUS_MAX = 5;
 export const BONUS_RADIUS = 3.2;
 /** Сколько ящик лежит, если его не подобрали, с. */
 export const BONUS_LIFETIME_S = 45;
+
+// --- Лут королевской битвы ---
+
+/** В BR контейнеры не дают таймерные эффекты: модуль действует до конца матча. */
+export const ROYALE_LOOT_ARMOR = BONUS_KINDS;
+export const ROYALE_LOOT_DAMAGE = BONUS_KINDS + 1;
+export const ROYALE_LOOT_RELOAD = BONUS_KINDS + 2;
+export const ROYALE_LOOT_SPEED = BONUS_KINDS + 3;
+export const ROYALE_LOOT_NAMES: Record<number, string> = {
+  [BONUS_HEAL]: 'Ремкомплект',
+  [ROYALE_LOOT_ARMOR]: 'Бронепластины',
+  [ROYALE_LOOT_DAMAGE]: 'Модуль орудия',
+  [ROYALE_LOOT_RELOAD]: 'Механизм заряжания',
+  [ROYALE_LOOT_SPEED]: 'Модуль двигателя',
+};
+
+/** Один подобранный модуль заметно меняет танк, но не превращает его в другой класс. */
+export const ROYALE_LOOT_ARMOR_HP = 300;
+export const ROYALE_LOOT_DAMAGE_MUL = 1.25;
+export const ROYALE_LOOT_RELOAD_MUL = 0.78;
+export const ROYALE_LOOT_SPEED_MUL = 1.18;
 
 /** Активен ли эффект в маске снапшота. */
 export function hasEffect(mask: number, kind: number): boolean {

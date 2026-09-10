@@ -32,8 +32,12 @@ import {
   COLOR_GROUND,
   COLOR_HOUSE_WALL,
   COLOR_METAL,
+  COLOR_CAR,
+  COLOR_ROAD,
+  COLOR_SIDEWALK,
   COLOR_ROOF,
   COLOR_TRACK,
+  COLOR_TREE_TRUNK,
   COLOR_WALL,
   EXPOSURE,
   FILL_INTENSITY,
@@ -47,6 +51,7 @@ import {
   LEAF_COLORS,
   PALETTE,
   SUN_INTENSITY,
+  TREE_LEAF_COLORS,
 } from './look.js';
 import {
   buildTankGeometry,
@@ -106,7 +111,7 @@ const OBSTACLE_BEVEL_SEGMENTS = 1;
  * где танк проезжает целиком, она даже не участвует в столкновении — см.
  * passableObstacles в map.ts), а кластер всегда поднимается заметно выше танка.
  */
-const LEAF_CUBE = 1.4; // м, ребро кубика
+const LEAF_CUBE = 1.4; // м, шаг посадки листовых комков
 const BUSH_HEIGHT = 3.2; // м, высота кластера
 const BUSH_LAYERS = 3;
 const LEAF_PALETTE = LEAF_COLORS.map((c) => new THREE.Color(c));
@@ -122,9 +127,31 @@ type BoxLook =
   | 'barricade'
   | 'berm'
   | 'rock'
-  | 'bush';
+  | 'bush'
+  | 'roof'
+  | 'gate'
+  | 'road'
+  | 'sidewalk'
+  | 'pole'
+  | 'car'
+  | 'tree'
+  | 'barrel'
+  | 'pipe'
+  | 'wreck';
 
 function boxLook(box: Box, mapId = 0): BoxLook {
+  if (box.style === 'tree') return 'tree';
+  if (box.style === 'barrel') return 'barrel';
+  if (box.style === 'pipe') return 'pipe';
+  if (box.style === 'wreck') return 'wreck';
+  if (box.solid === false) {
+    if (box.style === 'gate') return 'gate';
+    if (box.style === 'road') return 'road';
+    if (box.style === 'sidewalk') return 'sidewalk';
+    if (box.style === 'pole') return 'pole';
+    if (box.style === 'car') return 'car';
+    return 'roof';
+  }
   // Кусты определяются не вкусом рендера, а тем же правилом, что у сервера:
   // в них можно въехать, они прячут ботов и имеют свой кластер листвы.
   // Никакая карта и никакой визуальный архетип не должны это переопределять.
@@ -141,13 +168,120 @@ function boxLook(box: Box, mapId = 0): BoxLook {
     if (aspect >= 4) return 'barricade';
     if (shortest <= 5 && Math.max(box.w, box.d) >= 8) return 'container';
     if (area >= 70) return 'berm';
-    return 'bush';
+    // Раньше здесь стояло 'bush' — тот же зелёный силуэт, что и у настоящего
+    // куста, но isBush() выше уже сказал «нет» (не дотянул до BUSH_MIN_SIZE
+    // хотя бы по одной стороне). Танк в такой силуэт не заезжает, вид звал
+    // заехать — ровно тот баг с «мелкими кустами». Мелкий низкий объект,
+    // который не куст, должен выглядеть предметом, а не растением.
+    return 'crate';
   }
   if (box.h >= 7 && aspect < 1.35) return 'tower';
   if (aspect >= WALL_ASPECT) return 'wall';
   if (aspect >= 1.45 || area >= 190) return 'warehouse';
   if (shortest >= HOUSE_FOOTPRINT) return 'house';
   return shortest >= 6 ? 'guardhouse' : 'crate';
+}
+
+/** Лёгкий оттенок грунта для атмосферы карты; физика у всех вариантов одна. */
+const GROUND_COLORS = [
+  0x39412f, // Кремль — базовый оливковый грунт
+  0x414832, // Форт — сухая трава
+  0x3b403c, // Город — холодный городской прах
+  0x493f32, // Овраг — тёмная земля
+  0x514a32, // Окопы — выжженная почва
+  0x41443b, // Автопарк — бетонно-грунтовая смесь
+  0x67543a, // Дюны — тёплый песок
+  0x46503a, // Холмы — зелёно-серый склон
+  0x414d36, // Долина — влажная трава
+  0x3d4441, // Промзона — холодный техногенный грунт
+  0x4b4d3b, // Рубеж — выцветшая полевая трава
+  0x35383a, // Мегаполис — холодный асфальт сплошной застройки
+];
+
+function groundColor(mapId: number): number {
+  return GROUND_COLORS[mapId] ?? COLOR_GROUND;
+}
+
+/** Крупные варианты почвы: карта получает ритм районов, а не случайный камуфляж. */
+const GROUND_PATCH_PALETTES: number[][] = [
+  [0x4b5437, 0x6b5b3c, 0x303b2d],
+  [0x5d5d3e, 0x76623d, 0x3c4935],
+  [0x4d5050, 0x6b6251, 0x343b3b],
+  [0x5b4a35, 0x704c32, 0x38352d],
+  [0x665538, 0x4e4932, 0x7b633b],
+  [0x53534a, 0x75654b, 0x383e3b],
+  [0x8a6d43, 0x6d5937, 0x9b7d4a],
+  [0x53603c, 0x756243, 0x3c4c36],
+  [0x4f603b, 0x6f7045, 0x3b4b34],
+  [0x4d5550, 0x76604a, 0x35403d],
+  [0x566044, 0x756547, 0x3a4636],
+];
+
+/** Трава — один инстансированный low-poly пучок, без физики и теней. */
+const GRASS_COLORS = [0x536b38, 0x6f7b3e, 0x8a8147, 0x405c36];
+const GRASS_PAD = 1.8;
+
+function grassTuftGeometry(): THREE.BufferGeometry {
+  const vertices: number[] = [];
+  for (let i = 0; i < 3; i++) {
+    const angle = (i / 3) * Math.PI * 2;
+    const dirX = Math.cos(angle) * 0.32;
+    const dirZ = Math.sin(angle) * 0.32;
+    const sideX = -Math.sin(angle) * 0.16;
+    const sideZ = Math.cos(angle) * 0.16;
+    const height = 1;
+    vertices.push(
+      -sideX, 0, -sideZ,
+      sideX, 0, sideZ,
+      dirX, height, dirZ,
+    );
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+  geometry.computeVertexNormals();
+  return geometry;
+}
+
+type WeatherKind = 'clear' | 'mist' | 'rain' | 'snow';
+
+interface EnvironmentProfile {
+  sky: number;
+  fog: number;
+  fogNear: number;
+  fogFar: number;
+  hemiSky: number;
+  hemiGround: number;
+  hemiIntensity: number;
+  fill: number;
+  fillIntensity: number;
+  sun: number;
+  sunIntensity: number;
+  weather: WeatherKind;
+  night: boolean;
+}
+
+/** Четыре дешёвых профиля: выбор зависит от карты, поэтому одинаков у всех клиентов. */
+const ENVIRONMENT_PROFILES: EnvironmentProfile[] = [
+  { sky: 0x496783, fog: 0x496783, fogNear: 260, fogFar: 1200, hemiSky: 0x9fb8d8, hemiGround: 0x4a4f3e, hemiIntensity: 1, fill: 0xbfd4ea, fillIntensity: 0.42, sun: 0xffe6bd, sunIntensity: 1, weather: 'clear', night: false },
+  { sky: 0x817d79, fog: 0x827c72, fogNear: 180, fogFar: 920, hemiSky: 0xd2b9a0, hemiGround: 0x4c473c, hemiIntensity: 0.78, fill: 0xd3b49d, fillIntensity: 0.3, sun: 0xffb477, sunIntensity: 0.72, weather: 'mist', night: false },
+  { sky: 0x4e5364, fog: 0x555661, fogNear: 150, fogFar: 760, hemiSky: 0x8d91ab, hemiGround: 0x353943, hemiIntensity: 0.58, fill: 0x8795bd, fillIntensity: 0.24, sun: 0xd78360, sunIntensity: 0.5, weather: 'rain', night: false },
+  { sky: 0x111a31, fog: 0x17233b, fogNear: 85, fogFar: 520, hemiSky: 0x455c91, hemiGround: 0x171c27, hemiIntensity: 0.32, fill: 0x6077aa, fillIntensity: 0.16, sun: 0x6e83b6, sunIntensity: 0.2, weather: 'snow', night: true },
+];
+
+/** Одна запланированная перемена за матч: достаточно заметная, но не ломающая бой. */
+const ENVIRONMENT_CHANGE_DELAY_S = 75;
+const ENVIRONMENT_CHANGE_DURATION_S = 18;
+
+function weatherOpacity(kind: WeatherKind): number {
+  return kind === 'snow' ? 0.62 : kind === 'rain' ? 0.38 : 0;
+}
+
+function weatherSize(kind: WeatherKind): number {
+  return kind === 'snow' ? 0.28 : 0.14;
+}
+
+function weatherColor(kind: WeatherKind): number {
+  return kind === 'snow' ? 0xe5efff : 0x9fc8dc;
 }
 
 /**
@@ -168,15 +302,52 @@ function obstacleGeometry(box: Box, look: BoxLook): THREE.BufferGeometry {
 
 /** Группа деталей, которые сливаются в несколько мешей на всю карту. */
 interface DecorBatch {
+  roadBody: THREE.BufferGeometry[];
+  sidewalkBody: THREE.BufferGeometry[];
+  poleBody: THREE.BufferGeometry[];
+  carBody: THREE.BufferGeometry[];
+  carGlass: THREE.BufferGeometry[];
+  carWheel: THREE.BufferGeometry[];
+  treeTrunk: THREE.BufferGeometry[];
+  treeLeaf: THREE.BufferGeometry[];
+  treeLeafAlt: THREE.BufferGeometry[];
+  roofBody: THREE.BufferGeometry[];
+  gateBody: THREE.BufferGeometry[];
   roof: THREE.BufferGeometry[];
   trim: THREE.BufferGeometry[];
   windows: THREE.BufferGeometry[];
   doors: THREE.BufferGeometry[];
   rocks: THREE.BufferGeometry[];
+  // Корпуса самих препятствий: раньше каждый — свой Mesh, теперь копятся
+  // здесь и сливаются по материалу тем же способом, что и декор выше —
+  // на карте под сотню коробок, а после слияния это три драв-колла.
+  houseBody: THREE.BufferGeometry[];
+  crateBody: THREE.BufferGeometry[];
+  wallBoxBody: THREE.BufferGeometry[];
 }
 
 function createDecorBatch(): DecorBatch {
-  return { roof: [], trim: [], windows: [], doors: [], rocks: [] };
+  return {
+    roadBody: [],
+    sidewalkBody: [],
+    poleBody: [],
+    carBody: [],
+    carGlass: [],
+    carWheel: [],
+    treeTrunk: [],
+    treeLeaf: [],
+    treeLeafAlt: [],
+    roofBody: [],
+    gateBody: [],
+    roof: [],
+    trim: [],
+    windows: [],
+    doors: [],
+    rocks: [],
+    houseBody: [],
+    crateBody: [],
+    wallBoxBody: [],
+  };
 }
 
 function worldBox(w: number, h: number, d: number, x: number, y: number, z: number): THREE.BoxGeometry {
@@ -248,10 +419,11 @@ const CAMERA_BASE_HEIGHT = 3.4;
  */
 const FPV_FORWARD = 0.4;
 /**
- * Высота камеры от первого лица: заметно выше оси ствола — как будто сидишь
- * в открытом люке командирской башенки, а не лежишь щекой на казённике.
+ * Высота камеры от первого лица: ниже прежней командирской точки, ближе к
+ * опущенной линии орудия, чтобы камера и новая маска воспринимались одной
+ * конструкцией. Высота снаряда при этом остаётся авторитетной в симуляции.
  */
-const FPV_HEIGHT = TURRET_Y + 1.3;
+const FPV_HEIGHT = TURRET_Y + 0.95;
 /** Насколько далеко вынесена точка, куда смотрит камера от первого лица — далеко за горизонт, важно только направление. */
 const FPV_LOOK = 60;
 
@@ -425,6 +597,9 @@ export interface TankHandle {
   body: THREE.Group;
   /** Ходовая сидит прямо на root: при живом танке она всегда остаётся на земле. */
   runningGear: THREE.Group;
+  /** Базовые корпуса гусениц и общий пакет колёс: скрываются, когда лента слетела. */
+  runningBase: THREE.Mesh;
+  wheels: THREE.Mesh;
   turret: THREE.Group;
   /** Ствол ходит отдельно от башни: по нему играется откат. */
   barrel: THREE.Mesh;
@@ -455,6 +630,8 @@ export interface TankHandle {
   paint: THREE.MeshStandardMaterial;
   /** Исходный цвет краски, чтобы вернуть его при возрождении. */
   paintColor: number;
+  /** Палитра до командной окраски BR: в обычных режимах сохраняем её как есть. */
+  basePaintColor: number;
   /** Сколько секунд идёт гибель; -1 — танк не подбит. */
   dying: number;
   /**
@@ -482,7 +659,27 @@ export interface TankHandle {
   /** Под «Маскировкой» и достаточно далеко: корпус и подпись не рисуются. */
   cloaked: boolean;
   hp: number;
+  /** Парашют на время высадки BR. */
+  canopy: THREE.Mesh;
+  /** Фары видны у всех танков ночью; настоящие источники света есть только у своего. */
+  headlights: THREE.Group;
+  headlightSpots: THREE.SpotLight[];
 }
+
+interface ContactMarkerHandle {
+  el: HTMLDivElement;
+  x: number;
+  z: number;
+  until: number;
+}
+
+export type TankFaction = 'self' | 'ally' | 'enemy' | 'neutral';
+
+const FACTION_PAINT: Record<Exclude<TankFaction, 'neutral'>, number> = {
+  self: 0xd0a34f,
+  ally: 0x36a9bd,
+  enemy: 0xd6534d,
+};
 
 /** Одна всплывающая цифра урона: DOM-узел плюс мировая точка, от которой он растёт. */
 interface DamageNumberHandle {
@@ -538,11 +735,58 @@ export class Scene3D {
 
   /** Земля, стены и блоки текущей карты: при смене карты группа собирается заново. */
   private readonly world = new THREE.Group();
+  /** Граница безопасной зоны BR; сама зона не перекрывает рельеф и укрытия. */
+  private readonly royaleZoneRing = new THREE.Mesh(
+    new THREE.RingGeometry(0.985, 1, 128),
+    new THREE.MeshBasicMaterial({
+      color: 0x8ed8ff,
+      transparent: true,
+      opacity: 0.78,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    }),
+  );
+  /** Прозрачная вертикальная граница BR: видна как надвигающаяся стена, а не как HUD-кольцо. */
+  private readonly royaleZoneWall = new THREE.Mesh(
+    new THREE.CylinderGeometry(1, 1, 1, 128, 1, true),
+    new THREE.MeshBasicMaterial({
+      color: 0x8ed8ff,
+      transparent: true,
+      opacity: 0.12,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+      blending: THREE.AdditiveBlending,
+    }),
+  );
+  /** Самолёт высадки: живёт вне карты и показывается только в drop-фазе BR. */
+  private readonly royalePlane = new THREE.Group();
+  private readonly royaleDropCanopyGeometry = new THREE.SphereGeometry(2.1, 12, 6, 0, Math.PI * 2, 0, Math.PI / 2);
+  private readonly royaleDropCanopyMaterial = new THREE.MeshStandardMaterial({
+    color: 0xe5e0cf,
+    roughness: 0.85,
+    flatShading: true,
+  });
+  private royaleDropHeight = 0;
 
   /** Следы гусениц, пыль и обломки: живут отдельно от карты, но чистятся с ней. */
   private readonly tracks = new TrackMarks();
   private readonly dust = new ParticleField(DUST_FIELD);
   private readonly debris = new ParticleField(DEBRIS_FIELD);
+  /** Один общий поток частиц погоды на весь кадр, а не сотни отдельных Mesh. */
+  private readonly weatherPositions = new Float32Array(560 * 3);
+  private readonly weatherSpeeds = new Float32Array(560);
+  private readonly weatherPoints: THREE.Points;
+  private weatherAttribute!: THREE.BufferAttribute;
+  private weatherKind: WeatherKind = 'clear';
+  private weatherTime = 0;
+  private environmentElapsed = 0;
+  private environmentTransitionElapsed = 0;
+  private environmentChanging = false;
+  private environmentChangeDone = false;
+  private environmentFromIndex = 0;
+  private environmentToIndex = 0;
+  private readonly environmentScratch = new THREE.Color();
+  private nightLightsOn = false;
   /** Часы сцены в секундах: по ним шейдеры считают возраст следов и пылинок. */
   private clock = 0;
 
@@ -561,6 +805,7 @@ export class Scene3D {
 
   private readonly renderer: THREE.WebGLRenderer;
   private readonly tanks = new Map<number, TankHandle>();
+  private readonly contactMarkers = new Map<number, ContactMarkerHandle>();
   private readonly shells = new Map<number, ShellHandle>();
   private readonly shellPool: THREE.Group[] = [];
   private readonly effects: Effect[] = [];
@@ -577,6 +822,10 @@ export class Scene3D {
     flash: new THREE.SphereGeometry(1, 12, 10),
     ring: new THREE.RingGeometry(0.72, 1, 28),
     bonus: new THREE.BoxGeometry(1.7, 1.7, 1.7),
+    lootBody: new RoundedBoxGeometry(4.8, 2.2, 3.4, 0.16, 2),
+    lootLid: new RoundedBoxGeometry(5.1, 0.26, 3.7, 0.08, 1),
+    lootBand: new THREE.BoxGeometry(0.18, 2.42, 3.5),
+    lootPlate: new RoundedBoxGeometry(1.55, 0.62, 0.08, 0.04, 1),
     // Оба конуса единичной высоты и без донышка: длину задаёт масштаб, а крышка
     // светящегося конуса выглядела бы как приклеенный к снаряду диск.
     cone: new THREE.ConeGeometry(0.5, 1, 10, 1, true),
@@ -597,9 +846,29 @@ export class Scene3D {
       }),
   );
 
-  private readonly bonuses = new Map<number, { mesh: THREE.Mesh; seen: boolean }>();
-  /** Общая фаза вращения ящиков — чтобы они крутились в такт, а не вразнобой. */
-  private bonusSpin = 0;
+  private readonly containerBaseMaterial = new THREE.MeshStandardMaterial({
+    color: 0x465158,
+    roughness: 0.82,
+    metalness: 0.72,
+    flatShading: true,
+  });
+  private readonly containerBandMaterial = new THREE.MeshStandardMaterial({
+    color: 0x1e272b,
+    roughness: 0.9,
+    metalness: 0.58,
+    flatShading: true,
+  });
+  private readonly containerMarkMaterials = BONUS_COLORS.map(
+    (color) => new THREE.MeshStandardMaterial({
+      color,
+      roughness: 0.62,
+      metalness: 0.28,
+      flatShading: true,
+    }),
+  );
+  private readonly bonuses = new Map<number, { object: THREE.Object3D; seen: boolean }>();
+  /** BR-контейнеры тяжёлые и стоят на земле; старые бонусы по-прежнему парят. */
+  private royaleLootVisual = false;
 
   /**
    * Снаряд светится сам: он мелкий и должен читаться на любом фоне. Цвет поднят
@@ -639,6 +908,14 @@ export class Scene3D {
     metalness: 0.25,
     flatShading: true,
   });
+  private readonly headlightMaterial = new THREE.MeshStandardMaterial({
+    color: 0xffe0a4,
+    emissive: 0xffa83d,
+    emissiveIntensity: 4.2,
+    roughness: 0.28,
+    metalness: 0.05,
+  });
+  private readonly headlightGeometry = new THREE.SphereGeometry(0.16, 8, 6);
 
   /**
    * Цепочка постобработки для свечения. Держится собранной всегда, но при
@@ -650,6 +927,9 @@ export class Scene3D {
   private readonly renderPass: RenderPass;
   private readonly bloomPass: UnrealBloomPass;
   private bloomOn = true;
+  private hemisphereLight!: THREE.HemisphereLight;
+  private fillLight!: THREE.DirectionalLight;
+  private sunLight!: THREE.DirectionalLight;
 
   private readonly cameraTarget = new THREE.Vector3();
   private cameraReady = false;
@@ -692,7 +972,7 @@ export class Scene3D {
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = EXPOSURE;
 
-    this.camera = new THREE.PerspectiveCamera(62, 1, 0.5, 600);
+    this.camera = new THREE.PerspectiveCamera(62, 1, 0.5, 1200);
     this.camera.position.set(0, 20, -30);
 
     // Границы кадра задаст resize; дальняя плоскость с запасом на всю высоту.
@@ -702,10 +982,13 @@ export class Scene3D {
     this.topCamera.up.set(0, 0, -1);
     this.active = this.camera;
 
-    this.scene.background = new THREE.Color(0x121822);
-    // Ближняя граница вынесена за игровую зону (карта 140 м в поперечнике), чтобы туман
-    // не съедал поле, но дальняя стена через всю карту уже заметно подёрнута дымкой.
-    this.scene.fog = new THREE.Fog(0x121822, 110, 300);
+    // Небо не должно проваливаться в почти чёрный фон: при дальнем зуме оно
+    // занимает заметную часть кадра и задаёт общий уровень света сцены.
+    this.scene.background = new THREE.Color(0x496783);
+    // На больших картах туман начинается дальше, иначе «Рубеж» выглядел бы
+    // пустым уже через сотню метров, а дальние районы растворялись бы раньше
+    // самой игровой дистанции.
+    this.scene.fog = new THREE.Fog(0x496783, 260, 1200);
 
     this.groundMap = groundTexture(this.renderer);
     this.concreteMap = concreteTexture(this.renderer);
@@ -733,6 +1016,45 @@ export class Scene3D {
     this.composer.addPass(new OutputPass());
 
     this.scene.add(this.world);
+    const weatherGeometry = new THREE.BufferGeometry();
+    this.weatherAttribute = new THREE.BufferAttribute(this.weatherPositions, 3);
+    weatherGeometry.setAttribute('position', this.weatherAttribute);
+    const weatherMaterial = new THREE.PointsMaterial({
+      color: 0xb9d7e8,
+      size: 0.16,
+      transparent: true,
+      opacity: 0.42,
+      depthWrite: false,
+      sizeAttenuation: true,
+    });
+    this.weatherPoints = new THREE.Points(weatherGeometry, weatherMaterial);
+    this.weatherPoints.visible = false;
+    this.scene.add(this.weatherPoints);
+    this.royaleZoneRing.rotation.x = -Math.PI / 2;
+    this.royaleZoneRing.position.y = 0.08;
+    this.royaleZoneRing.visible = false;
+    this.scene.add(this.royaleZoneRing);
+    this.royaleZoneWall.position.y = 9;
+    this.royaleZoneWall.visible = false;
+    this.scene.add(this.royaleZoneWall);
+    const planeBody = new THREE.Mesh(
+      new THREE.BoxGeometry(13, 2.2, 3.2),
+      new THREE.MeshStandardMaterial({ color: 0xd9dde0, roughness: 0.72, metalness: 0.22, flatShading: true }),
+    );
+    const planeWings = new THREE.Mesh(
+      new THREE.BoxGeometry(4.2, 0.32, 19),
+      new THREE.MeshStandardMaterial({ color: 0xb8c0c5, roughness: 0.78, metalness: 0.2, flatShading: true }),
+    );
+    planeWings.position.x = -1.2;
+    const planeTail = new THREE.Mesh(
+      new THREE.BoxGeometry(3.2, 1.8, 3.4),
+      new THREE.MeshStandardMaterial({ color: 0xc9cfd2, roughness: 0.78, metalness: 0.18, flatShading: true }),
+    );
+    planeTail.position.x = -5.1;
+    planeTail.position.y = 0.8;
+    this.royalePlane.add(planeBody, planeWings, planeTail);
+    this.royalePlane.visible = false;
+    this.scene.add(this.royalePlane);
     this.scene.add(this.tracks.mesh);
     this.scene.add(this.dust.points);
     this.scene.add(this.debris.points);
@@ -743,26 +1065,27 @@ export class Scene3D {
 
   private setupLights(): void {
     // Небо сверху, отражённый от земли свет снизу: именно он вытягивает тени из черноты.
-    this.scene.add(new THREE.HemisphereLight(0x9fb8d8, 0x4a4f3e, AMBIENT_INTENSITY));
+    this.hemisphereLight = new THREE.HemisphereLight(0x9fb8d8, 0x4a4f3e, AMBIENT_INTENSITY);
+    this.scene.add(this.hemisphereLight);
 
     // Слабый контровой свет с противоположной стороны — без него теневой борт танка
     // сливается в один тёмный силуэт.
-    const fill = new THREE.DirectionalLight(0xbfd4ea, FILL_INTENSITY);
-    fill.position.set(-70, 45, -55);
-    this.scene.add(fill);
+    this.fillLight = new THREE.DirectionalLight(0xbfd4ea, FILL_INTENSITY);
+    this.fillLight.position.set(-70, 45, -55);
+    this.scene.add(this.fillLight);
 
-    const sun = new THREE.DirectionalLight(0xffe6bd, SUN_INTENSITY);
-    sun.position.set(60, 95, 40);
-    sun.castShadow = true;
-    sun.shadow.mapSize.set(2048, 2048);
-    sun.shadow.camera.left = -110;
-    sun.shadow.camera.right = 110;
-    sun.shadow.camera.top = 110;
-    sun.shadow.camera.bottom = -110;
-    sun.shadow.camera.near = 10;
-    sun.shadow.camera.far = 260;
-    sun.shadow.bias = -0.0006;
-    this.scene.add(sun);
+    this.sunLight = new THREE.DirectionalLight(0xffe6bd, SUN_INTENSITY);
+    this.sunLight.position.set(60, 95, 40);
+    this.sunLight.castShadow = true;
+    this.sunLight.shadow.mapSize.set(2048, 2048);
+    this.sunLight.shadow.camera.left = -240;
+    this.sunLight.shadow.camera.right = 240;
+    this.sunLight.shadow.camera.top = 240;
+    this.sunLight.shadow.camera.bottom = -240;
+    this.sunLight.shadow.camera.near = 10;
+    this.sunLight.shadow.camera.far = 600;
+    this.sunLight.shadow.bias = -0.0006;
+    this.scene.add(this.sunLight);
   }
 
   /**
@@ -773,6 +1096,7 @@ export class Scene3D {
    */
   buildWorld(half: number, obstacles: Box[], mapId = 0): void {
     this.clearWorld();
+    this.applyEnvironment(mapId);
     // Следы, пыль и обломки от прошлой карты к новой отношения не имеют.
     this.tracks.clear();
     this.dust.clear();
@@ -785,7 +1109,7 @@ export class Scene3D {
     const ground = new THREE.Mesh(
       new THREE.PlaneGeometry(groundSize, groundSize),
       new THREE.MeshStandardMaterial({
-        color: COLOR_GROUND,
+        color: groundColor(mapId),
         roughness: 1,
         map: this.groundMap,
       }),
@@ -793,6 +1117,8 @@ export class Scene3D {
     ground.rotation.x = -Math.PI / 2;
     ground.receiveShadow = true;
     this.world.add(ground);
+    this.buildGroundPatches(half, mapId);
+    this.buildGrass(half, obstacles, mapId);
 
     const grid = new THREE.GridHelper(half * 2, half / 2.5, 0x5c6b52, 0x475040);
     grid.position.y = 0.02;
@@ -867,15 +1193,68 @@ export class Scene3D {
       roughness: 0.9,
       flatShading: true,
     });
+    const roadMaterial = new THREE.MeshStandardMaterial({
+      color: COLOR_ROAD,
+      roughness: 0.96,
+      flatShading: true,
+    });
+    const sidewalkMaterial = new THREE.MeshStandardMaterial({
+      color: COLOR_SIDEWALK,
+      roughness: 0.9,
+      flatShading: true,
+    });
+    const poleMaterial = new THREE.MeshStandardMaterial({
+      color: 0x34383a,
+      roughness: 0.72,
+      metalness: 0.35,
+      flatShading: true,
+    });
+    const carMaterial = new THREE.MeshStandardMaterial({
+      color: COLOR_CAR,
+      roughness: 0.72,
+      metalness: 0.12,
+      flatShading: true,
+    });
+    const carGlassMaterial = new THREE.MeshStandardMaterial({
+      color: 0x243841,
+      roughness: 0.24,
+      metalness: 0.28,
+      flatShading: true,
+    });
+    const carWheelMaterial = new THREE.MeshStandardMaterial({
+      color: 0x25282a,
+      roughness: 0.96,
+      flatShading: true,
+    });
+    const treeTrunkMaterial = new THREE.MeshStandardMaterial({
+      color: COLOR_TREE_TRUNK,
+      roughness: 1,
+      flatShading: true,
+    });
+    const treeLeafMaterial = new THREE.MeshStandardMaterial({
+      color: TREE_LEAF_COLORS[0],
+      roughness: 1,
+      flatShading: true,
+    });
+    const treeLeafAltMaterial = new THREE.MeshStandardMaterial({
+      color: TREE_LEAF_COLORS[1],
+      roughness: 1,
+      flatShading: true,
+    });
     const rockMaterial = new THREE.MeshStandardMaterial({
       color: COLOR_BOX,
       roughness: 1,
       flatShading: true,
     });
-    // Куст — кластер мелких кубиков (см. buildBush), не крашеная коробка: своя
-    // геометрия и материал на кубик, отдельно от «полных» укрытий ниже.
-    const leafGeometry = new THREE.BoxGeometry(LEAF_CUBE, LEAF_CUBE, LEAF_CUBE);
-    const leafMaterial = new THREE.MeshStandardMaterial({ roughness: 1 });
+    // Куст — кластер фасеточных комков (см. buildBush), не крашеная коробка:
+    // гранёная форма лучше совпадает с низкополигональными камнями и фасками
+    // карты, а приглушённая шероховатая зелень не спорит с окружением.
+    const leafGeometry = new THREE.DodecahedronGeometry(LEAF_CUBE * 0.58, 0);
+    const leafMaterial = new THREE.MeshStandardMaterial({
+      roughness: 0.98,
+      metalness: 0,
+      flatShading: true,
+    });
     this.bushMeshes = [];
     this.activeBush = -1;
     const decor = createDecorBatch();
@@ -883,6 +1262,73 @@ export class Scene3D {
       const look = boxLook(box, mapId);
       if (look === 'bush') {
         this.buildBush(box, leafGeometry, leafMaterial);
+        continue;
+      }
+      if (look === 'road' || look === 'sidewalk') {
+        const geometry = obstacleGeometry(box, look);
+        geometry.translate(box.x, (box.y ?? 0) + box.h / 2, box.z);
+        if (look === 'road') decor.roadBody.push(geometry);
+        else decor.sidewalkBody.push(geometry);
+        continue;
+      }
+      if (look === 'pole') {
+        const pole = new THREE.CylinderGeometry(
+          Math.max(0.07, box.w * 0.45),
+          Math.max(0.1, box.w * 0.7),
+          box.h,
+          6,
+        );
+        pole.translate(box.x, (box.y ?? 0) + box.h / 2, box.z);
+        decor.poleBody.push(pole);
+        continue;
+      }
+      if (look === 'car') {
+        const geometry = obstacleGeometry(box, look);
+        geometry.translate(box.x, (box.y ?? 0) + box.h * 0.5, box.z);
+        decor.carBody.push(geometry);
+        const alongX = box.w >= box.d;
+        decor.carGlass.push(worldBox(
+          alongX ? box.w * 0.48 : box.w * 0.68,
+          box.h * 0.34,
+          alongX ? box.d * 0.68 : box.d * 0.48,
+          box.x,
+          (box.y ?? 0) + box.h * 0.86,
+          box.z,
+        ));
+        for (const side of [-1, 1]) {
+          const wheel = new THREE.CylinderGeometry(0.34, 0.34, 0.16, 8);
+          wheel.rotateZ(Math.PI / 2);
+          wheel.translate(
+            box.x + (alongX ? 0 : side * (box.w * 0.43)),
+            (box.y ?? 0) + 0.34,
+            box.z + (alongX ? side * (box.d * 0.43) : 0),
+          );
+          decor.carWheel.push(wheel);
+        }
+        continue;
+      }
+      if (look === 'barrel') {
+        this.buildBarrel(box, crateMaterial, trimMaterial);
+        continue;
+      }
+      if (look === 'pipe') {
+        this.buildPipe(box, trimMaterial);
+        continue;
+      }
+      if (look === 'wreck') {
+        this.buildWreck(box, carMaterial, carGlassMaterial, carWheelMaterial, trimMaterial);
+        continue;
+      }
+      if (look === 'tree') {
+        this.buildTree(box, decor);
+        continue;
+      }
+      if (look === 'roof' || look === 'gate') {
+        const geometry = obstacleGeometry(box, look);
+        scaleBoxUv(geometry, box.w, box.h, box.d, BLOCK_TILE);
+        geometry.translate(box.x, (box.y ?? 0) + box.h / 2, box.z);
+        if (look === 'roof') decor.roofBody.push(geometry);
+        else decor.gateBody.push(geometry);
         continue;
       }
 
@@ -898,24 +1344,314 @@ export class Scene3D {
         continue;
       }
 
-      const material =
-        look === 'house' || look === 'guardhouse'
-          ? houseMaterial
-          : look === 'crate' || look === 'container'
-            ? crateMaterial
-            : wallBoxMaterial;
       const geometry = obstacleGeometry(box, look);
       // Развёртка правится на геометрии, а не отдельным материалом на блок:
       // блоков на карте под сотню, и сотня материалов — это сотня шейдеров.
       scaleBoxUv(geometry, box.w, box.h, box.d, BLOCK_TILE);
-      const mesh = new THREE.Mesh(geometry, material);
-      mesh.position.set(box.x, box.h / 2, box.z);
-      mesh.castShadow = true;
-      mesh.receiveShadow = true;
-      this.world.add(mesh);
+      geometry.translate(box.x, (box.y ?? 0) + box.h / 2, box.z);
+      if (look === 'house' || look === 'guardhouse') decor.houseBody.push(geometry);
+      else if (look === 'crate' || look === 'container') decor.crateBody.push(geometry);
+      else decor.wallBoxBody.push(geometry);
       this.decorateObstacle(box, look, decor);
     }
-    this.flushDecor(decor, roofMaterial, trimMaterial, windowMaterial, doorMaterial, rockMaterial);
+    this.flushDecor(
+      decor,
+      roofMaterial,
+      trimMaterial,
+      windowMaterial,
+      doorMaterial,
+      rockMaterial,
+      houseMaterial,
+      crateMaterial,
+      wallBoxMaterial,
+      roadMaterial,
+      sidewalkMaterial,
+      poleMaterial,
+      carMaterial,
+      carGlassMaterial,
+      carWheelMaterial,
+      treeTrunkMaterial,
+      treeLeafMaterial,
+      treeLeafAltMaterial,
+    );
+  }
+
+  /** Применяет стартовый профиль и заводит одноразовую смену погоды. */
+  private applyEnvironment(mapId: number): void {
+    const index = ((mapId % ENVIRONMENT_PROFILES.length) + ENVIRONMENT_PROFILES.length) % ENVIRONMENT_PROFILES.length;
+    const profile = ENVIRONMENT_PROFILES[index];
+    this.environmentFromIndex = index;
+    this.environmentToIndex = (index + 1) % ENVIRONMENT_PROFILES.length;
+    this.environmentElapsed = 0;
+    this.environmentTransitionElapsed = 0;
+    this.environmentChanging = false;
+    this.environmentChangeDone = false;
+    this.weatherKind = profile.weather;
+    this.applyEnvironmentBlend(profile, profile, 0);
+    this.resetWeatherParticles();
+  }
+
+  /** Смешивает два профиля без создания объектов на каждом кадре перехода. */
+  private applyEnvironmentBlend(from: EnvironmentProfile, to: EnvironmentProfile, progress: number): void {
+    this.blendEnvironmentColor(this.scene.background as THREE.Color, from.sky, to.sky, progress);
+    const fog = this.scene.fog as THREE.Fog;
+    this.blendEnvironmentColor(fog.color, from.fog, to.fog, progress);
+    fog.near = THREE.MathUtils.lerp(from.fogNear, to.fogNear, progress);
+    fog.far = THREE.MathUtils.lerp(from.fogFar, to.fogFar, progress);
+    this.blendEnvironmentColor(this.hemisphereLight.color, from.hemiSky, to.hemiSky, progress);
+    this.blendEnvironmentColor(this.hemisphereLight.groundColor, from.hemiGround, to.hemiGround, progress);
+    this.hemisphereLight.intensity = AMBIENT_INTENSITY * THREE.MathUtils.lerp(from.hemiIntensity, to.hemiIntensity, progress);
+    this.blendEnvironmentColor(this.fillLight.color, from.fill, to.fill, progress);
+    this.fillLight.intensity = FILL_INTENSITY * THREE.MathUtils.lerp(from.fillIntensity, to.fillIntensity, progress);
+    this.blendEnvironmentColor(this.sunLight.color, from.sun, to.sun, progress);
+    this.sunLight.intensity = SUN_INTENSITY * THREE.MathUtils.lerp(from.sunIntensity, to.sunIntensity, progress);
+
+    // Фары и характер частиц переключаем в середине перехода, чтобы не было
+    // долгого смешения двух разных направлений света/осадков.
+    const night = progress >= 0.5 ? to.night : from.night;
+    if (night !== this.nightLightsOn) {
+      this.nightLightsOn = night;
+      this.setNightLights(night);
+    }
+
+    const material = this.weatherPoints.material as THREE.PointsMaterial;
+    this.blendEnvironmentColor(material.color, weatherColor(from.weather), weatherColor(to.weather), progress);
+    material.size = THREE.MathUtils.lerp(weatherSize(from.weather), weatherSize(to.weather), progress);
+    material.opacity = THREE.MathUtils.lerp(weatherOpacity(from.weather), weatherOpacity(to.weather), progress);
+    this.weatherPoints.visible = weatherOpacity(from.weather) > 0 || weatherOpacity(to.weather) > 0;
+  }
+
+  private blendEnvironmentColor(out: THREE.Color, from: number, to: number, progress: number): void {
+    out.set(from);
+    this.environmentScratch.set(to);
+    out.lerp(this.environmentScratch, progress);
+  }
+
+  /** Одна смена начинается после разгона боя и больше не повторяется до новой карты. */
+  private updateEnvironment(dt: number): void {
+    if (this.environmentChangeDone) return;
+
+    if (!this.environmentChanging) {
+      this.environmentElapsed += dt;
+      if (this.environmentElapsed < ENVIRONMENT_CHANGE_DELAY_S) return;
+      this.environmentChanging = true;
+      this.environmentTransitionElapsed = 0;
+    }
+
+    this.environmentTransitionElapsed = Math.min(
+      ENVIRONMENT_CHANGE_DURATION_S,
+      this.environmentTransitionElapsed + dt,
+    );
+    const rawProgress = this.environmentTransitionElapsed / ENVIRONMENT_CHANGE_DURATION_S;
+    const progress = rawProgress * rawProgress * (3 - 2 * rawProgress);
+    const from = ENVIRONMENT_PROFILES[this.environmentFromIndex];
+    const to = ENVIRONMENT_PROFILES[this.environmentToIndex];
+    this.applyEnvironmentBlend(from, to, progress);
+
+    if (rawProgress >= 0.5 && this.weatherKind !== to.weather) {
+      this.weatherKind = to.weather;
+      this.resetWeatherParticles();
+    }
+
+    if (rawProgress >= 1) {
+      this.environmentChanging = false;
+      this.environmentChangeDone = true;
+      this.weatherKind = to.weather;
+      this.applyEnvironmentBlend(to, to, 1);
+    }
+  }
+
+  private resetWeatherParticles(): void {
+    for (let i = 0; i < this.weatherSpeeds.length; i++) {
+      const seed = Math.abs(Math.sin((i + 1) * 17.17 + this.weatherKind.length * 13.1) * 43758.5);
+      const seed2 = Math.abs(Math.sin((i + 1) * 31.73 + this.weatherKind.length * 7.4) * 19341.1);
+      const seed3 = Math.abs(Math.sin((i + 1) * 47.29 + this.weatherKind.length * 3.8) * 9821.7);
+      const at = i * 3;
+      this.weatherPositions[at] = (seed - 0.5) * 80;
+      this.weatherPositions[at + 1] = 2 + seed2 * 28;
+      this.weatherPositions[at + 2] = (seed3 - 0.5) * 80;
+      this.weatherSpeeds[i] = this.weatherKind === 'snow' ? 2.2 + seed * 2.6 : 14 + seed * 12;
+    }
+    this.weatherTime = 0;
+    this.weatherAttribute.needsUpdate = true;
+  }
+
+  /** Дешёвый CPU-апдейт общего Points-эмиттера: 560 частиц, без аллокаций. */
+  private updateWeather(dt: number): void {
+    if (!this.weatherPoints.visible || (this.weatherKind !== 'rain' && this.weatherKind !== 'snow')) return;
+    this.weatherTime += dt;
+    const anchorX = this.active.position.x;
+    const anchorZ = this.active.position.z;
+    for (let i = 0; i < this.weatherSpeeds.length; i++) {
+      const at = i * 3;
+      this.weatherPositions[at + 1] -= this.weatherSpeeds[i] * dt;
+      if (this.weatherKind === 'snow') {
+        this.weatherPositions[at] += Math.sin(this.weatherTime * 0.7 + i) * dt * 1.4;
+      } else {
+        this.weatherPositions[at] += dt * 1.7;
+        this.weatherPositions[at + 2] += dt * 0.9;
+      }
+      if (this.weatherPositions[at + 1] < 0.5) {
+        const seed = Math.abs(Math.sin((i + 1) * 27.17 + this.weatherTime * 0.01) * 43758.5);
+        const seed2 = Math.abs(Math.sin((i + 1) * 41.73 + this.weatherTime * 0.01) * 19341.1);
+        this.weatherPositions[at] = anchorX + (seed - 0.5) * 80;
+        this.weatherPositions[at + 1] = 24 + seed2 * 10;
+        this.weatherPositions[at + 2] = anchorZ + (seed2 - 0.5) * 80;
+      }
+      // При обычном движении не оставляем поток частиц далеко за камерой.
+      if (Math.abs(this.weatherPositions[at] - anchorX) > 52) this.weatherPositions[at] = anchorX - Math.sign(this.weatherPositions[at] - anchorX) * 42;
+      if (Math.abs(this.weatherPositions[at + 2] - anchorZ) > 52) this.weatherPositions[at + 2] = anchorZ - Math.sign(this.weatherPositions[at + 2] - anchorZ) * 42;
+    }
+    this.weatherAttribute.needsUpdate = true;
+  }
+
+  private setNightLights(enabled: boolean): void {
+    for (const handle of this.tanks.values()) {
+      handle.headlights.visible = enabled;
+    }
+  }
+
+  /**
+   * Крупные пятна грунта лежат чуть выше базовой плоскости и ниже дорог.
+   * Неровный семиугольник сохраняет low-poly стиль, а прозрачность не спорит
+   * с тенями, следами и укрытиями. Это чисто визуальный слой.
+   */
+  private buildGroundPatches(half: number, mapId: number): void {
+    const palette = GROUND_PATCH_PALETTES[mapId] ?? GROUND_PATCH_PALETTES[0];
+    const count = half >= 400 ? 18 : half >= 120 ? 9 : 6;
+    const margin = Math.min(half - 12, half * 0.92);
+    for (let i = 0; i < count; i++) {
+      const seed = Math.abs(Math.sin((i + 1) * 91.731 + (mapId + 3) * 17.117) * 43758.5453);
+      const seed2 = Math.abs(Math.sin((i + 1) * 37.419 + (mapId + 11) * 29.713) * 19341.173);
+      const x = (seed - 0.5) * margin * 1.7;
+      const z = (seed2 - 0.5) * margin * 1.7;
+      const radiusX = (half >= 400 ? 25 : 10) + seed * (half >= 400 ? 48 : 18);
+      const radiusZ = radiusX * (0.58 + seed2 * 0.45);
+      const shape = new THREE.CircleGeometry(1, 7 + (i % 3));
+      shape.rotateX(-Math.PI / 2);
+      const material = new THREE.MeshStandardMaterial({
+        color: palette[i % palette.length],
+        roughness: 1,
+        transparent: true,
+        opacity: half >= 400 ? 0.16 : 0.13,
+        depthWrite: false,
+      });
+      const patch = new THREE.Mesh(shape, material);
+      patch.position.set(x, 0.012, z);
+      patch.scale.set(radiusX, 1, radiusZ);
+      patch.rotation.y = seed2 * Math.PI * 2;
+      patch.receiveShadow = true;
+      this.world.add(patch);
+    }
+  }
+
+  /**
+   * Статичная трава: вся карта — один InstancedMesh и один draw call. Точки
+   * отбрасываются из дорог, зданий и остальных Box, поэтому травинки не
+   * торчат сквозь укрытия и не создают новую физику.
+   */
+  private buildGrass(half: number, obstacles: Box[], mapId: number): void {
+    const count = half >= 400 ? 2200 : half >= 120 ? 1000 : 650;
+    const mesh = new THREE.InstancedMesh(
+      grassTuftGeometry(),
+      new THREE.MeshStandardMaterial({
+        color: 0xffffff,
+        roughness: 1,
+        flatShading: true,
+        vertexColors: true,
+        side: THREE.DoubleSide,
+      }),
+      count,
+    );
+    mesh.castShadow = false;
+    mesh.receiveShadow = false;
+
+    const dummy = new THREE.Object3D();
+    const color = new THREE.Color();
+    const margin = Math.max(6, half - 8);
+    const maxAttempts = count * 14;
+    let placed = 0;
+    for (let attempt = 0; attempt < maxAttempts && placed < count; attempt++) {
+      const seed = Math.abs(Math.sin((attempt + 1) * 17.731 + mapId * 41.17));
+      const seed2 = Math.abs(Math.sin((attempt + 1) * 31.419 + mapId * 13.71));
+      const seed3 = Math.abs(Math.sin((attempt + 1) * 47.293 + mapId * 7.31));
+      const x = (seed * 2 - 1) * margin;
+      const z = (seed2 * 2 - 1) * margin;
+      if (!this.isGrassSpot(x, z, obstacles)) continue;
+
+      const height = 0.62 + seed3 * 0.78;
+      const width = 0.72 + seed2 * 0.42;
+      dummy.position.set(x, 0.025, z);
+      dummy.rotation.y = seed * Math.PI * 2;
+      dummy.scale.set(width, height, width);
+      dummy.updateMatrix();
+      mesh.setMatrixAt(placed, dummy.matrix);
+      color.set(GRASS_COLORS[(attempt + mapId) % GRASS_COLORS.length]);
+      mesh.setColorAt(placed, color);
+      placed++;
+    }
+    mesh.count = placed;
+    mesh.instanceMatrix.needsUpdate = true;
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+    this.world.add(mesh);
+  }
+
+  private isGrassSpot(x: number, z: number, obstacles: Box[]): boolean {
+    for (const box of obstacles) {
+      const pad = box.style === 'road' || box.style === 'sidewalk' ? 0.35 : GRASS_PAD;
+      if (Math.abs(x - box.x) <= box.w / 2 + pad && Math.abs(z - box.z) <= box.d / 2 + pad) return false;
+    }
+    return true;
+  }
+
+  /** Обновляет границу круга BR; null убирает её в остальных режимах. */
+  setRoyaleZone(zone: { x: number; z: number; r: number; phase: string } | null): void {
+    if (!zone || zone.r <= 0) {
+      this.royaleZoneRing.visible = false;
+      this.royaleZoneWall.visible = false;
+      return;
+    }
+    this.royaleZoneRing.visible = true;
+    this.royaleZoneWall.visible = true;
+    this.royaleZoneRing.position.x = zone.x;
+    this.royaleZoneRing.position.z = zone.z;
+    this.royaleZoneRing.scale.set(zone.r, zone.r, zone.r);
+    this.royaleZoneWall.position.x = zone.x;
+    this.royaleZoneWall.position.z = zone.z;
+    this.royaleZoneWall.scale.set(zone.r, 18, zone.r);
+    const material = this.royaleZoneRing.material as THREE.MeshBasicMaterial;
+    const color = zone.phase === 'shrinking' ? 0xff8d58 : zone.phase === 'final' ? 0xff4f63 : 0x75d9ff;
+    material.color.setHex(color);
+    material.opacity = zone.phase === 'final' ? 0.9 : 0.65;
+    const wallMaterial = this.royaleZoneWall.material as THREE.MeshBasicMaterial;
+    wallMaterial.color.setHex(color);
+    wallMaterial.opacity = zone.phase === 'final' ? 0.2 : zone.phase === 'shrinking' ? 0.15 : 0.1;
+  }
+
+  /** Синхронизирует командные маркеры последней известной позиции врагов. */
+  syncContactMarkers(contacts: Array<{ i: number; x: number; z: number; u: number }>): void {
+    const seen = new Set<number>();
+    for (const contact of contacts) {
+      seen.add(contact.i);
+      let marker = this.contactMarkers.get(contact.i);
+      if (!marker) {
+        const el = document.createElement('div');
+        el.className = 'contact-marker';
+        el.textContent = '?';
+        this.labelContainer.appendChild(el);
+        marker = { el, x: contact.x, z: contact.z, until: contact.u };
+        this.contactMarkers.set(contact.i, marker);
+      } else {
+        marker.x = contact.x;
+        marker.z = contact.z;
+        marker.until = contact.u;
+      }
+    }
+    for (const [id, marker] of this.contactMarkers) {
+      if (seen.has(id)) continue;
+      marker.el.remove();
+      this.contactMarkers.delete(id);
+    }
   }
 
   /**
@@ -1070,6 +1806,100 @@ export class Scene3D {
     this.world.add(cap);
   }
 
+  /** Низкополигональная промышленная бочка: заметна, но не похожа на лут. */
+  private buildBarrel(
+    box: Box,
+    bodyMaterial: THREE.MeshStandardMaterial,
+    bandMaterial: THREE.MeshStandardMaterial,
+  ): void {
+    const radius = Math.min(box.w, box.d) * 0.38;
+    const body = new THREE.Mesh(new THREE.CylinderGeometry(radius, radius * 1.04, box.h, 10), bodyMaterial);
+    body.position.set(box.x, box.h / 2, box.z);
+    body.castShadow = true;
+    this.world.add(body);
+    for (const y of [box.h * 0.27, box.h * 0.72]) {
+      const ring = new THREE.Mesh(new THREE.TorusGeometry(radius * 1.01, 0.08, 6, 10), bandMaterial);
+      ring.rotation.x = Math.PI / 2;
+      ring.position.set(box.x, y, box.z);
+      ring.castShadow = true;
+      this.world.add(ring);
+    }
+  }
+
+  /** Связка труб с видимыми торцами: промышленный ориентир без новой коллизии. */
+  private buildPipe(box: Box, material: THREE.MeshStandardMaterial): void {
+    const alongX = box.w >= box.d;
+    const length = Math.max(box.w, box.d);
+    const radius = Math.min(box.w, box.d) * 0.28;
+    const pipe = new THREE.Mesh(new THREE.CylinderGeometry(radius, radius, length, 10), material);
+    if (alongX) pipe.rotation.z = Math.PI / 2;
+    else pipe.rotation.x = Math.PI / 2;
+    pipe.position.set(box.x, box.h * 0.58, box.z);
+    pipe.castShadow = true;
+    this.world.add(pipe);
+    for (const offset of [-length * 0.28, length * 0.28]) {
+      const support = new THREE.Mesh(
+        new THREE.BoxGeometry(alongX ? 0.42 : box.w * 0.72, box.h * 0.52, alongX ? box.d * 0.72 : 0.42),
+        material,
+      );
+      support.position.set(box.x + (alongX ? offset : 0), box.h * 0.26, box.z + (alongX ? 0 : offset));
+      support.castShadow = true;
+      this.world.add(support);
+    }
+  }
+
+  /** Разбитая лёгкая техника: узнаваемый силуэт без огня и лишнего свечения. */
+  private buildWreck(
+    box: Box,
+    bodyMaterial: THREE.MeshStandardMaterial,
+    glassMaterial: THREE.MeshStandardMaterial,
+    wheelMaterial: THREE.MeshStandardMaterial,
+    trimMaterial: THREE.MeshStandardMaterial,
+  ): void {
+    const alongX = box.w >= box.d;
+    const body = new THREE.Mesh(
+      new RoundedBoxGeometry(box.w, box.h * 0.62, box.d, 0.18, 1),
+      bodyMaterial,
+    );
+    body.position.set(box.x, box.h * 0.34, box.z);
+    body.rotation.y = (boxVariant(box) - 1.5) * 0.08;
+    body.castShadow = true;
+    this.world.add(body);
+
+    const cabin = new THREE.Mesh(
+      new THREE.BoxGeometry(
+        alongX ? box.w * 0.46 : box.w * 0.7,
+        box.h * 0.42,
+        alongX ? box.d * 0.72 : box.d * 0.46,
+      ),
+      glassMaterial,
+    );
+    cabin.position.set(box.x + (alongX ? box.w * 0.12 : 0), box.h * 0.76, box.z);
+    cabin.rotation.y = body.rotation.y;
+    cabin.castShadow = true;
+    this.world.add(cabin);
+
+    for (let i = 0; i < 2; i++) {
+      const t = i - 0.5;
+      const wheel = new THREE.Mesh(new THREE.CylinderGeometry(box.h * 0.25, box.h * 0.25, 0.18, 8), wheelMaterial);
+      wheel.rotation.z = Math.PI / 2;
+      wheel.position.set(
+        box.x + (alongX ? t * box.w * 0.62 : box.w * 0.46),
+        box.h * 0.22,
+        box.z + (alongX ? box.d * 0.46 : t * box.d * 0.62),
+      );
+      wheel.castShadow = true;
+      this.world.add(wheel);
+    }
+    const damagedBar = new THREE.Mesh(
+      new THREE.BoxGeometry(alongX ? box.w * 0.7 : 0.16, 0.12, alongX ? 0.16 : box.d * 0.7),
+      trimMaterial,
+    );
+    damagedBar.position.set(box.x, box.h * 0.98, box.z);
+    damagedBar.rotation.y = body.rotation.y;
+    this.world.add(damagedBar);
+  }
+
   /** Низкие дюны и каменные гряды: несколько многогранников вместо одного блока. */
   private buildBerm(box: Box, batch: DecorBatch): void {
     const variant = boxVariant(box);
@@ -1095,6 +1925,18 @@ export class Scene3D {
     windowMaterial: THREE.MeshStandardMaterial,
     doorMaterial: THREE.MeshStandardMaterial,
     rockMaterial: THREE.MeshStandardMaterial,
+    houseMaterial: THREE.MeshStandardMaterial,
+    crateMaterial: THREE.MeshStandardMaterial,
+    wallBoxMaterial: THREE.MeshStandardMaterial,
+    roadMaterial: THREE.MeshStandardMaterial,
+    sidewalkMaterial: THREE.MeshStandardMaterial,
+    poleMaterial: THREE.MeshStandardMaterial,
+    carMaterial: THREE.MeshStandardMaterial,
+    carGlassMaterial: THREE.MeshStandardMaterial,
+    carWheelMaterial: THREE.MeshStandardMaterial,
+    treeTrunkMaterial: THREE.MeshStandardMaterial,
+    treeLeafMaterial: THREE.MeshStandardMaterial,
+    treeLeafAltMaterial: THREE.MeshStandardMaterial,
   ): void {
     const add = (geometries: THREE.BufferGeometry[], material: THREE.MeshStandardMaterial) => {
       if (geometries.length === 0) return;
@@ -1105,6 +1947,20 @@ export class Scene3D {
       mesh.receiveShadow = true;
       this.world.add(mesh);
     };
+    add(batch.roadBody, roadMaterial);
+    add(batch.sidewalkBody, sidewalkMaterial);
+    add(batch.poleBody, poleMaterial);
+    add(batch.carBody, carMaterial);
+    add(batch.carGlass, carGlassMaterial);
+    add(batch.carWheel, carWheelMaterial);
+    add(batch.treeTrunk, treeTrunkMaterial);
+    add(batch.treeLeaf, treeLeafMaterial);
+    add(batch.treeLeafAlt, treeLeafAltMaterial);
+    add(batch.roofBody, roofMaterial);
+    add(batch.gateBody, doorMaterial);
+    add(batch.houseBody, houseMaterial);
+    add(batch.crateBody, crateMaterial);
+    add(batch.wallBoxBody, wallBoxMaterial);
     add(batch.roof, roofMaterial);
     add(batch.trim, trimMaterial);
     add(batch.windows, windowMaterial);
@@ -1112,15 +1968,41 @@ export class Scene3D {
     add(batch.rocks, rockMaterial);
   }
 
+  /** Разные деревья в одном low-poly стиле; Box остаётся точной коллизией ствола. */
+  private buildTree(box: Box, batch: DecorBatch): void {
+    const variant = boxVariant(box);
+    const trunkHeight = Math.max(2.1, box.h * 0.52);
+    const trunk = new THREE.CylinderGeometry(
+      Math.max(0.22, Math.min(box.w, box.d) * 0.12),
+      Math.max(0.32, Math.min(box.w, box.d) * 0.17),
+      trunkHeight,
+      6,
+    );
+    trunk.rotateY(variant * 0.4);
+    trunk.translate(box.x, (box.y ?? 0) + trunkHeight / 2, box.z);
+    batch.treeTrunk.push(trunk);
+
+    const target = variant % 2 === 0 ? batch.treeLeaf : batch.treeLeafAlt;
+    const crown = (scale: number, y: number, offsetX: number, offsetZ: number) => {
+      const geometry = new THREE.DodecahedronGeometry(1, 0);
+      geometry.scale(box.w * scale, box.h * scale * 0.9, box.d * scale);
+      geometry.rotateY(variant * 0.65 + scale);
+      geometry.translate(box.x + offsetX, (box.y ?? 0) + y, box.z + offsetZ);
+      target.push(geometry);
+    };
+    crown(0.48, box.h * 0.67, -box.w * 0.08, 0);
+    crown(0.38, box.h * 0.9, box.w * 0.11, -box.d * 0.04);
+  }
+
   /**
-   * Куст: кластер мелких кубиков вместо одной плоской коробки — читается как
+   * Куст: кластер фасеточных комков вместо одной плоской коробки — читается как
    * листва, а не крашеный бетон. Высота фиксирована и заметно выше танка
    * (BUSH_HEIGHT) — box.h в этом не участвует, он у куста чисто про физику
    * (держит снаряд или нет, мешает ехать или нет — см. isBush в map.ts).
    * Один InstancedMesh на куст: кубиков в кластере может быть несколько
    * десятков, обычный Mesh на каждый обошёлся бы куда дороже по кадру.
    */
-  private buildBush(box: Box, geometry: THREE.BoxGeometry, material: THREE.MeshStandardMaterial): void {
+  private buildBush(box: Box, geometry: THREE.BufferGeometry, material: THREE.MeshStandardMaterial): void {
     const cols = Math.max(2, Math.round(box.w / LEAF_CUBE));
     const rows = Math.max(2, Math.round(box.d / LEAF_CUBE));
     const stepX = box.w / cols;
@@ -1135,12 +2017,20 @@ export class Scene3D {
     for (let layer = 0; layer < BUSH_LAYERS; layer++) {
       for (let cx = 0; cx < cols; cx++) {
         for (let cz = 0; cz < rows; cz++) {
-          const x = box.x - box.w / 2 + stepX * (cx + 0.5) + (Math.random() - 0.5) * stepX * 0.4;
-          const z = box.z - box.d / 2 + stepZ * (cz + 0.5) + (Math.random() - 0.5) * stepZ * 0.4;
+          const nx = cols === 1 ? 0 : (cx / (cols - 1)) * 2 - 1;
+          const nz = rows === 1 ? 0 : (cz / (rows - 1)) * 2 - 1;
+          const edge = Math.min(1, Math.hypot(nx, nz) * 0.72);
+          const layerT = layer / (BUSH_LAYERS - 1);
+          const x = box.x - box.w / 2 + stepX * (cx + 0.5) + (Math.random() - 0.5) * stepX * 0.34;
+          const z = box.z - box.d / 2 + stepZ * (cz + 0.5) + (Math.random() - 0.5) * stepZ * 0.34;
           const y = stepY * (layer + 0.5) + (Math.random() - 0.5) * stepY * 0.5;
           dummy.position.set(x, y, z);
           dummy.rotation.set(0, Math.random() * Math.PI * 2, 0);
-          dummy.scale.setScalar(0.85 + Math.random() * 0.3);
+          // Верх и края чуть компактнее: силуэт получается мягким и кустовым,
+          // но сетка и число экземпляров остаются прежними.
+          const fullness = 0.82 + (1 - edge) * 0.2 - layerT * 0.1;
+          const size = fullness * (0.92 + Math.random() * 0.16);
+          dummy.scale.set(size * (0.94 + Math.random() * 0.12), size * (0.82 + Math.random() * 0.18), size * (0.94 + Math.random() * 0.12));
           dummy.updateMatrix();
           mesh.setMatrixAt(i, dummy.matrix);
           mesh.setColorAt(i, LEAF_PALETTE[(Math.random() * LEAF_PALETTE.length) | 0]);
@@ -1250,6 +2140,34 @@ export class Scene3D {
 
     upperHull.add(turret);
 
+    const canopy = new THREE.Mesh(this.royaleDropCanopyGeometry, this.royaleDropCanopyMaterial);
+    // Купол должен читаться прямо над башней, а не висеть отдельным объектом
+    // высоко над танком.
+    canopy.position.y = 7;
+    canopy.visible = false;
+    root.add(canopy);
+
+    const headlights = new THREE.Group();
+    const headlightSpots: THREE.SpotLight[] = [];
+    for (const side of [-1, 1]) {
+      const lamp = new THREE.Mesh(this.headlightGeometry, this.headlightMaterial);
+      lamp.position.set(side * 0.82, 1.12, 2.12);
+      headlights.add(lamp);
+      // Два реальных источника только у локального танка: остальные машины
+      // получают те же светящиеся корпуса фар, но не создают десятки lights.
+      if (!isSelf) continue;
+      const spot = new THREE.SpotLight(0xffd99a, 28, 55, Math.PI / 8, 0.72, 1.2);
+      spot.position.set(side * 0.82, 1.14, 2.12);
+      spot.castShadow = false;
+      const target = new THREE.Object3D();
+      target.position.set(side * 3.5, 0.2, 42);
+      headlights.add(spot, target);
+      spot.target = target;
+      headlightSpots.push(spot);
+    }
+    headlights.visible = this.nightLightsOn;
+    root.add(headlights);
+
     this.scene.add(root);
 
     const label = document.createElement('div');
@@ -1276,6 +2194,8 @@ export class Scene3D {
       turret,
       barrel,
       trackLinks,
+      runningBase: running,
+      wheels,
       recoil: 0,
       lastX: 0,
       lastZ: 0,
@@ -1290,6 +2210,7 @@ export class Scene3D {
       treadPhase: [0, 0],
       paint: bodyMaterial,
       paintColor,
+      basePaintColor: paintColor,
       dying: -1,
       smokeAt: 0,
       everSeen: false,
@@ -1304,9 +2225,28 @@ export class Scene3D {
       alive: true,
       cloaked: false,
       hp: MAX_HP,
+      canopy,
+      headlights,
+      headlightSpots,
     };
     this.tanks.set(id, handle);
     return handle;
+  }
+
+  /** Командный цвет BR: меняем только броню, ходовая и металл остаются общими. */
+  setTankFaction(id: number, faction: TankFaction): void {
+    const handle = this.tanks.get(id);
+    if (!handle) return;
+
+    const paintColor = faction === 'neutral' ? handle.basePaintColor : FACTION_PAINT[faction];
+    handle.paintColor = paintColor;
+    handle.paint.color.setHex(paintColor);
+    if (!handle.alive) handle.paint.color.multiplyScalar(WRECK_DARKEN);
+
+    for (const name of ['faction-self', 'faction-ally', 'faction-enemy']) {
+      handle.label.classList.remove(name);
+    }
+    if (faction !== 'neutral') handle.label.classList.add(`faction-${faction}`);
   }
 
   /** Создаёт одну сторону гусеницы и ставит звенья в исходную фазу. */
@@ -1376,6 +2316,7 @@ export class Scene3D {
       handle.paint.color.setHex(handle.paintColor).multiplyScalar(WRECK_DARKEN);
       handle.body.rotation.set(WRECK_PITCH, 0, WRECK_ROLL);
       this.setWreckPose(handle, wreckSink(WRECK_S));
+      this.setWreckVisual(handle, 1);
       handle.roll = WRECK_ROLL;
       handle.pitch = WRECK_PITCH;
       this.setTankShadow(handle, false);
@@ -1389,6 +2330,7 @@ export class Scene3D {
     handle.paint.color.setHex(handle.paintColor).multiplyScalar(WRECK_DARKEN);
     handle.body.rotation.set(WRECK_PITCH, 0, WRECK_ROLL);
     this.setWreckPose(handle, 0);
+    this.setWreckVisual(handle, 0);
     handle.roll = WRECK_ROLL;
     handle.pitch = WRECK_PITCH;
 
@@ -1420,8 +2362,16 @@ export class Scene3D {
     handle.paint.color.setHex(handle.paintColor);
     handle.body.position.y = SUSPENSION_PIVOT_Y;
     handle.body.rotation.set(0, 0, 0);
+    handle.turret.rotation.set(0, 0, 0);
     handle.runningGear.position.set(0, 0, 0);
     handle.runningGear.rotation.set(0, 0, 0);
+    handle.runningBase.visible = true;
+    handle.wheels.visible = true;
+    for (const links of handle.trackLinks) {
+      links.visible = true;
+      links.position.set(0, 0, 0);
+      links.rotation.set(0, 0, 0);
+    }
     handle.roll = 0;
     handle.pitch = 0;
     this.setTankShadow(handle, true);
@@ -1433,6 +2383,25 @@ export class Scene3D {
     handle.body.position.y = SUSPENSION_PIVOT_Y + sink;
     handle.runningGear.position.y = sink;
     handle.runningGear.rotation.copy(handle.body.rotation);
+  }
+
+  /** Разрушенная ходовая: звенья расходятся, а башня заваливается отдельно. */
+  private setWreckVisual(handle: TankHandle, progress: number): void {
+    const p = Math.max(0, Math.min(1, progress));
+    handle.runningBase.visible = false;
+    handle.wheels.visible = false;
+    handle.turret.rotation.x = -0.13 * p;
+    handle.turret.rotation.z = 0.24 * p;
+
+    for (let index = 0; index < handle.trackLinks.length; index++) {
+      const side = index === 0 ? -1 : 1;
+      const links = handle.trackLinks[index];
+      links.visible = true;
+      links.position.x = side * (0.16 + 0.72 * p);
+      links.position.y = -0.08 - 0.26 * p;
+      links.position.z = side * 0.12 * p;
+      links.rotation.z = side * 0.12 * p;
+    }
   }
 
   /** И верх, и ходовая участвуют в одном состоянии теней — живом либо остове. */
@@ -1456,6 +2425,7 @@ export class Scene3D {
       handle.dying += dt;
 
       this.setWreckPose(handle, wreckSink(Math.min(handle.dying, WRECK_S)));
+      this.setWreckVisual(handle, Math.min(handle.dying / 0.55, 1));
       if (handle.dying >= WRECK_S || handle.dying < handle.smokeAt) continue;
       handle.smokeAt += WRECK_SMOKE_EVERY;
       this.spawnEffect(
@@ -1479,6 +2449,13 @@ export class Scene3D {
     // Горящий остов ещё не «жив», но виден: без этой оговорки любое обновление
     // маскировки в кадре гибели гасило бы его на полуслове.
     handle.root.visible = (handle.alive || handle.dying >= 0) && !cloaked;
+  }
+
+  /** Сетевой засвет BR: скрытый враг не должен оставаться на старой позиции. */
+  setTankVisibility(id: number, visible: boolean): void {
+    const handle = this.tanks.get(id);
+    if (!handle) return;
+    handle.root.visible = visible && (handle.alive || handle.dying >= 0) && !handle.cloaked;
   }
 
   /**
@@ -1521,10 +2498,46 @@ export class Scene3D {
     const handle = this.tanks.get(id);
     if (!handle) return;
     if (handle.alive) handle.everSeen = true;
-    handle.root.position.set(x, 0, z);
+    handle.root.position.set(x, handle.alive ? this.royaleDropHeight : 0, z);
     handle.root.rotation.y = angle;
     // Башня хранится в мировых углах, а её узел — потомок корпуса.
     handle.turret.rotation.y = turret - angle;
+  }
+
+  /** Анимация входа в матч BR: самолёт проходит над картой, танки спускаются. */
+  setRoyaleDrop(progress: number, half: number): void {
+    const p = Math.max(0, Math.min(1, progress));
+    this.royaleDropHeight = p < 1 ? (1 - p) * 52 : 0;
+    for (const handle of this.tanks.values()) {
+      const dropping = p < 1 && handle.alive;
+      handle.canopy.visible = dropping && !handle.cloaked;
+      if (!dropping && handle.alive) {
+        handle.root.position.y = 0;
+        handle.root.rotation.x = 0;
+        handle.root.rotation.z = 0;
+      } else if (dropping) {
+        // Разная фаза от координат танка не даёт всему скваду качаться как
+        // одна модель. Амплитуда небольшая: читается ветер, но не тошнит.
+        const phase = handle.root.position.x * 0.013 + handle.root.position.z * 0.019;
+        const gust = Math.sin(this.clock * 2.35 + phase) * 0.1;
+        const crosswind = Math.cos(this.clock * 1.8 + phase * 1.7) * 0.055;
+        handle.root.rotation.z = gust;
+        handle.root.rotation.x = crosswind;
+        handle.canopy.rotation.z = -gust * 1.8;
+      }
+    }
+    if (p >= 1) {
+      this.royalePlane.visible = false;
+      return;
+    }
+    const route = half + 90;
+    this.royalePlane.visible = true;
+    this.royalePlane.position.set(
+      -route + p * route * 2,
+      78,
+      -half * 0.72 + p * half * 1.44,
+    );
+    this.royalePlane.rotation.y = Math.atan2(route * 2, half * 1.44);
   }
 
   /** Камера летит за танком: позиция задаётся углами обзора, а не поворотом корпуса. */
@@ -1537,7 +2550,11 @@ export class Scene3D {
     zoom = CAMERA_DISTANCE,
   ): void {
     const distance = zoom * Math.cos(pitch) + 2;
-    const height = CAMERA_BASE_HEIGHT + Math.sin(pitch) * zoom;
+    // Во время BR-десанта камера поднимается вместе с танком. Раньше модель
+    // уходила на 52 м вверх, а камера продолжала смотреть на землю — поэтому
+    // вся анимация существовала, но игрок её не видел.
+    const drop = this.royaleDropHeight;
+    const height = CAMERA_BASE_HEIGHT + Math.sin(pitch) * zoom + drop;
 
     const desiredX = x - Math.sin(yaw) * distance;
     const desiredZ = z - Math.cos(yaw) * distance;
@@ -1556,7 +2573,7 @@ export class Scene3D {
 
     // Цель взгляда не трясётся вместе с камерой: смещаем только точку съёмки,
     // и толчок выходит поворотом кадра, а не сползанием прицела с танка.
-    this.cameraTarget.set(x, 2.2, z);
+    this.cameraTarget.set(x, 2.2 + drop, z);
     this.applyShake(dt);
     this.camera.lookAt(this.cameraTarget);
   }
@@ -1584,12 +2601,13 @@ export class Scene3D {
   updateFirstPersonCamera(x: number, z: number, yaw: number, pitch: number, dt: number): void {
     const camX = x + Math.sin(yaw) * FPV_FORWARD;
     const camZ = z + Math.cos(yaw) * FPV_FORWARD;
+    const drop = this.royaleDropHeight;
 
     if (!this.cameraReady) {
-      this.cameraHeight = FPV_HEIGHT;
+      this.cameraHeight = FPV_HEIGHT + drop;
       this.cameraReady = true;
     } else {
-      this.cameraHeight += (FPV_HEIGHT - this.cameraHeight) * (1 - Math.exp(-dt * 14));
+      this.cameraHeight += (FPV_HEIGHT + drop - this.cameraHeight) * (1 - Math.exp(-dt * 14));
     }
     this.camera.position.set(camX, this.cameraHeight, camZ);
 
@@ -1619,10 +2637,11 @@ export class Scene3D {
       this.syncParticleScale();
     }
 
-    this.topCamera.position.set(x, TOP_HEIGHT, z);
+    const drop = this.royaleDropHeight;
+    this.topCamera.position.set(x, TOP_HEIGHT + drop, z);
     // Разворот считаем до тряски: у ортокамеры наклон не качает кадр, а сдвигает
     // всю картинку вбок целиком, и толчок читался бы как рывок карты.
-    this.topCamera.lookAt(x, 0, z);
+    this.topCamera.lookAt(x, drop, z);
     this.applyShake(dt);
   }
 
@@ -1758,6 +2777,38 @@ export class Scene3D {
 
   // --- Ящики с бонусами ---
 
+  /** Переключает только внешний вид: серверная логика и список предметов не меняются. */
+  setRoyaleLootVisual(enabled: boolean): void {
+    if (this.royaleLootVisual === enabled) return;
+    this.royaleLootVisual = enabled;
+    this.clearBonuses();
+  }
+
+  /** Собирает приземлённый металлический контейнер вместо светящегося куба. */
+  private createLootContainer(kind: number): THREE.Group {
+    const group = new THREE.Group();
+    const body = new THREE.Mesh(this.geo.lootBody, this.containerBaseMaterial);
+    const lid = new THREE.Mesh(this.geo.lootLid, this.containerBaseMaterial);
+    const leftBand = new THREE.Mesh(this.geo.lootBand, this.containerBandMaterial);
+    const rightBand = new THREE.Mesh(this.geo.lootBand, this.containerBandMaterial);
+    const plate = new THREE.Mesh(
+      this.geo.lootPlate,
+      this.containerMarkMaterials[kind % this.containerMarkMaterials.length],
+    );
+
+    body.position.y = 1.1;
+    lid.position.y = 2.28;
+    leftBand.position.set(-2.05, 1.1, 0);
+    rightBand.position.set(2.05, 1.1, 0);
+    // Маркер цвета встроен во фронт контейнера, а не висит над ним значком.
+    plate.position.set(0, 0.75, -1.73);
+    group.add(body, lid, leftBand, rightBand, plate);
+    group.traverse((child) => {
+      if (child instanceof THREE.Mesh) child.castShadow = true;
+    });
+    return group;
+  }
+
   /** Ставит ящики по списку из снапшота: пропавшие подобрали или они истекли. */
   syncBonuses(list: SnapshotBonus[]): void {
     for (const handle of this.bonuses.values()) handle.seen = false;
@@ -1765,22 +2816,21 @@ export class Scene3D {
     for (const bonus of list) {
       let handle = this.bonuses.get(bonus.i);
       if (!handle) {
-        const mesh = new THREE.Mesh(
-          this.geo.bonus,
-          this.bonusMaterials[bonus.k % this.bonusMaterials.length],
-        );
-        mesh.castShadow = true;
-        this.scene.add(mesh);
-        handle = { mesh, seen: true };
+        const object = this.royaleLootVisual
+          ? this.createLootContainer(bonus.k)
+          : new THREE.Mesh(this.geo.bonus, this.bonusMaterials[bonus.k % this.bonusMaterials.length]);
+        if (object instanceof THREE.Mesh) object.castShadow = true;
+        this.scene.add(object);
+        handle = { object, seen: true };
         this.bonuses.set(bonus.i, handle);
       }
       handle.seen = true;
-      handle.mesh.position.set(bonus.x, BONUS_HOVER, bonus.z);
+      handle.object.position.set(bonus.x, this.royaleLootVisual ? 0 : BONUS_HOVER, bonus.z);
     }
 
     for (const [id, handle] of this.bonuses) {
       if (handle.seen) continue;
-      this.scene.remove(handle.mesh);
+      this.scene.remove(handle.object);
       this.bonuses.delete(id);
     }
   }
@@ -1789,15 +2839,15 @@ export class Scene3D {
     this.syncBonuses([]);
   }
 
-  /** Ящик крутится и покачивается — так его видно издали на пёстром фоне. */
-  private updateBonuses(dt: number): void {
-    if (this.bonuses.size === 0) return;
-    this.bonusSpin += dt;
-    const bob = Math.sin(this.bonusSpin * 2.2) * 0.28;
+  /** Старые бонусы крутятся; BR-контейнеры остаются тяжёлыми и неподвижными. */
+  private updateBonuses(): void {
+    if (this.royaleLootVisual || this.bonuses.size === 0) return;
+    const phase = this.clock;
+    const bob = Math.sin(phase * 2.2) * 0.28;
     for (const handle of this.bonuses.values()) {
-      handle.mesh.rotation.y = this.bonusSpin * 1.1;
-      handle.mesh.rotation.x = this.bonusSpin * 0.5;
-      handle.mesh.position.y = BONUS_HOVER + bob;
+      handle.object.rotation.y = phase * 1.1;
+      handle.object.rotation.x = phase * 0.5;
+      handle.object.position.y = BONUS_HOVER + bob;
     }
   }
 
@@ -2163,11 +3213,13 @@ export class Scene3D {
 
   render(dt: number): void {
     this.clock += dt;
+    this.updateEnvironment(dt);
+    this.updateWeather(dt);
     this.updateEffects(dt);
     this.updateRecoil(dt);
     this.updateChassis(dt);
     this.updateWrecks(dt);
-    this.updateBonuses(dt);
+    this.updateBonuses();
     this.tracks.update(this.clock);
     this.dust.update(this.clock);
     this.debris.update(this.clock);
@@ -2204,6 +3256,7 @@ export class Scene3D {
       // z вне [-1, 1] значит «за камерой или за дальней плоскостью».
       const visible =
         handle.plated &&
+        handle.root.visible &&
         handle.alive &&
         !handle.cloaked &&
         distance < LABEL_MAX_DISTANCE &&
@@ -2220,6 +3273,22 @@ export class Scene3D {
       const y =
         Math.round((-this.projected.y * 0.5 + 0.5) * this.viewHeight) - handle.labelHeight;
       handle.label.style.transform = `translate(${x}px, ${y}px)`;
+    }
+
+    for (const marker of this.contactMarkers.values()) {
+      this.projected.set(marker.x, 1.25, marker.z);
+      const distance = this.projected.distanceTo(this.active.position);
+      this.projected.project(this.active);
+      const visible =
+        distance < LABEL_MAX_DISTANCE * 1.4 &&
+        this.projected.z > -1 &&
+        this.projected.z < 1;
+      marker.el.style.display = visible ? '' : 'none';
+      if (!visible) continue;
+      const x = Math.round((this.projected.x * 0.5 + 0.5) * this.viewWidth) - 12;
+      const y = Math.round((-this.projected.y * 0.5 + 0.5) * this.viewHeight) - 12;
+      marker.el.style.opacity = String(Math.max(0.32, Math.min(1, marker.until / 5)));
+      marker.el.style.transform = `translate(${x}px, ${y}px)`;
     }
   }
 

@@ -1,4 +1,4 @@
-import type { GameMode, Ruleset } from '../shared/constants.js';
+import type { GameMode, RoyaleSquadSize, Ruleset } from '../shared/constants.js';
 import { decode, encode, type ClientMessage, type ServerMessage } from '../shared/protocol.js';
 import type { Input } from '../shared/types.js';
 
@@ -66,6 +66,8 @@ export class Net {
     bonuses?: boolean;
     map?: number;
     stance?: number;
+    teamSize?: number;
+    royaleSquadSize?: RoyaleSquadSize;
   }): void {
     this.send({ t: 'setup', ...setup });
   }

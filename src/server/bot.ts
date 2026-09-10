@@ -78,6 +78,8 @@ export interface BotTier {
    * точность этого перевеса не отыгрывает.
    */
   hesitate: number;
+  /** Сколько ботов одного отряда может одновременно вести прямой огонь по цели. */
+  focusers: number;
   /**
    * Сколько ботов одновременно имеют право идти на сближение с одной целью.
    * Остальные держат дистанцию. Один наседающий — это дуэль, в которой надо
@@ -106,10 +108,10 @@ export interface BotTier {
 // Ошибка прицела в радианах разворачивается в метры промаха на дистанции:
 // на 30 м 0.14 рад — это 4 м мимо при радиусе танка 2.4, то есть чаще мимо, чем в цель.
 export const BOT_TIERS: BotTier[] = [
-  { reaction: 1.3, aimError: 0.26, lead: 0, fireGate: 1.7, cover: false, ricochet: false, range: 52, keep: 46, hesitate: 2.6, pressers: 1, sight: 58, memory: 2.5 },
-  { reaction: 0.6, aimError: 0.17, lead: 0, fireGate: 1.25, cover: true, ricochet: false, range: 42, keep: 36, hesitate: 1.4, pressers: 1, sight: 72, memory: 3.5 },
-  { reaction: 0.25, aimError: 0.085, lead: 0.6, fireGate: 0.95, cover: true, ricochet: true, range: 40, keep: 30, hesitate: 0.6, pressers: 2, sight: 86, memory: 5 },
-  { reaction: 0.11, aimError: 0.018, lead: 1, fireGate: 0.7, cover: true, ricochet: true, range: 44, keep: 26, hesitate: 0, pressers: 3, sight: 100, memory: 6.5 },
+  { reaction: 1.3, aimError: 0.26, lead: 0, fireGate: 1.7, cover: false, ricochet: false, range: 52, keep: 46, hesitate: 2.6, focusers: 1, pressers: 1, sight: 58, memory: 2.5 },
+  { reaction: 0.6, aimError: 0.17, lead: 0, fireGate: 1.25, cover: true, ricochet: false, range: 42, keep: 36, hesitate: 1.4, focusers: 1, pressers: 1, sight: 72, memory: 3.5 },
+  { reaction: 0.25, aimError: 0.085, lead: 0.6, fireGate: 0.95, cover: true, ricochet: true, range: 40, keep: 30, hesitate: 0.6, focusers: 2, pressers: 2, sight: 86, memory: 5 },
+  { reaction: 0.11, aimError: 0.018, lead: 1, fireGate: 0.7, cover: true, ricochet: true, range: 44, keep: 26, hesitate: 0, focusers: 2, pressers: 3, sight: 100, memory: 6.5 },
 ];
 
 /**
@@ -270,6 +272,17 @@ export interface BotWorld {
    * бот на большой карте видел бы стену там, где чистое поле, и уезжал в сторону.
    */
   half?: number;
+  /** Состояние BR-зоны; вне неё движение к безопасности важнее патруля. */
+  zone?: BotZone;
+}
+
+export interface BotZone {
+  x: number;
+  z: number;
+  r: number;
+  nextR: number;
+  until: number;
+  phase: 'safe' | 'shrinking' | 'final' | 'over';
 }
 
 /** Раз в столько тиков бот пересматривает цель — полсекунды. */
@@ -307,6 +320,10 @@ const PRESS_MIN = 10;
 const SPREAD = 18;
 /** Дальше этого бот не стреляет: снаряд живёт 3.5 с и по дороге его собьёт стена. */
 const MAX_ENGAGE = 95;
+/** За сколько секунд до нового сжатия боты начинают заранее занимать безопасный край. */
+const ZONE_PREP_S = 10;
+/** Запас внутри круга: бот не должен ехать по самой границе и получать урон от округления. */
+const ZONE_MARGIN = 24;
 
 /** Во сколько раз шире увод ствола, пока бот подавлен (см. BotSelf.suppressed). */
 const SUPPRESS_AIM_MULT = 2.2;
@@ -332,6 +349,8 @@ export function think(self: BotSelf, world: BotWorld): Input {
     retarget(self, world, tier);
   }
 
+  const zoneMove = zoneHeading(self, world);
+
   const target = findTank(world, brain.targetId);
   if (!target || target.dead) {
     brain.targetId = 0;
@@ -339,6 +358,7 @@ export function think(self: BotSelf, world: BotWorld): Input {
     // Цель мертва или уже вышла — искать её незачем, но если до этого бот уже
     // ехал доразведать другую потерянную цель, доедет: searchUntil про это,
     // а не про то, что случилось с target прямо сейчас.
+    if (zoneMove !== null) return driveTo(self, world, zoneMove, 1);
     if (world.tick < brain.searchUntil) return search(self, world, brain.lastX, brain.lastZ);
     return patrol(self, world);
   }
@@ -403,8 +423,13 @@ export function think(self: BotSelf, world: BotWorld): Input {
   // Порог наводки — угловой размер танка на этой дистанции, растянутый терпением тира.
   const gate = Math.atan2(TANK_RADIUS, Math.max(dist, TANK_RADIUS)) * tier.fireGate;
   const aimed = Math.abs(angleDiff(me.turret, turret)) < gate;
+  // Толпа может видеть одну цель одновременно, но не должна превращать это в
+  // очередь из нескольких стволов. Лишние боты всё ещё едут, обходят и ищут
+  // угол — просто ждут своей очереди на прямой выстрел.
+  const focusShot =
+    (visible || brain.bank !== null) && focusAllowed(self, target, world, tier.focusers);
   const fire =
-    clear && aimed && dist < MAX_ENGAGE && world.tick >= brain.readyAt && !self.dead;
+    clear && aimed && dist < MAX_ENGAGE && world.tick >= brain.readyAt && !self.dead && focusShot;
   // Свой таймер бот держит длиннее перезарядки ровно на hesitate, поэтому комната
   // его выстрел никогда не отклонит: она готова раньше, чем он решится.
   if (fire) brain.readyAt = world.tick + Math.round((RELOAD_S + tier.hesitate) * TICK_HZ);
@@ -414,10 +439,80 @@ export function think(self: BotSelf, world: BotWorld): Input {
   const retreat = tier.cover && self.hp <= BOT_HP * 0.35;
   const want =
     dodge(self, world) ??
+    zoneMove ??
     heading(self, createTankState(trackX, trackZ), dist, tier, world, retreat, shot, bushOnly);
   const drive = unstick(brain, me, world.tick, steerTo(me, want, world.obstacles, world.half));
 
   return { seq: 0, throttle: drive.throttle, steer: drive.steer, turret, fire };
+}
+
+/** Возвращает направление к безопасной точке или null, если бот уже в порядке. */
+function zoneHeading(self: BotSelf, world: BotWorld): number | null {
+  const zone = world.zone;
+  if (!zone || zone.phase === 'over' || zone.r <= 0) return null;
+
+  const me = self.state;
+  const dx = me.x - zone.x;
+  const dz = me.z - zone.z;
+  const distance = Math.hypot(dx, dz);
+  const outside = distance > zone.r - ZONE_MARGIN;
+  const preparing =
+    zone.phase === 'shrinking' ||
+    (zone.phase === 'safe' && zone.until <= ZONE_PREP_S);
+  if (!outside && !preparing) return null;
+
+  const targetRadius = preparing
+    ? Math.max(0, Math.min(zone.r, zone.nextR) - ZONE_MARGIN)
+    : Math.max(0, zone.r - ZONE_MARGIN);
+  if (distance <= targetRadius) return null;
+
+  const scale = distance > 1e-3 ? targetRadius / distance : 0;
+  const targetX = zone.x + dx * scale;
+  const targetZ = zone.z + dz * scale;
+  const base = Math.atan2(targetX - me.x, targetZ - me.z);
+  const { vx, vz } = spread(self, world, Math.sin(base), Math.cos(base));
+  return avoid(me, Math.atan2(vx, vz), world.obstacles, world.half);
+}
+
+/** Движение к зоне, когда цели нет: сохраняет расталкивание и выход из упора. */
+function driveTo(self: BotSelf, world: BotWorld, want: number, throttle: number): Input {
+  const drive = steerTo(self.state, want, world.obstacles, world.half);
+  const move = unstick(self.brain, self.state, world.tick, {
+    throttle: drive.throttle * throttle,
+    steer: drive.steer,
+  });
+  return { seq: 0, throttle: move.throttle, steer: move.steer, turret: self.state.turret };
+}
+
+/**
+ * Разрешает фокусированный огонь только ограниченному числу ботов. Приоритет
+ * получают те, кто ближе к цели, а при равной дистанции — тот, кто уже занял
+ * слот наседающего; id оставляет порядок стабильным и не даёт стволам
+ * хаотично перескакивать каждый тик.
+ */
+function focusAllowed(
+  self: BotSelf,
+  target: BotTarget,
+  world: BotWorld,
+  limit: number,
+): boolean {
+  const priority = (bot: BotTarget & { brain: BotBrain }): [number, number, number] => [
+    Math.hypot(target.state.x - bot.state.x, target.state.z - bot.state.z) - (bot.brain.press ? 4 : 0),
+    -bot.brain.tier,
+    bot.id,
+  ];
+  const before = (a: [number, number, number], b: [number, number, number]): boolean =>
+    a[0] < b[0] || (a[0] === b[0] && (a[1] < b[1] || (a[1] === b[1] && a[2] < b[2])));
+
+  const mine = priority(self);
+  let ahead = 0;
+  for (const tank of world.tanks) {
+    if (tank.id === self.id || tank.dead || tank.team !== self.team) continue;
+    const bot = tank as BotTarget & { brain?: BotBrain | null };
+    if (!bot.brain || bot.brain.targetId !== target.id || (!bot.brain.engaged && bot.brain.bank === null)) continue;
+    if (before(priority({ ...tank, brain: bot.brain }), mine)) ahead++;
+  }
+  return ahead < Math.max(1, limit);
 }
 
 /**
@@ -776,12 +871,19 @@ const EDGE_PULLBACK = Math.sqrt(Math.max(0, TANK_RADIUS * TANK_RADIUS - EDGE_PRO
  * только обзор, и не для смотрящего, который сам сейчас в этом кусте (см.
  * bushBlockers): его собственная листва не слепит его самого на выходе.
  */
-function hasShot(me: TankState, target: TankState, cover: Box[], bushes: Box[] = [], half?: number): boolean {
+export function hasShot(
+  me: TankState,
+  target: TankState,
+  cover: Box[],
+  bushes: Box[] = [],
+  half?: number,
+  maxDistance = MAX_ENGAGE,
+): boolean {
   const dx = target.x - me.x;
   const dz = target.z - me.z;
   const dist = Math.hypot(dx, dz);
   if (dist < 1e-3) return true;
-  if (dist > MAX_ENGAGE) return false;
+  if (dist > maxDistance) return false;
 
   const blockers = bushBlockers(bushes, me.x, me.z);
   if (rayClear(me, target.x, target.z, TANK_RADIUS, cover, blockers, half)) return true;

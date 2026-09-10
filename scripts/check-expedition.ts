@@ -1,5 +1,5 @@
-/** Быстрая проверка десятиволнового забега без поднятия WebSocket-сервера. */
-import { MODE_EXPEDITION, TICK_HZ, EXPEDITION_WAVES } from '../src/shared/constants.js';
+/** Быстрая проверка пятнадцативолнового забега без поднятия WebSocket-сервера. */
+import { EXPEDITION_WAVES, MAX_HP, MODE_EXPEDITION, TICK_HZ } from '../src/shared/constants.js';
 import { Room, type Player } from '../src/server/room.js';
 
 const room = new Room();
@@ -8,6 +8,9 @@ room.add('Проверка', () => {});
 
 const internal = room as unknown as { quotaLeft: number };
 const bots = (): Player[] => [...room.players.values()].filter((player) => player.brain);
+const hero = [...room.players.values()].find((player) => !player.brain);
+if (!hero) throw new Error('В экспедиции не создан игрок');
+let healthUpgradeSeen = false;
 
 room.update();
 if (room.waveState().wave !== 1 || room.waveState().phase !== 'fight') {
@@ -24,7 +27,14 @@ for (let wave = 1; wave <= EXPEDITION_WAVES; wave++) {
     if (state.phase !== 'upgrade' || state.choices?.length !== 3) {
       throw new Error(`После волны ${wave} нет трёх улучшений`);
     }
-    room.chooseUpgrade(state.choices[0].id);
+    const choice = state.choices.find((upgrade) => upgrade.health > 1) ?? state.choices[0];
+    room.chooseUpgrade(choice.id);
+    if (choice.health > 1) {
+      healthUpgradeSeen = true;
+      if (hero.hp !== Math.round(MAX_HP * (room.waveState().health ?? 1))) {
+        throw new Error('Улучшение здоровья не подняло максимальный HP');
+      }
+    }
     for (let i = 0; i < 2 * TICK_HZ + 1; i++) room.update();
     if (room.waveState().wave !== wave + 1) {
       throw new Error(`После улучшения не началась волна ${wave + 1}`);
@@ -33,7 +43,8 @@ for (let wave = 1; wave <= EXPEDITION_WAVES; wave++) {
 }
 
 if (!room.waveState().victory || room.waveState().phase !== 'over') {
-  throw new Error('Десятая волна не завершила экспедицию победой');
+  throw new Error('Пятнадцатая волна не завершила экспедицию победой');
 }
+if (!healthUpgradeSeen) throw new Error('За забег не встретилось улучшение здоровья');
 
-console.log('Экспедиция: все 10 волн и выбор улучшений прошли');
+console.log('Экспедиция: все 15 волн и выбор улучшений прошли');

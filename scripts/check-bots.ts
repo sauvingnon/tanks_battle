@@ -7,6 +7,7 @@
  */
 import {
   BONUS_DAMAGE,
+  BONUS_DAMAGE_MUL,
   BONUS_HEAL,
   BONUS_HEAL_HP,
   BONUS_RELOAD,
@@ -19,11 +20,19 @@ import {
   STANCE_NAMES,
   MODE_DM,
   MODE_PVE,
+  MODE_ROYALE,
+  ROYALE_SQUAD_COUNT,
+  ROYALE_SQUAD_SIZES,
+  ROYALE_SQUAD_SIZE,
+  ROYALE_START_COUNTDOWN_S,
+  ROYALE_LOOT_ARMOR,
+  ROYALE_LOOT_ARMOR_HP,
   RESPAWN_S,
   RULES_ARCADE,
   RULES_REAL,
   alliedTeams,
   SHELL_DAMAGE,
+  SHELL_DAMAGE_SPREAD,
   SHELL_LIFETIME,
   SHELL_SPEED,
   TANK_RADIUS,
@@ -32,7 +41,7 @@ import {
   waveConcurrent,
   waveQuota,
 } from '../src/shared/constants.js';
-import { buildMap, MAP_NAMES, spawnPoint } from '../src/shared/map.js';
+import { buildMap, bushBoxes, MAP_NAMES, spawnCount, spawnPoint } from '../src/shared/map.js';
 import { sweepShell } from '../src/shared/sim.js';
 import { createTankState, TEAM_BOTS, TEAM_PLAYERS, type ShellState } from '../src/shared/types.js';
 import { createBrain, findBankShot, think } from '../src/server/bot.js';
@@ -40,6 +49,10 @@ import { Room, type Player } from '../src/server/room.js';
 
 const checks: Array<[string, boolean]> = [];
 const check = (label: string, ok: boolean) => checks.push([label, ok]);
+
+// Урон снаряда плавает — границы разброса, а не точное значение.
+const SHELL_DAMAGE_MIN = Math.round(SHELL_DAMAGE * (1 - SHELL_DAMAGE_SPREAD));
+const SHELL_DAMAGE_BOOSTED_MIN = Math.round(SHELL_DAMAGE * BONUS_DAMAGE_MUL * (1 - SHELL_DAMAGE_SPREAD));
 
 const noop = () => {};
 
@@ -84,7 +97,7 @@ function wipeWave(room: Room): void {
 function duel(victim: Player, shooter: Player): void {
   victim.state = createTankState(-15, 35, Math.PI / 2);
   shooter.state = createTankState(-32, 35, Math.PI / 2);
-  victim.hp = SHELL_DAMAGE;
+  victim.hp = SHELL_DAMAGE_MIN - 1;
 }
 
 // --- Волна выходит порциями и не превышает потолок ---
@@ -236,7 +249,7 @@ function duel(victim: Player, shooter: Player): void {
   // Снимаем усиление сразу после выстрела — снаряд ещё летит.
   shooter.fx.fill(0);
   run(room, Math.round(0.6 * TICK_HZ));
-  check('усиленный снаряд не слабеет в полёте', victim.hp <= MAX_HP - Math.round(SHELL_DAMAGE * 1.5));
+  check('усиленный снаряд не слабеет в полёте', victim.hp <= MAX_HP - SHELL_DAMAGE_BOOSTED_MIN);
 }
 
 // --- Смена карты ---
@@ -825,6 +838,112 @@ function holdDistance(stance: number): number {
 }
 
 // --- Итог ---
+
+// --- Первый вертикальный срез королевской битвы ---
+{
+  const room = new Room();
+  const player = room.add('Разведчик', noop);
+  room.setup(MODE_ROYALE, 1, true);
+  run(room, 1);
+  check('BR показывает предстартовый отсчёт', room.waveState().royalePhase === 'countdown');
+  const squadOnDrop = [player, ...bots(room).filter((bot) => bot.team === player.team)];
+  const maxSquadDropDistance = Math.max(
+    ...squadOnDrop.map((member) => Math.hypot(member.state.x - player.state.x, member.state.z - player.state.z)),
+  );
+  check('BR высаживает союзный сквад рядом', maxSquadDropDistance < 12);
+  run(room, ROYALE_START_COUNTDOWN_S * TICK_HZ + 1);
+
+  const royaleBots = bots(room);
+  const allies = royaleBots.filter((bot) => bot.team === player.team);
+  const enemies = royaleBots.filter((bot) => bot.team !== player.team);
+  const zone = room.royaleZoneState();
+  check('BR автоматически выбрал большую карту', room.half === 450 && MAP_NAMES[room.mapId] === 'Рубеж');
+  check('BR заполнил союзный сквад', allies.length === ROYALE_SQUAD_SIZE - 1);
+  check('BR создал три вражеских сквада', enemies.length === ROYALE_SQUAD_SIZE * 3);
+  const allDropsInsideZone = zone !== undefined && Array.from({ length: spawnCount(room.mapId) }, (_, index) => spawnPoint(index, room.mapId))
+    .every((spawn) => Math.hypot(spawn.x - zone.x, spawn.z - zone.z) <= zone.r);
+  check('BR все точки высадки внутри стартовой зоны', allDropsInsideZone);
+  check('BR контейнеры лута стоят по карте', room.bonuses.length >= 8);
+  check('BR контейнеры не истекают сами', room.bonuses.every((loot) => loot.until === Number.MAX_SAFE_INTEGER));
+  const armorLoot = room.bonuses.find((loot) => loot.kind === ROYALE_LOOT_ARMOR);
+  if (armorLoot) {
+    player.state = createTankState(armorLoot.x, armorLoot.z, 0);
+    player.hp = MAX_HP / 2;
+    run(room, 1);
+  }
+  check('BR броня подбирается в контейнере', Boolean(armorLoot) && player.royaleArmor === ROYALE_LOOT_ARMOR_HP);
+  check('BR броня увеличивает запас здоровья', Boolean(armorLoot) && player.hp === MAX_HP / 2 + ROYALE_LOOT_ARMOR_HP);
+  check('BR ремонт остаётся отдельным расходником', room.bonuses.some((loot) => loot.kind === BONUS_HEAL));
+
+  for (const size of ROYALE_SQUAD_SIZES) {
+    const formatRoom = new Room();
+    const formatPlayer = formatRoom.add(`Формат ${size}`, noop);
+    formatRoom.setup(MODE_ROYALE, 1, true, undefined, undefined, undefined, undefined, size);
+    run(formatRoom, 2);
+    const formatAllies = bots(formatRoom).filter((bot) => bot.team === formatPlayer.team);
+    const formatEnemies = bots(formatRoom).filter((bot) => bot.team !== formatPlayer.team);
+    check(`BR ${size === 1 ? 'соло' : size === 2 ? 'дуо' : 'сквад'} заполняет союзный состав`, formatAllies.length === size - 1);
+    check(`BR ${size === 1 ? 'соло' : size === 2 ? 'дуо' : 'сквад'} создаёт ${ROYALE_SQUAD_COUNT - 1} вражеских сквада`, formatEnemies.length === size * (ROYALE_SQUAD_COUNT - 1));
+  }
+  check('BR отдаёт зону', zone !== undefined && zone.r > 400 && zone.phase === 'safe');
+  check('сквад считается союзным для клиента', alliedTeams(MODE_ROYALE, player.team, allies[0]?.team ?? -1));
+  const royaleBushes = bushBoxes(buildMap(room.mapId));
+  check('BR получил плотные кустовые зоны', royaleBushes.length >= 20);
+  // Берём отдельный куст на открытом подходе: тест не должен зависеть от
+  // соседнего здания, которое само по себе может закрыть линию.
+  const bush = royaleBushes[royaleBushes.length - 1];
+  const bushTarget = enemies[1];
+  player.state = createTankState(bush.x - 36, bush.z, 0);
+  bushTarget.state = createTankState(bush.x, bush.z, 0);
+  bushTarget.lastShotAt = -Infinity;
+  room.invalidateRoyaleVision();
+  const hiddenInBush = !room.snapshotEntries(player).some((entry) => entry.i === bushTarget.id);
+  bushTarget.lastShotAt = room.tickCount;
+  room.invalidateRoyaleVision();
+  const revealedFromBush = room.snapshotEntries(player).some((entry) => entry.i === bushTarget.id);
+  check('куст скрывает танк до выстрела', hiddenInBush);
+  check('выстрел раскрывает танк в кусте', revealedFromBush);
+  const zoneBot = enemies[2];
+  zoneBot.brain!.targetId = 0;
+  zoneBot.state = createTankState(Math.min(room.half - 3, (zone?.r ?? 400) + 3), 0, Math.PI / 2);
+  const zoneDistanceBefore = Math.hypot(zoneBot.state.x - (zone?.x ?? 0), zoneBot.state.z - (zone?.z ?? 0));
+  run(room, 1);
+  const zoneDistanceAfter = Math.hypot(zoneBot.state.x - (zone?.x ?? 0), zoneBot.state.z - (zone?.z ?? 0));
+  check('бот, оказавшийся за зоной, едет внутрь', zoneDistanceAfter < zoneDistanceBefore);
+
+  const visible = room.snapshotEntries(player);
+  check('скрытые враги не попадают в снапшот', visible.length < room.players.size);
+  const contactTarget = enemies[0];
+  const scout = allies[0];
+  player.state = createTankState(220, 220, 0);
+  scout.state = createTankState(0, 0, 0);
+  contactTarget.state = createTankState(0, 0, 0);
+  contactTarget.lastShotAt = -Infinity;
+  room.invalidateRoyaleVision();
+  const sharedVision = room.snapshotEntries(player).some((entry) => entry.i === contactTarget.id);
+  check('засвет союзника общий для сквада', sharedVision);
+  for (const ally of allies) ally.state = createTankState(player.state.x, player.state.z, 0);
+  contactTarget.state = createTankState(player.state.x + 10, player.state.z, 0);
+  contactTarget.lastShotAt = -Infinity;
+  room.invalidateRoyaleVision();
+  room.snapshotEntries(player);
+  // Дальше и обычной дальности обзора, и окна раскрытия выстрелом: здесь
+  // проверяем именно сохранённый контакт, а не повторное обнаружение.
+  contactTarget.state.x = player.state.x + 220;
+  room.invalidateRoyaleVision();
+  const contacts = room.snapshotContacts(player);
+  check('скрытый враг оставляет последнюю точку контакта', contacts.some((contact) => contact.i === contactTarget.id));
+  const wreckTarget = enemies[3];
+  wreckTarget.state = createTankState(-320, -320, 0);
+  wreckTarget.dead = true;
+  room.invalidateRoyaleVision();
+  const wreckVisible = room.snapshotEntries(player).some((entry) => entry.i === wreckTarget.id && entry.d === 1);
+  check('трупы не становятся невидимыми препятствиями', wreckVisible);
+  wreckTarget.dead = false;
+  player.dead = true;
+  run(room, Math.round(RESPAWN_S * TICK_HZ) + 2);
+  check('в BR нет автоматического респавна', player.dead);
+}
 
 let failed = 0;
 for (const [label, ok] of checks) {

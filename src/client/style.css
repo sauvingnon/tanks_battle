@@ -86,6 +86,58 @@ body {
   color: #ffb3a8;
 }
 
+/* В BR цвет танка и цвет подписи читаются как одна команда. */
+.nameplate.faction-self {
+  border-color: rgba(255, 215, 108, 0.95);
+  color: #ffe7a6;
+  background: rgba(55, 38, 14, 0.78);
+}
+
+.nameplate.faction-ally {
+  border-color: rgba(91, 222, 238, 0.95);
+  color: #c5f8ff;
+  background: rgba(8, 45, 55, 0.78);
+}
+
+.nameplate.faction-enemy {
+  border-color: rgba(255, 105, 92, 0.95);
+  color: #ffd0c9;
+  background: rgba(62, 16, 18, 0.78);
+}
+
+.nameplate.faction-self .np-hp b {
+  background: #ffd36a;
+}
+
+.nameplate.faction-ally .np-hp b {
+  background: #5be0ed;
+}
+
+.nameplate.faction-enemy .np-hp b {
+  background: #ff6b5e;
+}
+
+/* Короткий контакт в BR: не ник и не точный трекер, а старая точка с вопросом. */
+.contact-marker {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  border: 1px solid rgba(255, 213, 125, 0.9);
+  border-radius: 50%;
+  background: rgba(40, 29, 16, 0.72);
+  color: #ffe0a0;
+  font-size: 15px;
+  font-weight: 800;
+  line-height: 1;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9);
+  box-shadow: 0 0 0 3px rgba(255, 178, 70, 0.12), 0 0 12px rgba(255, 161, 44, 0.36);
+  will-change: transform, opacity;
+}
+
 /* Ширина полоски фиксированная: подпись не должна менять размер вместе с HP. */
 .np-hp {
   display: block;
@@ -103,6 +155,23 @@ body {
   height: 100%;
   background: hsl(105 70% 48%);
   transition: width 0.15s linear;
+}
+
+/* Цифра урона: позицию и прозрачность каждый кадр считает render.ts, здесь
+   только внешний вид — те же причины, что и у .nameplate (см. updateLabels). */
+.dmg-number {
+  position: absolute;
+  top: 0;
+  left: 0;
+  will-change: transform, opacity;
+  font-size: 20px;
+  font-weight: 800;
+  color: #ffb84d;
+  text-shadow:
+    0 1px 3px rgba(0, 0, 0, 0.85),
+    0 0 10px rgba(255, 120, 40, 0.35);
+  white-space: nowrap;
+  pointer-events: none;
 }
 
 /* --- HUD --- */
@@ -236,38 +305,158 @@ body {
   position: absolute;
   left: 0;
   top: 0;
-  width: 26px;
-  height: 26px;
-  margin: -13px 0 0 -13px;
+  width: 28px;
+  height: 28px;
+  margin: -14px 0 0 -14px;
   pointer-events: none;
   will-change: transform;
 }
 
-/* Кольцо и точка внутри: цель видно насквозь, а место попадания читается. */
-#crosshair::before,
-#crosshair::after {
-  content: "";
-  position: absolute;
-  border-radius: 50%;
-  box-shadow: 0 0 3px rgba(0, 0, 0, 0.9);
+/* Тонкое кольцо с точкой: простая форма, но хорошо читается на земле и небе. */
+.reticle-arm {
+  display: none;
 }
 
 #crosshair::before {
-  inset: 7px;
-  border: 1.5px solid rgba(255, 255, 255, 0.8);
+  content: "";
+  position: absolute;
+  inset: 4px;
+  border: 1.5px solid rgba(255, 255, 255, 0.92);
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px rgba(9, 13, 13, 0.82), 0 1px 3px rgba(9, 13, 13, 0.78);
 }
 
-#crosshair::after {
-  inset: 12px;
-  background: rgba(255, 255, 255, 0.9);
+/* Три локальных варианта для сравнения: сервер и наведение у них общие. */
+#crosshair[data-style="realistic"]::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 1px;
+  width: 1px;
+  height: 4px;
+  background: #ffffff;
+  box-shadow: 0 22px 0 #ffffff;
+  transform: translateX(-50%);
+  filter: drop-shadow(0 1px 1px rgba(9, 13, 13, 0.9));
+}
+
+#crosshair[data-style="minimal"] {
+  width: 12px;
+  height: 12px;
+  margin: -6px 0 0 -6px;
+}
+
+#crosshair[data-style="minimal"]::before {
+  display: none;
+}
+
+#crosshair[data-style="minimal"] #reticle-core {
+  width: 3px;
+  height: 3px;
+  margin: -1.5px 0 0 -1.5px;
+  background: #ffffff;
+}
+
+#crosshair[data-style="arcade"] {
+  width: 34px;
+  height: 34px;
+  margin: -17px 0 0 -17px;
+}
+
+#crosshair[data-style="arcade"]::before {
+  inset: 1px;
+  border: 2px solid #ffffff;
+  box-shadow: 0 0 0 1px rgba(8, 12, 12, 0.82), 0 0 8px rgba(255, 255, 255, 0.58);
+}
+
+#crosshair[data-style="arcade"]::after {
+  content: "";
+  position: absolute;
+  inset: 6px;
+  border: 1px dashed rgba(255, 255, 255, 0.82);
+  border-radius: 50%;
+}
+
+#crosshair[data-style="arcade"] #reticle-core {
+  width: 6px;
+  height: 6px;
+  margin: -3px 0 0 -3px;
+  background: #ffffff;
+  box-shadow: 0 0 0 1px rgba(8, 12, 12, 0.88), 0 0 7px rgba(255, 255, 255, 0.82);
+}
+
+#reticle-core {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 4px;
+  height: 4px;
+  margin: -2px 0 0 -2px;
+  border-radius: 50%;
+  background: #ffffff;
+  box-shadow: 0 0 0 1px rgba(9, 13, 13, 0.9), 0 0 3px rgba(9, 13, 13, 0.8);
+}
+
+#crosshair.is-firing #reticle-core {
+  animation: reticle-dot-kick 0.14s ease-out;
+}
+
+@keyframes reticle-dot-kick {
+  from { transform: scale(1.35); }
+  to { transform: scale(1); }
 }
 
 #hitmarker {
   position: absolute;
-  inset: -6px;
-  border: 2px solid #ffcf6b;
-  border-radius: 50%;
+  inset: -3px;
   opacity: 0;
+  border: 2px solid #ffffff;
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px rgba(8, 12, 12, 0.82), 0 0 8px rgba(255, 255, 255, 0.72);
+}
+
+#hitmarker::before {
+  content: "";
+  position: absolute;
+  inset: -5px;
+  border: 1px solid rgba(255, 255, 255, 0.78);
+  border-radius: 50%;
+}
+
+#hitmarker::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 7px;
+  height: 7px;
+  margin: -3.5px 0 0 -3.5px;
+  border-radius: 50%;
+  background: #ffffff;
+  box-shadow: 0 0 8px 2px rgba(255, 255, 255, 0.9);
+}
+
+#crosshair[data-style="minimal"] #hitmarker {
+  inset: -2px;
+  border-width: 1.5px;
+  box-shadow: 0 0 0 1px rgba(8, 12, 12, 0.74), 0 0 5px rgba(255, 255, 255, 0.55);
+}
+
+#crosshair[data-style="minimal"] #hitmarker::before {
+  display: none;
+}
+
+#crosshair[data-style="minimal"] #hitmarker::after {
+  width: 4px;
+  height: 4px;
+  margin: -2px 0 0 -2px;
+  box-shadow: 0 0 5px 1px rgba(255, 255, 255, 0.8);
+}
+
+#crosshair[data-style="arcade"] #hitmarker {
+  inset: -7px;
+  border-width: 3px;
+  box-shadow: 0 0 0 1px rgba(8, 12, 12, 0.88), 0 0 14px rgba(255, 255, 255, 0.9);
 }
 
 #hitmarker.is-on {
@@ -279,9 +468,13 @@ body {
     opacity: 1;
     transform: scale(0.5);
   }
+  38% {
+    opacity: 1;
+    transform: scale(1.12);
+  }
   to {
     opacity: 0;
-    transform: scale(1.35);
+    transform: scale(1.7);
   }
 }
 
@@ -420,6 +613,14 @@ body {
   color: #ff9c8b;
 }
 
+#wave-banner.is-win {
+  border-color: rgba(120, 220, 150, 0.45);
+}
+
+#wave-banner.is-win #wave-title {
+  color: #86e6a4;
+}
+
 /* --- Экспедиция: выбор улучшения --- */
 
 #expedition {
@@ -530,11 +731,86 @@ body {
   color: var(--text);
 }
 
-#setup {
+#leaderboard-toggle {
+  position: absolute;
+  top: calc(14px + env(safe-area-inset-top));
+  right: calc(60px + env(safe-area-inset-right));
+  width: 38px;
+  height: 38px;
+  border-radius: 10px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+#leaderboard-toggle:hover {
+  color: var(--text);
+}
+
+#leaderboard {
   position: absolute;
   top: calc(60px + env(safe-area-inset-top));
   right: calc(14px + env(safe-area-inset-right));
-  width: 268px;
+  width: min(360px, 90vw);
+  max-height: calc(100vh - 74px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+  max-height: calc(100dvh - 74px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+  overflow-y: auto;
+  scrollbar-width: thin;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px 18px;
+  border-radius: 16px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+}
+
+.leaderboard-row {
+  display: grid;
+  grid-template-columns: 20px 1fr auto auto auto auto;
+  gap: 8px;
+  align-items: baseline;
+  font-size: 12px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.leaderboard-row:last-child {
+  border-bottom: none;
+}
+
+.leaderboard-rank {
+  color: var(--muted);
+}
+
+.leaderboard-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.leaderboard-empty {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+#setup {
+  position: absolute;
+  top: calc(60px + env(safe-area-inset-top));
+  left: 50%;
+  /*
+   * Раньше панель жалась узкой полоской в угол — с каждой новой настройкой она
+   * только вытягивалась вниз и упиралась в прокрутку. Теперь она по центру и
+   * широкая: строки переключателей укладываются в один ряд, а не колонкой в
+   * три этажа, и есть запас, чтобы со временем разложить настройки по разделам.
+   */
+  transform: translateX(-50%);
+  width: min(640px, 94vw);
   max-width: calc(100vw - 28px);
   /*
    * Потолок по высоте и прокрутка. Панель растёт с каждой новой настройкой, а
@@ -553,11 +829,12 @@ body {
   scrollbar-width: thin;
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding: 14px;
-  border-radius: 14px;
+  gap: 10px;
+  padding: 18px 20px;
+  border-radius: 16px;
   background: var(--panel);
   border: 1px solid var(--line);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
 }
 
 .setup-head {

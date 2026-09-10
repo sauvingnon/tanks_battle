@@ -11,6 +11,13 @@ import {
   BONUS_SPEED_MUL,
   BONUS_STEALTH,
   BONUS_STEALTH_RANGE,
+  ROYALE_LOOT_ARMOR,
+  ROYALE_LOOT_DAMAGE,
+  ROYALE_LOOT_NAMES,
+  ROYALE_LOOT_RELOAD,
+  ROYALE_LOOT_SPEED,
+  ROYALE_LOOT_SPEED_MUL,
+  ROYALE_LOOT_RELOAD_MUL,
   DIFFICULTY_NAMES,
   DT,
   hasEffect,
@@ -21,7 +28,12 @@ import {
   STANCE_NEUTRAL,
   MODE_DM,
   MODE_EXPEDITION,
+  MODE_ROYALE,
+  MODE_TEAM,
   MODE_PVE,
+  TEAM_BATTLE_SIZES,
+  ROYALE_SQUAD_SIZES,
+  ROYALE_START_COUNTDOWN_S,
   EXPEDITION_UPGRADES,
   expeditionPower,
   MAP_HALF,
@@ -32,16 +44,19 @@ import {
   RULES_REAL,
   SHELL_HEIGHT,
   type GameMode,
+  type RoyaleSquadSize,
   type Ruleset,
 } from '../shared/constants.js';
 import { bushBoxes, bushIndexAt, coverBoxes, passableObstacles, MAP_NAMES } from '../shared/map.js';
 import { clamp, lerpAngle, sweepShell } from '../shared/sim.js';
-import type { RoomConfig, ServerMessage, WaveState } from '../shared/protocol.js';
+import type { LeaderboardEntry, RoomConfig, RoyaleZoneState, ServerMessage, WaveState } from '../shared/protocol.js';
 import {
   BOOM_GROUND,
   BOOM_HIT,
   BOOM_KILL,
   BOOM_RICOCHET,
+  TEAM_ONE,
+  TEAM_TWO,
   type Boom,
   type BoomKind,
   type Box,
@@ -49,14 +64,16 @@ import {
   type PlayerInfo,
   type ShellState,
   type SnapshotBonus,
+  type SnapshotContact,
   type SnapshotEntry,
   type SnapshotShell,
 } from '../shared/types.js';
 
 import { Controls } from './controls.js';
+import { AudioManager } from './audio.js';
 import { Net } from './net.js';
 import { SelfPrediction } from './prediction.js';
-import { BONUS_COLORS, Scene3D, TRACER_LENGTH } from './render.js';
+import { BONUS_COLORS, Scene3D, TRACER_LENGTH, type TankFaction } from './render.js';
 
 const el = <T extends HTMLElement>(id: string): T => {
   const node = document.getElementById(id);
@@ -75,6 +92,18 @@ const hint = el('hint');
 const touchLayer = el('touch');
 const crosshair = el('crosshair');
 
+const RETICLE_STYLES = [
+  ['realistic', 'Реалистичный', 'Тонкое кольцо, точка и небольшие дальномерные засечки.'],
+  ['minimal', 'Минималистичный', 'Только маленькая точка и заметный импульс при попадании.'],
+  ['arcade', 'Аркадный', 'Крупнее, ярче и с сильнее выраженной анимацией попадания.'],
+] as const;
+type ReticleStyle = (typeof RETICLE_STYLES)[number][0];
+const savedReticle = localStorage.getItem('tanks:reticle');
+let reticleStyle: ReticleStyle = RETICLE_STYLES.some(([id]) => id === savedReticle)
+  ? (savedReticle as ReticleStyle)
+  : 'realistic';
+crosshair.dataset.style = reticleStyle;
+
 const scene = new Scene3D(canvas, el('labels'));
 const controls = new Controls(
   canvas,
@@ -85,6 +114,9 @@ const controls = new Controls(
   el('aim-knob'),
 );
 controls.attach();
+const audio = new AudioManager();
+window.addEventListener('pointerdown', () => audio.unlock(), { passive: true });
+window.addEventListener('keydown', () => audio.unlock(), { passive: true });
 
 // --- Состояние мира на клиенте ---
 
@@ -181,6 +213,8 @@ let firePendingUntil = 0;
 let myShotCount = 0;
 let shotCountReady = false;
 let myHp = MAX_HP;
+let myMaxHp = MAX_HP;
+let expeditionMaxHp = MAX_HP;
 let myDead = false;
 let respawnAt = 0;
 
@@ -196,6 +230,11 @@ let activeDifficulty = 1;
 let stance = STANCE_NEUTRAL;
 let bonusesOn = false;
 let hostId = 0;
+/** Выбор хоста для командного боя: 5×5 или 10×10. */
+let teamSize = 5;
+/** Выбор формата отряда BR: 1 — соло, 2 — дуо, 4 — сквад. */
+let royaleSquadSize: RoyaleSquadSize = 4;
+let leaderboardEntries: LeaderboardEntry[] = [];
 /** Первый config пришёл: до него о «сменах» настроек сообщать нечего. */
 let configKnown = false;
 
@@ -208,6 +247,9 @@ const MAP_HINTS = [
   'Срабатывает сразу: бой начинается заново. Брустверы простреливаются насквозь — ехать зигзагом, а видно тебя всегда.',
   'Срабатывает сразу: бой начинается заново. Контейнеры не укрывают: весь парк простреливается поверху.',
   'Срабатывает сразу: бой начинается заново. Открыто и далеко. Барханы держат колёса, но не снаряды.',
+  'Срабатывает сразу: бой начинается заново. Большая долина 280×280 с редкими укрытиями и длинными переходами.',
+  'Срабатывает сразу: бой начинается заново. Промышленный район 280×280 с цехами, дворами и воротами.',
+  'Срабатывает сразу: BR-карта 900×900. Районы, дальние переходы и 24 точки появления.',
 ];
 
 /** Что делает манера боя — подпись под выбором. Порядок как в STANCE_NAMES. */
@@ -221,6 +263,8 @@ const MODE_NAMES: Record<GameMode, string> = {
   [MODE_DM]: 'Все против всех',
   [MODE_PVE]: 'Против ботов',
   [MODE_EXPEDITION]: 'Экспедиция',
+  [MODE_ROYALE]: 'Королевская битва',
+  [MODE_TEAM]: 'Командный бой',
 };
 
 const RULES_NAMES: Record<Ruleset, string> = {
@@ -245,6 +289,7 @@ let myEffects = 0;
  */
 const effectUntil = new Array<number>(BONUS_KINDS).fill(0);
 let wave: WaveState = { wave: 0, phase: 'break', left: 0, until: 0, best: 0 };
+let royaleZone: RoyaleZoneState | null = null;
 let expeditionBasePower = 1;
 /** Момент, когда кончится передышка или экран итогов: сервер прислал остаток в секундах. */
 let waveUntilAt = 0;
@@ -278,6 +323,8 @@ function handleMessage(msg: ServerMessage): void {
       for (const info of msg.players) addPlayer(info);
       applyWave(msg.wave);
       applyConfig(msg);
+      leaderboardEntries = msg.leaderboard;
+      renderLeaderboard();
       hideOverlay();
       break;
     }
@@ -312,10 +359,23 @@ function handleMessage(msg: ServerMessage): void {
       onPickup(msg.id, msg.kind);
       break;
     case 'snapshot':
-      onSnapshot(msg.players, msg.ack, msg.shells ?? [], msg.booms ?? [], msg.hits ?? [], msg.bonuses ?? []);
+      onSnapshot(
+        msg.players,
+        msg.ack,
+        msg.shells ?? [],
+        msg.booms ?? [],
+        msg.hits ?? [],
+        msg.bonuses ?? [],
+        msg.contacts ?? [],
+        msg.zone,
+      );
       break;
     case 'kill':
       pushKillFeed(msg.killer, msg.victim);
+      break;
+    case 'leaderboard':
+      leaderboardEntries = msg.entries;
+      renderLeaderboard();
       break;
     case 'error':
       showOverlay(msg.message, true);
@@ -326,8 +386,21 @@ function handleMessage(msg: ServerMessage): void {
 function addPlayer(info: PlayerInfo): void {
   players.set(info.id, info);
   scene.addTank(info.id, info.name, info.color, info.id === selfId, info.bot === 1);
+  scene.setTankFaction(info.id, factionOf(info));
   scene.setNameplate(info.id, plated(info));
   updateHud();
+}
+
+function factionOf(info: PlayerInfo): TankFaction {
+  if (mode !== MODE_ROYALE && mode !== MODE_TEAM) return 'neutral';
+  // Свой красится как союзник, а не отдельным цветом: одна сторона — один цвет,
+  // включая тебя самого, иначе на карте появлялся бы третий, никому не нужный оттенок.
+  const me = players.get(selfId);
+  return me !== undefined && alliedTeams(mode, me.team, info.team) ? 'ally' : 'enemy';
+}
+
+function applyFactions(): void {
+  for (const info of players.values()) scene.setTankFaction(info.id, factionOf(info));
 }
 
 /**
@@ -361,6 +434,8 @@ function applyConfig(next: RoomConfig): void {
   const wasDifficulty = difficulty;
   const wasBonuses = bonusesOn;
   const wasStance = stance;
+  const wasTeamSize = teamSize;
+  const wasRoyaleSquadSize = royaleSquadSize;
 
   const wasMap = mapId;
 
@@ -373,6 +448,16 @@ function applyConfig(next: RoomConfig): void {
   bonusesOn = next.bonuses;
   stance = next.stance;
   hostId = next.hostId;
+  teamSize = next.teamSize;
+  royaleSquadSize = next.royaleSquadSize;
+  scene.setRoyaleLootVisual(mode === MODE_ROYALE);
+  applyFactions();
+  if (mode !== MODE_ROYALE) {
+    royaleZone = null;
+    scene.setRoyaleZone(null);
+  }
+  if (mode !== MODE_EXPEDITION) expeditionMaxHp = MAX_HP;
+  if (mode !== MODE_ROYALE) myMaxHp = MAX_HP;
   expeditionBasePower = mode === MODE_EXPEDITION ? wave.power ?? expeditionPower(wave.wave) : 1;
   refreshSelfBoost();
 
@@ -409,6 +494,12 @@ function applyConfig(next: RoomConfig): void {
     if (bonusesOn !== wasBonuses) {
       pushFeed(`Бонусы ${bonusesOn ? 'включены' : 'выключены'} · сразу`, 'is-setup');
     }
+    if (teamSize !== wasTeamSize) {
+      pushFeed(`Размер команды: ${teamSize}×${teamSize} · сразу`, 'is-setup');
+    }
+    if (royaleSquadSize !== wasRoyaleSquadSize) {
+      pushFeed(`Формат BR: ${royaleSquadLabel(royaleSquadSize)} · сразу`, 'is-setup');
+    }
   }
 
   renderSetup();
@@ -418,9 +509,16 @@ function applyConfig(next: RoomConfig): void {
 
 /** Когда выбранная сложность вступит в силу. Сервер меняет её на границе волн. */
 function whenDifficulty(): string {
-  if (mode !== MODE_PVE && mode !== MODE_EXPEDITION) return 'вступит в силу в режиме с ботами';
+  if (mode !== MODE_PVE && mode !== MODE_EXPEDITION && mode !== MODE_ROYALE && mode !== MODE_TEAM) {
+    return 'вступит в силу в режиме с ботами';
+  }
+  if (mode === MODE_TEAM) return 'со следующего раунда';
   if (wave.phase !== 'fight') return 'с ближайшей волны';
   return `с волны ${wave.wave + 1}`;
+}
+
+function royaleSquadLabel(size: RoyaleSquadSize): string {
+  return size === 1 ? 'соло' : size === 2 ? 'дуо' : 'сквад';
 }
 
 function applyWave(next: WaveState): void {
@@ -429,6 +527,12 @@ function applyWave(next: WaveState): void {
   const started = next.phase === 'fight' && next.wave !== wave.wave;
   const previousUpgradeCount = wave.upgrades?.length ?? 0;
   wave = next;
+  expeditionMaxHp = next.health !== undefined
+    ? Math.round(MAX_HP * next.health)
+    : mode === MODE_EXPEDITION
+      ? Math.round(MAX_HP * (next.health ?? 1))
+      : MAX_HP;
+  updateHealthHud();
   if (mode === MODE_EXPEDITION && (next.upgrades?.length ?? 0) > previousUpgradeCount) {
     const id = next.upgrades?.[next.upgrades.length - 1];
     const upgrade = id === undefined ? undefined : EXPEDITION_UPGRADES[id];
@@ -437,7 +541,7 @@ function applyWave(next: WaveState): void {
   expeditionBasePower = mode === MODE_EXPEDITION ? next.power ?? expeditionPower(next.wave) : 1;
   refreshSelfBoost();
   renderExpeditionChoices();
-  waveUntilAt = performance.now() + next.until * 1000;
+  waveUntilAt = performance.now() + (next.royaleUntil ?? next.until) * 1000;
   if (started) bannerHideAt = performance.now() + 3000;
   updateModeChip();
   // В подписи настроек стоит номер следующей волны — он только что изменился.
@@ -455,7 +559,9 @@ function refreshSelfBoost(): void {
   self.boost =
     expeditionBasePower *
     upgradeSpeed *
-    (hasEffect(myEffects, BONUS_SPEED) ? BONUS_SPEED_MUL : 1);
+    (hasEffect(myEffects, mode === MODE_ROYALE ? ROYALE_LOOT_SPEED : BONUS_SPEED)
+      ? mode === MODE_ROYALE ? ROYALE_LOOT_SPEED_MUL : BONUS_SPEED_MUL
+      : 1);
 }
 
 function expeditionReloadMultiplier(): number {
@@ -473,8 +579,14 @@ function onSnapshot(
   booms: Boom[],
   hits: HitFx[],
   bonuses: SnapshotBonus[],
+  contacts: SnapshotContact[],
+  zone?: RoyaleZoneState,
 ): void {
   const now = performance.now();
+  royaleZone = zone ?? (mode === MODE_ROYALE ? royaleZone : null);
+  scene.setRoyaleZone(royaleZone);
+  scene.syncContactMarkers(mode === MODE_ROYALE ? contacts : []);
+  if (mode === MODE_ROYALE) updateModeChip();
   // Ящики стоят на месте, интерполировать нечего — ставим их сразу.
   scene.syncBonuses(bonuses);
   const map = new Map<number, SnapshotEntry>();
@@ -495,6 +607,11 @@ function onSnapshot(
     myEffects = mask;
     refreshSelfBoost();
     updateEffectsHud();
+  }
+
+  if (mine.m !== undefined && mine.m !== myMaxHp) {
+    myMaxHp = mine.m;
+    updateHealthHud();
   }
 
   // Серверный счётчик подтверждает запрос и снимает блокировку следующего.
@@ -572,8 +689,14 @@ function frame(now: number): void {
           RELOAD_S *
           1000 *
           expeditionReloadMultiplier() *
-          (hasEffect(myEffects, BONUS_RELOAD) ? BONUS_RELOAD_MUL : 1);
+          (hasEffect(myEffects, mode === MODE_ROYALE ? ROYALE_LOOT_RELOAD : BONUS_RELOAD)
+            ? mode === MODE_ROYALE ? ROYALE_LOOT_RELOAD_MUL : BONUS_RELOAD_MUL
+            : 1);
         reloadUntil = now + reloadSpan;
+        crosshair.classList.remove('is-firing');
+        void crosshair.offsetWidth;
+        crosshair.classList.add('is-firing');
+        audio.playShot();
         scene.tankFired(selfId);
         scene.addShake(SELF_SHOT_SHAKE);
         firePending = true;
@@ -589,6 +712,7 @@ function frame(now: number): void {
   self.decay(dt);
 
   const renderTime = now - INTERP_DELAY_MS;
+  updateRoyaleDrop(now);
   drawSelf(dt, renderTime);
   drawOthers(renderTime);
   playBooms(now);
@@ -607,6 +731,7 @@ function playBooms(now: number): void {
     scene.boom(boom.x, boom.z, boom.k);
 
     const distance = Math.hypot(boom.x - selfX, boom.z - selfZ);
+    audio.playBoom(boom.k, distance);
     const near = 1 - distance / SHAKE_RANGE;
     if (near > 0) scene.addShake(BOOM_SHAKE[boom.k] * near);
 
@@ -620,6 +745,7 @@ function playHits(now: number): void {
   while (pendingHits.length > 0 && pendingHits[0].at <= now) {
     const { hit } = pendingHits.shift()!;
     scene.damageNumber(hit.x, hit.z, hit.amount);
+    audio.playHit(Math.hypot(hit.x - selfX, hit.z - selfZ));
   }
 }
 
@@ -635,10 +761,13 @@ function drawSelf(dt: number, renderTime: number): void {
   selfX = state.x;
   selfZ = state.z;
   scene.updateTank(selfId, state.x, state.z, state.angle, state.turret);
+  audio.updateEngine(self.speed, !myDead);
 
   // Мёртвый в PvE смотрит не в свою неподвижную точку, а на живого товарища —
   // иначе спектатор всю волну глядит в один и тот же кусок земли.
-  const camera = myDead && (mode === MODE_PVE || mode === MODE_EXPEDITION) ? spectateCamera(renderTime) : null;
+  const camera = myDead && (mode === MODE_PVE || mode === MODE_EXPEDITION || mode === MODE_ROYALE || mode === MODE_TEAM)
+    ? spectateCamera(renderTime)
+    : null;
   setSpectateTarget(camera?.id ?? 0);
   const camX = camera?.x ?? state.x;
   const camZ = camera?.z ?? state.z;
@@ -665,6 +794,24 @@ let selfZ = 0;
 
 /** id товарища, на которого сейчас переключена камера; 0 — камера на себе. */
 let spectateId = 0;
+
+/**
+ * Живых по сторонам командного боя — считаем сами по ростеру и последнему
+ * снапшоту, а не ждём отдельное сообщение от сервера: тогда счёт в HUD не
+ * отстаёт от кадра, а падает ровно в момент гибели.
+ */
+function teamAliveCounts(): { a: number; b: number } {
+  const latest = snapshots[snapshots.length - 1];
+  let a = 0;
+  let b = 0;
+  for (const [id, info] of players) {
+    if (info.team !== TEAM_ONE && info.team !== TEAM_TWO) continue;
+    if (latest?.entries.get(id)?.d === 1) continue;
+    if (info.team === TEAM_ONE) a++;
+    else b++;
+  }
+  return { a, b };
+}
 
 /**
  * Ближайший живой союзник и его положение на текущий момент интерполяции —
@@ -754,11 +901,27 @@ function drawOthers(renderTime: number): void {
   if (!frame) return;
   const { from, to, t } = frame;
 
+  if (mode === MODE_ROYALE) {
+    // Отсутствие врага в снапшоте — это намеренный «не засвечен», а не потеря
+    // пакета. Союзники и свой танк сервер присылает всегда.
+    for (const info of players.values()) {
+      if (info.id === selfId) continue;
+      const me = players.get(selfId);
+      const ally = me !== undefined && alliedTeams(mode, me.team, info.team);
+      scene.setTankVisibility(info.id, ally || to.entries.has(info.id));
+    }
+  }
+
   for (const [id, target] of to.entries) {
     if (!players.has(id)) continue; // снапшот обогнал сообщение joined
     // Здоровье и «жив ли» берём и для себя тоже: свой танк рисуется предсказанием,
     // но его полоска и видимость живут по тем же данным, что и у остальных.
-    scene.setTankHealth(id, target.h, target.d === 0, players.get(id)?.bot ? BOT_HP : MAX_HP);
+    scene.setTankHealth(
+      id,
+      target.h,
+      target.d === 0,
+      target.m ?? (players.get(id)?.bot ? BOT_HP : expeditionMaxHp),
+    );
     // Свой танк под маскировкой видно всегда: прятать его от себя незачем.
     // Кусты на экран не влияют — они рвут обзор только у ИИ ботов (see bot.ts):
     // человек всегда видит всех, кого видел бы без кустов вовсе.
@@ -768,6 +931,7 @@ function drawOthers(renderTime: number): void {
         hasEffect(target.f ?? 0, BONUS_STEALTH) &&
         Math.hypot(target.x - selfX, target.z - selfZ) > BONUS_STEALTH_RANGE,
     );
+    if (mode === MODE_ROYALE) scene.setTankVisibility(id, true);
     if (id === selfId) continue;
 
     const start = from.entries.get(id) ?? target;
@@ -811,6 +975,9 @@ function drawShells(from: BufferedSnapshot, to: BufferedSnapshot, t: number): vo
         knownShells.add(shell.i);
         // Танк стрелявшего мог ещё не доехать сообщением joined; тогда остаётся
         // вспышка по координатам снаряда, отмотанным назад к дульному срезу.
+        if (shell.o !== selfId) {
+          audio.playShot(Math.hypot(shell.x - selfX, shell.z - selfZ));
+        }
         if (shell.o !== selfId && !scene.tankFired(shell.o)) {
           scene.muzzleFlash(
             shell.x - Math.sin(shell.a) * MUZZLE_OFFSET * 0.25,
@@ -884,6 +1051,12 @@ const setupToggle = el<HTMLButtonElement>('setup-toggle');
 const setupOwner = el('setup-owner');
 const setupMaps = el('setup-maps');
 const setupModes = el('setup-modes');
+const setupTeamsizeLabel = el('setup-teamsize-label');
+const setupTeamsize = el('setup-teamsize');
+const hintTeamsize = el('hint-teamsize');
+const setupRoyaleSizeLabel = el('setup-royale-size-label');
+const setupRoyaleSize = el('setup-royale-size');
+const hintRoyaleSize = el('hint-royale-size');
 const setupRules = el('setup-rules');
 const setupDiffs = el('setup-diffs');
 const setupStances = el('setup-stances');
@@ -891,6 +1064,7 @@ const setupBonuses = el<HTMLInputElement>('setup-bonuses');
 const setupBloom = el<HTMLInputElement>('setup-bloom');
 const setupTop = el<HTMLInputElement>('setup-top');
 const setupFpv = el<HTMLInputElement>('setup-fpv');
+const setupReticles = el('setup-reticles');
 const hintChase = el('hint-chase');
 const hintTopView = el('hint-top');
 const hintFpvView = el('hint-fpv');
@@ -903,6 +1077,10 @@ const hintStance = el('hint-stance');
 const hintBonuses = el('hint-bonuses');
 const hintBloom = el('hint-bloom');
 const hintView = el('hint-view');
+const hintReticle = el('hint-reticle');
+const leaderboardToggle = el<HTMLButtonElement>('leaderboard-toggle');
+const leaderboardPanel = el('leaderboard');
+const leaderboardRows = el('leaderboard-rows');
 
 function renderExpeditionChoices(): void {
   const show = mode === MODE_EXPEDITION && wave.phase === 'upgrade' && (wave.choices?.length ?? 0) > 0;
@@ -917,8 +1095,12 @@ function renderExpeditionChoices(): void {
     1,
   );
   const reload = expeditionReloadMultiplier();
+  const health = (wave.upgrades ?? []).reduce(
+    (value, id) => value * (EXPEDITION_UPGRADES[id]?.health ?? 1),
+    1,
+  );
   expeditionStats.textContent =
-    `Сейчас: ход ${Math.round(speed * 100)}% · урон ${Math.round(damage * 100)}% · перезарядка ${Math.round(reload * 100)}%`;
+    `Сейчас: ход ${Math.round(speed * 100)}% · урон ${Math.round(damage * 100)}% · перезарядка ${Math.round(reload * 100)}% · HP ${Math.round(health * 100)}%`;
   expeditionCards.replaceChildren();
   for (const choice of wave.choices ?? []) {
     const card = document.createElement('button');
@@ -948,6 +1130,36 @@ function updateModeChip(): void {
     hudMode.textContent = `${map} · все против всех`;
     return;
   }
+  if (mode === MODE_TEAM) {
+    if (wave.phase === 'over') {
+      const myTeam = players.get(selfId)?.team;
+      const result = wave.winner === 'draw' ? 'ничья' : wave.winner === myTeam ? 'победа' : 'поражение';
+      hudMode.textContent = `${map} · командный бой ${teamSize}×${teamSize} · ${result} · новый раунд через ${Math.max(0, Math.ceil((waveUntilAt - performance.now()) / 1000))}с`;
+      return;
+    }
+    const { a, b } = teamAliveCounts();
+    hudMode.textContent = `${map} · командный бой ${teamSize}×${teamSize} · ${a}:${b}`;
+    return;
+  }
+  if (mode === MODE_ROYALE) {
+    const zone = royaleZone;
+    const royalePhase = wave.royalePhase;
+    const zoneText = royalePhase === 'countdown'
+      ? `высадка через ${Math.ceil(wave.royaleUntil ?? 0)}с`
+      : royalePhase === 'over'
+        ? 'матч завершён'
+        : !zone
+      ? 'зона готовится'
+      : zone.phase === 'shrinking'
+        ? `зона сжимается · ${Math.ceil(zone.until)}с`
+        : zone.phase === 'final'
+          ? 'финальная зона'
+          : zone.phase === 'over'
+            ? 'матч завершён'
+            : `зона через ${Math.ceil(zone.until)}с`;
+    hudMode.textContent = `${map} · королевская битва · ${zoneText}`;
+    return;
+  }
   if (wave.phase === 'fight') {
     const power = mode === MODE_EXPEDITION ? ` · сила ${Math.round((wave.power ?? 1) * 100)}%` : '';
     hudMode.textContent = `${map} · волна ${wave.wave} · осталось ${wave.left}${power}`;
@@ -960,6 +1172,14 @@ function updateModeChip(): void {
 let bannerShown = '';
 
 function updateBanner(now: number): void {
+  if (mode === MODE_ROYALE) {
+    updateRoyaleBanner();
+    return;
+  }
+  if (mode === MODE_TEAM) {
+    updateTeamBanner();
+    return;
+  }
   const visible =
     (mode === MODE_PVE || mode === MODE_EXPEDITION) && wave.wave > 0 && (wave.phase !== 'fight' || now < bannerHideAt);
   if (!visible) {
@@ -986,7 +1206,7 @@ function updateBanner(now: number): void {
   } else {
     title = wave.victory ? 'Экспедиция завершена' : 'Забег окончен';
     sub = wave.victory
-      ? `10 волн пройдено · заново через ${left}`
+      ? `15 волн пройдено · заново через ${left}`
       : `дошли до волны ${wave.wave} · рекорд ${wave.best} · заново через ${left}`;
   }
 
@@ -997,6 +1217,57 @@ function updateBanner(now: number): void {
     bannerSub.textContent = sub;
   }
   banner.classList.toggle('is-over', wave.phase === 'over');
+  banner.hidden = false;
+}
+
+function updateRoyaleBanner(): void {
+  const phase = wave.royalePhase;
+  if (phase !== 'countdown' && phase !== 'over') {
+    if (!banner.hidden) {
+      banner.hidden = true;
+      bannerShown = '';
+    }
+    return;
+  }
+
+  const title = phase === 'countdown' ? 'Высадка' : 'Матч завершён';
+  const sub = phase === 'countdown'
+    ? `Старт через ${Math.max(0, Math.ceil(wave.royaleUntil ?? 0))} · состав готов`
+    : 'Наблюдение за сквадом';
+  const key = `${title}|${sub}`;
+  if (key !== bannerShown) {
+    bannerShown = key;
+    bannerTitle.textContent = title;
+    bannerSub.textContent = sub;
+  }
+  banner.classList.toggle('is-over', phase === 'over');
+  banner.classList.toggle('is-win', false);
+  banner.hidden = false;
+}
+
+/** Итог раунда командного боя: без волн — только «решено / не решено». */
+function updateTeamBanner(): void {
+  if (wave.phase !== 'over') {
+    if (!banner.hidden) {
+      banner.hidden = true;
+      bannerShown = '';
+    }
+    return;
+  }
+
+  const left = Math.max(0, Math.ceil((waveUntilAt - performance.now()) / 1000));
+  const myTeam = players.get(selfId)?.team;
+  const title = wave.winner === 'draw' ? 'Ничья' : wave.winner === myTeam ? 'Победа' : 'Поражение';
+  const sub = `Новый раунд через ${left}`;
+
+  const key = `${title}|${sub}`;
+  if (key !== bannerShown) {
+    bannerShown = key;
+    bannerTitle.textContent = title;
+    bannerSub.textContent = sub;
+  }
+  banner.classList.toggle('is-over', title === 'Поражение');
+  banner.classList.toggle('is-win', title === 'Победа');
   banner.hidden = false;
 }
 
@@ -1015,6 +1286,8 @@ for (const [value, label] of [
   [MODE_DM, 'Все против всех'],
   [MODE_PVE, 'Против ботов'],
   [MODE_EXPEDITION, 'Экспедиция'],
+  [MODE_ROYALE, 'Королевская битва'],
+  [MODE_TEAM, 'Командный бой'],
 ] as Array<[GameMode, string]>) {
   const button = document.createElement('button');
   button.type = 'button';
@@ -1022,6 +1295,24 @@ for (const [value, label] of [
   button.dataset.mode = value;
   button.addEventListener('click', () => net.sendSetup({ mode: value }));
   setupModes.appendChild(button);
+}
+
+for (const size of TEAM_BATTLE_SIZES) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.textContent = `${size}×${size}`;
+  button.dataset.teamsize = String(size);
+  button.addEventListener('click', () => net.sendSetup({ teamSize: size }));
+  setupTeamsize.appendChild(button);
+}
+
+for (const size of ROYALE_SQUAD_SIZES) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.textContent = size === 1 ? 'Соло' : size === 2 ? 'Дуо' : 'Сквад';
+  button.dataset.royaleSize = String(size);
+  button.addEventListener('click', () => net.sendSetup({ royaleSquadSize: size }));
+  setupRoyaleSize.appendChild(button);
 }
 
 for (const value of [RULES_ARCADE, RULES_REAL] as Ruleset[]) {
@@ -1050,6 +1341,20 @@ STANCE_NAMES.forEach((label, index) => {
   button.addEventListener('click', () => net.sendSetup({ stance: index }));
   setupStances.appendChild(button);
 });
+
+for (const [id, label] of RETICLE_STYLES) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.textContent = label;
+  button.dataset.reticle = id;
+  button.addEventListener('click', () => {
+    reticleStyle = id;
+    crosshair.dataset.style = reticleStyle;
+    localStorage.setItem('tanks:reticle', reticleStyle);
+    renderSetup();
+  });
+  setupReticles.appendChild(button);
+}
 
 setupBonuses.addEventListener('change', () => net.sendSetup({ bonuses: setupBonuses.checked }));
 
@@ -1144,7 +1449,31 @@ function renderSetup(): void {
 
   // Про волны — только там, где волны есть. В «Все против всех» это пять строк
   // не о том, и панель без них заметно короче.
-  setupNote.hidden = mode !== MODE_PVE && mode !== MODE_EXPEDITION;
+  setupNote.hidden = mode !== MODE_PVE && mode !== MODE_EXPEDITION && mode !== MODE_ROYALE && mode !== MODE_TEAM;
+  setupNote.textContent =
+    mode === MODE_ROYALE
+      ? `Большая карта 900×900: формат ${royaleSquadLabel(royaleSquadSize)}, союзные боты, одна жизнь и зона, которая постепенно сжимается.`
+      : mode === MODE_TEAM
+        ? 'Раунд без возрождения: погиб — смотришь за живым союзником до конца раунда. Побеждает сторона, уничтожившая всех; если за 5 минут бой не решён — ничья, и начинается новый раунд.'
+        : 'Волны растут: сначала числом, потом выучкой. В «Экспедиции» забег длится 15 волн, а между ними команда выбирает одно общее улучшение.';
+
+  setupTeamsizeLabel.hidden = mode !== MODE_TEAM;
+  setupTeamsize.hidden = mode !== MODE_TEAM;
+  hintTeamsize.hidden = mode !== MODE_TEAM;
+  for (const button of setupTeamsize.querySelectorAll('button')) {
+    button.classList.toggle('is-on', Number(button.dataset.teamsize) === teamSize);
+    button.disabled = !isHost;
+  }
+  hintTeamsize.textContent = 'Срабатывает сразу: новый раунд с новым составом сторон.';
+
+  setupRoyaleSizeLabel.hidden = mode !== MODE_ROYALE;
+  setupRoyaleSize.hidden = mode !== MODE_ROYALE;
+  hintRoyaleSize.hidden = mode !== MODE_ROYALE;
+  for (const button of setupRoyaleSize.querySelectorAll('button')) {
+    button.classList.toggle('is-on', Number(button.dataset.royaleSize) === royaleSquadSize);
+    button.disabled = !isHost;
+  }
+  hintRoyaleSize.textContent = 'Срабатывает сразу: матч перезапустится с выбранным размером отряда.';
 
   // Три галки в панели, которые работают у всех: они не про бой.
   setupTop.checked = topView;
@@ -1165,6 +1494,11 @@ function renderSetup(): void {
     ? 'Трассеры, вспышки и взрывы разгораются. Если кадры проседают — сними.'
     : 'Выключено: кадр рисуется одним проходом, без размытия по всему экрану.';
 
+  for (const button of setupReticles.querySelectorAll('button')) {
+    button.classList.toggle('is-on', button.dataset.reticle === reticleStyle);
+  }
+  hintReticle.textContent = RETICLE_STYLES.find(([id]) => id === reticleStyle)?.[2] ?? '';
+
   for (const button of setupMaps.querySelectorAll('button')) {
     button.classList.toggle('is-on', Number(button.dataset.map) === mapId);
     button.disabled = !isHost;
@@ -1177,14 +1511,15 @@ function renderSetup(): void {
     button.classList.toggle('is-on', button.dataset.rules === rules);
     button.disabled = !isHost;
   }
-  const pending = (mode === MODE_PVE || mode === MODE_EXPEDITION) && activeDifficulty !== difficulty;
+  const botMode = mode === MODE_PVE || mode === MODE_EXPEDITION || mode === MODE_ROYALE || mode === MODE_TEAM;
+  const pending = botMode && activeDifficulty !== difficulty;
   for (const button of setupDiffs.querySelectorAll('button')) {
     const tier = Number(button.dataset.diff);
     button.classList.toggle('is-on', tier === difficulty);
     // Пока выбор не вступил в силу, отдельно помечаем то, по чему идёт бой.
     button.classList.toggle('is-live', pending && tier === activeDifficulty);
     // Сложность имеет смысл только в режиме ботов.
-    button.disabled = !isHost || (mode !== MODE_PVE && mode !== MODE_EXPEDITION);
+    button.disabled = !isHost || !botMode;
   }
 
   for (const button of setupStances.querySelectorAll('button')) {
@@ -1195,18 +1530,25 @@ function renderSetup(): void {
 
   // Главное, чего не хватало: когда настройка сработает.
   hintMap.textContent = MAP_HINTS[mapId];
-  hintMode.textContent = 'Срабатывает сразу: бой начинается заново, счёт обнуляется.';
+  hintMode.textContent =
+    mode === MODE_ROYALE
+      ? 'Срабатывает сразу: включит карту «Рубеж» 900×900 и начнёт новый матч.'
+      : mode === MODE_TEAM
+        ? 'Срабатывает сразу: разведёт игроков по двум сторонам через одного и начнёт раунд.'
+        : 'Срабатывает сразу: бой начинается заново, счёт обнуляется.';
   hintRules.textContent = RULES_HINTS[rules];
   hintBonuses.textContent = bonusesOn
     ? 'Срабатывает сразу: выключение уберёт ящики и снимет действующие усиления.'
     : 'Срабатывает сразу: ящики начнут появляться на карте.';
 
-  if (mode !== MODE_PVE && mode !== MODE_EXPEDITION) {
+  if (!botMode) {
     hintDiff.textContent = 'Работает только в режиме «Против ботов».';
   } else if (pending) {
     hintDiff.textContent =
       `Сейчас в бою: ${DIFFICULTY_NAMES[activeDifficulty]}. ` +
       `Выбранная включится ${whenDifficulty()} — вышедшие боты не переучиваются.`;
+  } else if (mode === MODE_TEAM) {
+    hintDiff.textContent = 'Действует с нового раунда.';
   } else if (wave.phase === 'fight') {
     hintDiff.textContent = 'Смена включится со следующей волны: эту доигрываем как есть.';
   } else {
@@ -1223,6 +1565,44 @@ function toggleSetup(open = setupPanel.hidden): void {
 
 setupToggle.addEventListener('click', () => toggleSetup());
 
+/** Доска лидеров — своя маленькая панель, открывается тем же жестом, что настройки. */
+function toggleLeaderboard(open = leaderboardPanel.hidden): void {
+  leaderboardPanel.hidden = !open;
+  if (open && document.pointerLockElement) document.exitPointerLock();
+  if (open) renderLeaderboard();
+}
+
+function renderLeaderboard(): void {
+  leaderboardRows.innerHTML = '';
+  if (leaderboardEntries.length === 0) {
+    const empty = document.createElement('p');
+    empty.className = 'leaderboard-empty';
+    empty.textContent = 'Пока пусто — сыграйте раунд командного боя.';
+    leaderboardRows.appendChild(empty);
+    return;
+  }
+  leaderboardEntries.forEach((entry, index) => {
+    const row = document.createElement('div');
+    row.className = 'leaderboard-row';
+    row.innerHTML =
+      `<span class="leaderboard-rank">${index + 1}</span>` +
+      `<span class="leaderboard-name">${escapeHtml(entry.name)}</span>` +
+      `<span>${entry.wins}П</span>` +
+      `<span>${entry.losses}Пр</span>` +
+      `<span>${entry.draws}Н</span>` +
+      `<span>${entry.kills} фрагов</span>`;
+    leaderboardRows.appendChild(row);
+  });
+}
+
+function escapeHtml(text: string): string {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+leaderboardToggle.addEventListener('click', () => toggleLeaderboard());
+
 window.addEventListener('keydown', (event) => {
   if (event.target instanceof HTMLInputElement) return;
   if (hud.hidden) return; // до входа в бой настраивать нечего
@@ -1232,10 +1612,13 @@ window.addEventListener('keydown', (event) => {
 });
 
 function updateHealthHud(): void {
-  const fraction = clamp(myHp / MAX_HP, 0, 1);
+  const maxHp = mode === MODE_ROYALE ? myMaxHp : expeditionMaxHp;
+  const fraction = clamp(myHp / maxHp, 0, 1);
   hudHpFill.style.width = `${(fraction * 100).toFixed(0)}%`;
   hudHpFill.style.background = `hsl(${Math.round(fraction * 105)} 70% 48%)`;
-  hudHpValue.textContent = String(myHp);
+  hudHpValue.textContent = mode === MODE_EXPEDITION || mode === MODE_ROYALE
+    ? `${myHp}/${maxHp}`
+    : String(myHp);
 }
 
 /** Красная засветка по краям экрана, когда прилетело. */
@@ -1266,11 +1649,13 @@ function pushFeed(text: string, extra = ''): void {
 
 // --- Бонусы ---
 
-/** Чипы действующих эффектов; «Ремонт» мгновенный, поэтому чипа у него нет. */
+/** Чипы старых таймерных бонусов; «Ремонт» мгновенный, поэтому чипа у него нет. */
 const TIMED_BONUSES = [BONUS_DAMAGE, BONUS_RELOAD, BONUS_SPEED, BONUS_STEALTH];
+/** Постоянные модули BR: в HUD нет обратного отсчёта, они живут до конца матча. */
+const ROYALE_MODULES = [ROYALE_LOOT_ARMOR, ROYALE_LOOT_DAMAGE, ROYALE_LOOT_RELOAD, ROYALE_LOOT_SPEED];
 const fxChips = new Map<number, HTMLElement>();
 
-for (const kind of TIMED_BONUSES) {
+for (const kind of [...TIMED_BONUSES, ...ROYALE_MODULES]) {
   const chip = document.createElement('span');
   chip.className = 'hud-chip fx-chip';
   chip.style.setProperty('--fx', `#${BONUS_COLORS[kind].toString(16).padStart(6, '0')}`);
@@ -1281,12 +1666,13 @@ for (const kind of TIMED_BONUSES) {
 
 function onPickup(id: number, kind: number): void {
   const who = players.get(id);
-  pushFeed(`${who?.name ?? 'Кто-то'} ⚡ ${BONUS_NAMES[kind]}`, 'is-bonus');
+  const name = mode === MODE_ROYALE ? ROYALE_LOOT_NAMES[kind] : BONUS_NAMES[kind];
+  pushFeed(`${who?.name ?? 'Кто-то'} ◆ ${name ?? 'Контейнер'}`, 'is-bonus');
   if (id !== selfId) return;
 
   // Секунды считаем сами: сервер шлёт только факт «эффект висит», а длительность
   // и так известна обеим сторонам. Если маска погаснет раньше — чип уйдёт с ней.
-  if (kind !== BONUS_HEAL) {
+  if (mode !== MODE_ROYALE && kind !== BONUS_HEAL) {
     effectUntil[kind] = performance.now() + BONUS_DURATION_S[kind] * 1000;
   }
   updateEffectsHud();
@@ -1295,12 +1681,18 @@ function onPickup(id: number, kind: number): void {
 function updateEffectsHud(now = performance.now()): void {
   for (const kind of TIMED_BONUSES) {
     const chip = fxChips.get(kind)!;
-    const on = hasEffect(myEffects, kind);
+    const on = mode !== MODE_ROYALE && hasEffect(myEffects, kind);
     chip.hidden = !on;
     if (!on) continue;
     const left = Math.max(0, Math.ceil((effectUntil[kind] - now) / 1000));
     const text = `${BONUS_NAMES[kind]} ${left}`;
     if (chip.textContent !== text) chip.textContent = text;
+  }
+  for (const kind of ROYALE_MODULES) {
+    const chip = fxChips.get(kind)!;
+    const on = mode === MODE_ROYALE && hasEffect(myEffects, kind);
+    chip.hidden = !on;
+    if (on) chip.textContent = ROYALE_LOOT_NAMES[kind];
   }
 }
 
@@ -1320,19 +1712,22 @@ function updateReloadHud(now: number): void {
 
 function updateDeathScreen(now = performance.now()): void {
   // Итоги забега показывает плашка волны — две карточки разом были бы лишними.
-  const show = myDead && !((mode === MODE_PVE || mode === MODE_EXPEDITION) && wave.phase === 'over');
+  const byWave = mode === MODE_PVE || mode === MODE_EXPEDITION;
+  const byRoyale = mode === MODE_ROYALE;
+  const show = myDead && !(byWave && wave.phase === 'over');
   deathScreen.hidden = !show;
   if (!show) {
     respawnShown = '';
     return;
   }
 
-  // В режиме ботов жизнь одна на волну, поэтому обратного отсчёта нет.
-  const byWave = mode === MODE_PVE || mode === MODE_EXPEDITION;
-  deathRespawn.hidden = byWave;
-  deathNote.hidden = !byWave;
+  // В BR и режиме ботов жизнь одна: после гибели можно только наблюдать.
+  deathRespawn.hidden = byWave || byRoyale;
+  deathNote.hidden = !byWave && !byRoyale;
 
-  const text = byWave
+  const text = byRoyale
+    ? 'Твой танк уничтожен · наблюдение за сквадом'
+    : byWave
     ? wave.phase === 'break' || wave.phase === 'upgrade'
       ? 'В строю со следующей волной'
       : 'В строю, когда волна будет зачищена'
@@ -1340,8 +1735,18 @@ function updateDeathScreen(now = performance.now()): void {
 
   if (text === respawnShown) return;
   respawnShown = text;
-  if (byWave) deathNote.textContent = text;
+  if (byWave || byRoyale) deathNote.textContent = text;
   else deathTimer.textContent = text;
+}
+
+function updateRoyaleDrop(now: number): void {
+  if (mode !== MODE_ROYALE || wave.royalePhase !== 'countdown') {
+    scene.setRoyaleDrop(1, mapHalf);
+    return;
+  }
+  const total = ROYALE_START_COUNTDOWN_S * 1000;
+  const left = Math.max(0, waveUntilAt - now);
+  scene.setRoyaleDrop(1 - left / total, mapHalf);
 }
 
 let speedTimer = 0;
@@ -1367,6 +1772,7 @@ function hideOverlay(): void {
   // Прицел покажется сам, как только появится своё состояние: его место
   // считается от ствола, а не от центра экрана.
   setupToggle.hidden = false;
+  leaderboardToggle.hidden = false;
   setStatus('');
   joinButton.disabled = false;
   renderSetup();
@@ -1388,6 +1794,8 @@ function showOverlay(message: string, isError = false): void {
   touchLayer.hidden = true;
   setupToggle.hidden = true;
   setupPanel.hidden = true;
+  leaderboardToggle.hidden = true;
+  leaderboardPanel.hidden = true;
   banner.hidden = true;
   expeditionPanel.hidden = true;
   joinButton.disabled = false;
@@ -1397,6 +1805,7 @@ function showOverlay(message: string, isError = false): void {
 
 function resetWorld(): void {
   // Именно clearTanks, а не обход players: догорающие остовы из комнаты уже вышли.
+  audio.stopEngine();
   scene.clearTanks();
   players.clear();
   snapshots.length = 0;
@@ -1410,6 +1819,8 @@ function resetWorld(): void {
   // Пока нас не было, хост мог сменить карту — на переподключении собираем мир заново.
   worldBuilt = false;
   myHp = MAX_HP;
+  myMaxHp = MAX_HP;
+  expeditionMaxHp = MAX_HP;
   myDead = false;
   spectateId = 0;
   deathSpectate.hidden = true;

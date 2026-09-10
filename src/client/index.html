@@ -13,7 +13,14 @@
       <div id="labels"></div>
 
       <div id="damage-flash"></div>
-      <div id="crosshair" hidden><div id="hitmarker"></div></div>
+      <div id="crosshair" hidden>
+        <i class="reticle-arm reticle-nw"></i>
+        <i class="reticle-arm reticle-ne"></i>
+        <i class="reticle-arm reticle-sw"></i>
+        <i class="reticle-arm reticle-se"></i>
+        <i id="reticle-core"></i>
+        <i id="hitmarker"></i>
+      </div>
       <div id="kill-feed"></div>
 
       <div id="death" hidden>
@@ -50,6 +57,12 @@
         <div class="setup-label">Режим</div>
         <div class="setup-row" id="setup-modes"></div>
         <p class="setup-hint" id="hint-mode"></p>
+        <div class="setup-label" id="setup-teamsize-label">Размер команды</div>
+        <div class="setup-row" id="setup-teamsize"></div>
+        <p class="setup-hint" id="hint-teamsize"></p>
+        <div class="setup-label" id="setup-royale-size-label">Формат BR</div>
+        <div class="setup-row" id="setup-royale-size"></div>
+        <p class="setup-hint" id="hint-royale-size"></p>
         <div class="setup-label">Правила</div>
         <div class="setup-row" id="setup-rules"></div>
         <p class="setup-hint" id="hint-rules"></p>
@@ -75,16 +88,28 @@
           <span>Вид от первого лица (F)</span>
         </label>
         <p class="setup-hint" id="hint-view"></p>
+        <div class="setup-label setup-local">Прицел — только у тебя</div>
+        <div class="setup-row" id="setup-reticles"></div>
+        <p class="setup-hint" id="hint-reticle"></p>
         <label class="setup-check">
           <input type="checkbox" id="setup-bloom" />
           <span>Свечение</span>
         </label>
         <p class="setup-hint" id="hint-bloom"></p>
 
-        <p class="setup-note" id="setup-note" hidden>Волны растут: сначала числом, потом выучкой. В «Экспедиции» забег длится 10 волн, а между ними команда выбирает одно общее улучшение.</p>
+        <p class="setup-note" id="setup-note" hidden>Волны растут: сначала числом, потом выучкой. В «Экспедиции» забег длится 15 волн, а между ними команда выбирает одно общее улучшение.</p>
       </div>
 
       <button id="setup-toggle" type="button" title="Настройки боя (M)" hidden>⚙</button>
+      <button id="leaderboard-toggle" type="button" title="Доска лидеров" hidden>🏆</button>
+
+      <div id="leaderboard" hidden>
+        <div class="setup-head">
+          <b>Доска лидеров</b>
+          <span>Командный бой</span>
+        </div>
+        <div id="leaderboard-rows"></div>
+      </div>
 
       <div id="hud" hidden>
         <div class="hud-left">
@@ -123,7 +148,7 @@
       <div id="overlay">
         <form id="join-form" autocomplete="off">
           <h1>Танковый бой</h1>
-          <p class="sub">Семь карт, PvP, волны ботов или экспедиция на 10 волн. 100 HP, снаряд снимает 25.</p>
+        <p class="sub">Карты, PvP, волны ботов, экспедиция и королевская битва на огромной карте. 1000 HP, снаряд снимает 250.</p>
           <input id="name-input" name="name" maxlength="16" placeholder="Твой позывной" required />
           <button id="join-button" type="submit">В бой</button>
           <p id="status" class="status"></p>
