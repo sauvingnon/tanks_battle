@@ -8,7 +8,7 @@ import type { Box } from './types.js';
  *
  * Общие правила для любой карты:
  *  - всё выровнено по осям, иначе перестанут работать свипы снарядов и рикошеты;
- *  - блок выше SHELL_HEIGHT (2.15) укрывает от огня, ниже — только мешает ехать:
+ *  - блок выше SHELL_HEIGHT (1.82) укрывает от огня, ниже — только мешает ехать:
  *    через него видно, простреливается насквозь, но проехать нельзя;
  *  - проезд между блоками не уже 8 м: танк — круг радиусом 2.4, и в щель
  *    впритык он заезжает, но выбраться уже не может;
@@ -492,35 +492,758 @@ function buildWorks(): Box[] {
   return boxes;
 }
 
+/**
+ * «Рубеж»: карта для королевской битвы, 900×900 м.
+ *
+ * Четыре самостоятельных района разнесены по углам, а между ними оставлены
+ * длинные, но не пустые переходы. Центр не превращён в одну крепость: там есть
+ * несколько ориентиров, но ни один из них не перекрывает всю карту. Благодаря
+ * этому круг может закрывать разные районы, а маршрут к нему каждый раз другой.
+ */
+const FRONTIER_SCALE = 1.6;
+const ROYALE_HALF = 450;
+const ROYALE_SPAWNS_BASE: Array<[number, number]> = [
+  [0, 262], [72, 262], [-72, 262],
+  [262, 0], [262, 72], [262, -72],
+  [0, -262], [72, -262], [-72, -262],
+  [-262, 0], [-262, 72], [-262, -72],
+  [0, 214], [214, 0], [0, -214], [-214, 0],
+  [150, 214], [-150, 214], [150, -214], [-150, -214],
+  [214, 150], [214, -150], [-214, 150], [-214, -150],
+];
+const ROYALE_SPAWNS: Array<[number, number]> = ROYALE_SPAWNS_BASE.map(([x, z]) => [
+  x * FRONTIER_SCALE,
+  z * FRONTIER_SCALE,
+]);
+
+function buildFrontier(): Box[] {
+  const boxes: Box[] = [];
+  const add = (x: number, z: number, w: number, d: number, h: number) => {
+    boxes.push({
+      x: x * FRONTIER_SCALE,
+      z: z * FRONTIER_SCALE,
+      w: w * FRONTIER_SCALE,
+      d: d * FRONTIER_SCALE,
+      h,
+    });
+  };
+  const detail = (
+    x: number,
+    z: number,
+    w: number,
+    d: number,
+    h: number,
+    y: number,
+    style: 'roof' | 'gate' | 'road' | 'sidewalk' | 'pole' | 'car' | 'barrel' | 'pipe' | 'wreck',
+    solid = false,
+  ) => {
+    boxes.push({
+      x: x * FRONTIER_SCALE,
+      z: z * FRONTIER_SCALE,
+      w: w * FRONTIER_SCALE,
+      d: d * FRONTIER_SCALE,
+      h,
+      y,
+      solid,
+      style,
+    });
+  };
+
+  // Городские поверхности не являются укрытиями и не участвуют в физике. Они
+  // лежат отдельными полосами поверх грунта, поэтому сервер видит только
+  // настоящие здания, а клиент получает цельную сеть улиц.
+  const surface = (
+    x: number,
+    z: number,
+    w: number,
+    d: number,
+    style: 'road' | 'sidewalk',
+    y = 0.035,
+    h = 0.07,
+  ) => detail(x, z, w, d, h, y, style);
+  const street = (x: number, z: number, w: number, d: number) => {
+    surface(x, z, w, d, 'road');
+    if (w >= d) {
+      surface(x, z - d / 2 - 1.7, w, 2.2, 'sidewalk', 0.07, 0.1);
+      surface(x, z + d / 2 + 1.7, w, 2.2, 'sidewalk', 0.07, 0.1);
+    } else {
+      surface(x - w / 2 - 1.7, z, 2.2, d, 'sidewalk', 0.07, 0.1);
+      surface(x + w / 2 + 1.7, z, 2.2, d, 'sidewalk', 0.07, 0.1);
+    }
+  };
+  const pole = (x: number, z: number, h = 8.5) => detail(x, z, 0.34, 0.34, h, 0, 'pole');
+  const barrels = (x: number, z: number, count = 2) => {
+    for (let i = 0; i < count; i++) {
+      const offset = (i - (count - 1) / 2) * 2.1;
+      detail(x + offset, z, 1.7, 1.7, 2.2, 0, 'barrel', true);
+    }
+  };
+  const pipes = (x: number, z: number, alongX = true, length = 14) => {
+    detail(x, z, alongX ? length : 2.4, alongX ? 2.4 : length, 1.1, 0, 'pipe', true);
+  };
+  const wreck = (x: number, z: number, alongX = true) => {
+    detail(x, z, alongX ? 5.8 : 3.6, alongX ? 3.6 : 5.8, 1.15, 0, 'wreck', true);
+  };
+
+
+  // Эта карта больше не строится поворотом одного шаблона. Сначала задаём
+  // крупный городской каркас: две магистрали оставляют четыре разных сектора,
+  // а короткие улицы и дворы связывают их в непрерывную сеть. В координатах
+  // ниже всё ещё используется «половина» старой карты; FRONTIER_SCALE растянет
+  // её до 900×900 уже в конце.
+
+  // Центральный город. Площадь намеренно не симметрична: башня-ориентир
+  // смещена к югу и слегка вытянута, чтобы перекрыть проезд ровно в месте
+  // пересечения двух главных проспектов — иначе перекрёсток остаётся
+  // единственной точкой на всей карте, простреливаемой в обе стороны разом.
+  add(0, -8, 16, 18, 8.5);
+  add(-42, -28, 28, 14, 5.5);
+  add(40, -30, 24, 16, 5);
+  add(-44, 28, 18, 28, 5);
+  add(34, 30, 28, 14, 5.5);
+  add(-78, -26, 16, 24, 4.8);
+  add(76, -34, 14, 20, 4.5);
+  add(-76, 34, 24, 12, 4.5);
+  add(74, 48, 14, 18, 4.8);
+  add(-30, 76, 20, 12, 4.5);
+  add(28, 76, 14, 22, 5);
+
+  // Северо-западный жилой сектор: кварталы собраны плотнее, с переулками в
+  // 6–10 м между фасадами. Это уже городской ритм, но не непроездная стена.
+  const northWestHomes = [
+    [-130, 104, 22, 16, 4.5], [-157, 104, 18, 24, 4.8],
+    [-183, 104, 26, 14, 5], [-128, 140, 16, 24, 4.3],
+    [-156, 150, 24, 16, 5], [-184, 148, 18, 20, 4.5],
+    [-126, 192, 28, 14, 5], [-158, 192, 18, 22, 4.7],
+    [-186, 190, 24, 16, 5.2], [-164, 232, 30, 14, 4.5],
+  ] as const;
+  for (const [x, z, w, d, h] of northWestHomes) add(x, z, w, d, h);
+  // Открытый двор между жилыми группами — одна из небольших безопасных
+  // пересадочных площадок, но не поле на полкарты.
+  add(-166, 170, 8, 8, 3.8);
+  // Часовая площадь — пересадочный узел между центром и жилым сектором: башня
+  // видна ещё с проспекта и сразу говорит, что впереди северо-запад, а не
+  // просто ещё один квартал таких же домов.
+  add(-92, 78, 13, 13, 11);
+  add(-92, 65, 4, 4, LOW);
+  add(-92, 91, 4, 4, LOW);
+
+  // Восточная промзона — единый промышленный район, а не россыпь складов.
+  // Большие корпуса формируют погрузочные дворы; контейнеры задают низкие
+  // линии, поверх которых идут длинные прострелы.
+  add(136, -136, 42, 24, 6);
+  add(184, -136, 32, 20, 5.5);
+  add(142, -88, 24, 34, 5.5);
+  add(190, -86, 38, 18, 5.5);
+  add(148, 78, 34, 22, 5.5);
+  add(188, 78, 26, 34, 6);
+  add(144, 132, 42, 18, 5.5);
+  add(188, 132, 30, 22, 5);
+  // Административная башня видна с центральной площади и помогает понять,
+  // что игрок находится у промзоны, даже когда обзор режет дым/кусты.
+  add(112, 12, 14, 14, 10);
+  // Элеваторы — второй, совсем другой силуэт промзоны: три узкие высокие
+  // башни вместо привычных приземистых корпусов. Стоят в разрыве между
+  // северной и южной группами цехов, поэтому не отжимают ничей маршрут.
+  add(148, -28, 9, 9, 14);
+  add(164, -28, 9, 9, 15.5);
+  add(180, -28, 9, 9, 13);
+  // Погрузочные дворы: это низкие объекты, которые разделяют маршруты, но не
+  // превращают весь район в непроницаемый лабиринт.
+  for (const [x, z, w, d] of [
+    [168, -112, 18, 5], [214, -112, 14, 5],
+    [168, 110, 20, 5], [216, 106, 14, 5],
+    [120, -170, 8, 12], [230, 170, 10, 8],
+  ] as const) add(x, z, w, d, LOW);
+
+  // Юго-западный частный сектор. Здесь меньше этажей, больше дистанции между
+  // домами и есть несколько флангов через сады, но ни один двор не выходит в
+  // бесполезное чистое поле.
+  const southWestHomes = [
+    [-116, -104, 20, 16, 4], [-143, -98, 16, 20, 4.5],
+    [-170, -108, 22, 14, 4.2], [-104, -146, 16, 24, 4.5],
+    [-132, -146, 24, 14, 4], [-162, -150, 16, 22, 4.5],
+    [-116, -196, 26, 16, 4.5], [-146, -194, 18, 26, 4.3],
+    [-176, -190, 24, 16, 4.5], [-156, -232, 32, 14, 4],
+  ] as const;
+  for (const [x, z, w, d, h] of southWestHomes) add(x, z, w, d, h);
+  // Низкие ограды читаются как границы дворов и дают стелс-маршрут, но не
+  // мешают танку пройти через весь сектор.
+  for (const [x, z, w, d] of [
+    [-122, -122, 8, 6], [-166, -126, 6, 10],
+    [-112, -176, 10, 6], [-220, -164, 8, 6],
+    [-184, -216, 10, 6],
+  ] as const) add(x, z, w, d, LOW);
+  // Усадьба — самое крупное частное владение района: и по площади, и по
+  // высоте она заметно больше рядовых домиков вокруг. Невысокая парадная
+  // ограда со стороны подъезда не мешает объехать дом с любой стороны.
+  add(-192, -150, 24, 18, 6.2);
+  add(-192, -164, 16, 3, LOW);
+
+  // Северо-восток — зеленая зона. Здесь меньше капитальных зданий, зато есть
+  // две просеки, карманы кустов и низкие бетонные элементы. Это самостоятельный
+  // скрытный маршрут, а не несколько случайных кустов на обочине.
+  add(118, 198, 28, 16, 4.8);
+  add(170, 196, 18, 28, 4.5);
+  add(218, 206, 26, 16, 5);
+  add(194, 246, 34, 14, 4.5);
+  add(94, 238, 18, 24, 4.2);
+  for (const [x, z, w, d] of [
+    [104, 144, 10, 8], [132, 160, 8, 12], [166, 150, 12, 8],
+    [204, 164, 8, 12], [232, 146, 10, 8], [114, 218, 12, 8],
+    [152, 224, 8, 12], [184, 222, 12, 8], [224, 232, 8, 12],
+    [126, 258, 10, 8], [166, 268, 8, 10], [232, 264, 10, 8],
+  ] as const) add(x, z, w, d, LOW);
+  // Редут — четыре стены с воротами на каждую сторону, а не одна коробка:
+  // сюда заходят с любого фланга, как и было задумано для зелёной зоны.
+  // Стены выше SHELL_HEIGHT, то есть держат выстрел, а не только мешают
+  // ехать — внутри есть настоящее укрытие, а не только простор. Финальный
+  // круг «королевской битвы» стягивается в случайную точку карты (см.
+  // Room.randomZoneCenter), поэтому вход специально не один — редуту всё
+  // равно может достаться роль последнего пятачка.
+  {
+    const rx = 50;
+    const rz = 152;
+    const half = 11;
+    const seg = half * 2 - 8; // сторона минус ворота шириной 8
+    const off = 4 + seg / 4;
+    for (const s of [1, -1] as const) {
+      add(rx + s * off, rz + half, seg / 2, 2.8, 2.2);
+      add(rx + s * off, rz - half, seg / 2, 2.8, 2.2);
+      add(rx + half, rz + s * off, 2.8, seg / 2, 2.2);
+      add(rx - half, rz + s * off, 2.8, seg / 2, 2.2);
+    }
+  }
+
+  // Южная окраина связывает центр с частным сектором. Это не ещё один район,
+  // а переходная полоса: несколько ориентиров и карманов не дают дороге
+  // превращаться в 200 метров пустого прострела.
+  add(-34, -126, 14, 26, 4.5);
+  add(24, -132, 24, 14, 4.8);
+  add(-34, -178, 22, 14, 4.3);
+  add(28, -186, 16, 22, 4.5);
+  add(64, -206, 24, 14, 4.5);
+  add(28, -238, 18, 18, 5);
+  add(-40, -236, 28, 12, 4.5);
+  for (const [x, z, w, d] of [
+    [-4, -158, 10, 6], [52, -160, 8, 10],
+    [-20, -214, 8, 10], [74, -238, 10, 6],
+  ] as const) add(x, z, w, d, LOW);
+
+  // Главные проспекты не рисуются отдельными коробками: их роль выполняют
+  // свободные коридоры между районами. Эти ориентиры стоят на их краях и
+  // дают точки для поворота, не закрывая проезд по оси.
+  add(-96, 34, 12, 18, 4.5);
+  add(-98, -34, 18, 12, 4.5);
+  add(96, -36, 12, 18, 4.5);
+  add(94, 46, 18, 12, 4.5);
+  add(12, 112, 18, 12, 4.5);
+  add(-12, -106, 12, 18, 4.5);
+
+  // Второй ряд застройки. Небольшие дома и мастерские заполняют пустоты
+  // внутри кварталов, но не замыкают их в стены: между ними остаются короткие
+  // обходы и дворы. Этот слой заметно повышает плотность без лабиринта.
+  const infill = [
+    // Северо-западные жилые кварталы.
+    [-116, 120, 10, 8, 3.8], [-182, 128, 10, 8, 4],
+    [-228, 128, 10, 8, 4], [-142, 176, 10, 8, 3.8],
+    [-190, 172, 10, 8, 4], [-222, 216, 10, 8, 4],
+    [-140, 214, 10, 8, 3.8], [-104, 154, 8, 10, 3.8],
+    [-218, 170, 8, 10, 3.8],
+    // Восточные цеховые дворы.
+    [166, -158, 12, 8, 4], [220, -174, 12, 8, 4],
+    [168, -52, 12, 8, 4], [222, -52, 10, 12, 4],
+    [168, 44, 12, 8, 4], [220, 44, 10, 12, 4],
+    [166, 158, 12, 8, 4], [222, 158, 10, 10, 4],
+    [118, 82, 8, 8, 3.8], [120, -58, 8, 8, 3.8],
+    // Частный сектор на юго-западе.
+    [-190, -120, 10, 8, 3.8], [-216, -138, 10, 8, 3.8],
+    [-110, -166, 10, 8, 3.8], [-148, -170, 10, 8, 3.8],
+    [-204, -174, 10, 8, 4], [-90, -210, 10, 8, 3.8],
+    [-130, -216, 10, 8, 3.8], [-208, -216, 10, 8, 4],
+    [-72, -146, 8, 10, 3.8], [-78, -188, 8, 10, 3.8],
+    // Зеленый сектор: отдельные домики вокруг просек.
+    [120, 172, 10, 8, 3.8], [150, 172, 10, 8, 3.8],
+    [206, 176, 10, 8, 4], [114, 180, 8, 8, 3.8],
+    [146, 186, 10, 8, 3.8], [218, 186, 10, 8, 4],
+    [128, 232, 10, 8, 3.8], [166, 232, 10, 8, 3.8],
+    [220, 222, 10, 8, 4],
+    // Переходы вокруг центра убирают последние большие пустые окна.
+    [-68, -66, 10, 8, 3.8], [70, -70, 10, 8, 3.8],
+    [-66, 62, 8, 10, 3.8], [64, 62, 10, 8, 3.8],
+  ] as const;
+  for (const [x, z, w, d, h] of infill) add(x, z, w, d, h);
+
+  // Проезжаемые объекты. Это не цельная коробка: две продольные стены оставляют
+  // открытые торцы, поэтому танк может заехать, развернуться и выйти с другой
+  // стороны. Внутрь можно спрятаться от дальнего огня, но входы остаются честным
+  // риском — противник способен простреливать их насквозь.
+
+  // Проезжаемые объекты. Это не цельная коробка: две продольные стены оставляют
+  // открытые торцы, поэтому танк может заехать, развернуться и выйти с другой
+  // стороны. Внутрь можно спрятаться от дальнего огня, но входы остаются честным
+  // риском — противник способен простреливать их насквозь.
+  const driveThrough = (
+    cx: number,
+    cz: number,
+    w: number,
+    d: number,
+    h: number,
+    along: 'x' | 'z',
+  ) => {
+    const thickness = 2.8;
+    if (along === 'z') {
+      add(cx - w / 2 + thickness / 2, cz, thickness, d, h);
+      add(cx + w / 2 - thickness / 2, cz, thickness, d, h);
+      // Кровля — только по боковым фермам и торцевым козырькам: центр остаётся
+      // открытым, чтобы камера и засвет не превращали ангар в чёрный потолок.
+      detail(cx - w / 2 + thickness / 2, cz, thickness + 1.6, d + 1.2, 0.35, h, 'roof');
+      detail(cx + w / 2 - thickness / 2, cz, thickness + 1.6, d + 1.2, 0.35, h, 'roof');
+      detail(cx, cz - d / 2, w + 1.2, 1, 0.35, h, 'roof');
+      detail(cx, cz + d / 2, w + 1.2, 1, 0.35, h, 'roof');
+      detail(cx, cz - d / 2, w - 4, 0.22, 1.35, h - 1.8, 'gate');
+      detail(cx, cz + d / 2, w - 4, 0.22, 1.35, h - 1.8, 'gate');
+    } else {
+      add(cx, cz - d / 2 + thickness / 2, w, thickness, h);
+      add(cx, cz + d / 2 - thickness / 2, w, thickness, h);
+      detail(cx, cz - d / 2 + thickness / 2, w + 1.2, thickness + 1.6, 0.35, h, 'roof');
+      detail(cx, cz + d / 2 - thickness / 2, w + 1.2, thickness + 1.6, 0.35, h, 'roof');
+      detail(cx - w / 2, cz, 1, d + 1.2, 0.35, h, 'roof');
+      detail(cx + w / 2, cz, 1, d + 1.2, 0.35, h, 'roof');
+      detail(cx - w / 2, cz, 0.22, d - 4, 1.35, h - 1.8, 'gate');
+      detail(cx + w / 2, cz, 0.22, d - 4, 1.35, h - 1.8, 'gate');
+    }
+  };
+  driveThrough(0, 180, 26, 32, 5.5, 'z');
+  driveThrough(180, 0, 32, 26, 5.5, 'x');
+
+  // ДОТы с амбразурой. Щель фронтальной стены — 1.8 базовых метра, то есть
+  // 2.88 м после масштаба карты: танк через неё не протискивается даже на
+  // углу, а точечный снаряд проходит. Сзади оставлен полноценный въезд на 8 м.
+  const bunker = (cx: number, cz: number, w: number, d: number, h: number) => {
+    const thickness = 2.8;
+    const embrasure = 1.8;
+    const entrance = 8;
+    const sideLength = d - thickness * 2;
+    const sideX = w / 2 - thickness / 2;
+    const frontZ = cz + d / 2 - thickness / 2;
+    const rearZ = cz - d / 2 + thickness / 2;
+    const frontSegment = (w - embrasure) / 2;
+    const rearSegment = (w - entrance) / 2;
+
+    add(cx - sideX, cz, thickness, sideLength, h);
+    add(cx + sideX, cz, thickness, sideLength, h);
+    add(cx - (embrasure / 2 + frontSegment / 2), frontZ, frontSegment, thickness, h);
+    add(cx + (embrasure / 2 + frontSegment / 2), frontZ, frontSegment, thickness, h);
+    add(cx - (entrance / 2 + rearSegment / 2), rearZ, rearSegment, thickness, h);
+    add(cx + (entrance / 2 + rearSegment / 2), rearZ, rearSegment, thickness, h);
+
+    // Низкий бетонный козырёк повторяет контур стен, но не закрывает обзор
+    // сверху: центральная часть ДОТа остаётся открытой для читаемого боя.
+    detail(cx - sideX, cz, thickness + 1.2, sideLength + 1.2, 0.35, h, 'roof');
+    detail(cx + sideX, cz, thickness + 1.2, sideLength + 1.2, 0.35, h, 'roof');
+    detail(cx, frontZ, w + 1.2, thickness + 1.2, 0.35, h, 'roof');
+    detail(cx, rearZ, w + 1.2, thickness + 1.2, 0.35, h, 'roof');
+    detail(cx, frontZ - 0.45, embrasure + 2.2, 1.2, 0.4, h - 0.25, 'roof');
+    detail(cx, rearZ, entrance - 1.2, 0.22, 1.2, h - 1.7, 'gate');
+  };
+  bunker(0, -180, 24, 20, 5.5);
+  bunker(-180, 0, 24, 20, 5.5);
+
+  // Погранпосты — то, что дало карте название. Стоят на обоих проспектах
+  // между площадью и краем застройки: без них проспект простреливается на
+  // весь проезд насквозь (450+ м по оси). Пост — не будки по бокам с честным
+  // проездом посередине (тогда танк, идущий ровно по оси, видел бы всё то же
+  // самое через оба зазора разом), а шлагбаум почти во всю ширину дороги:
+  // проезд шириной 10 м остаётся только у одной обочины, и на соседнем посту
+  // он сделан у противоположной, так что прямая линия огня вдоль дороги
+  // требует вильнуть — а не просто ехать по центру.
+  const checkpoint = (cx: number, cz: number, guards: 'x' | 'z', gateSide: 1 | -1) => {
+    const roadHalf = 9;
+    const gap = 10;
+    const thick = 3.2;
+    const wallLen = roadHalf * 2 - gap;
+    const wallCenter = gateSide > 0 ? -roadHalf + wallLen / 2 : roadHalf - wallLen / 2;
+    const gateCenter = gateSide > 0 ? roadHalf - gap / 2 : -roadHalf + gap / 2;
+    const h = 4.6;
+    if (guards === 'x') {
+      add(cx, cz + wallCenter, thick, wallLen, h);
+      detail(cx, cz + gateCenter, thick + 0.6, gap - 0.8, 2.6, 0, 'gate');
+    } else {
+      add(cx + wallCenter, cz, wallLen, thick, h);
+      detail(cx + gateCenter, cz, gap - 0.8, thick + 0.6, 2.6, 0, 'gate');
+    }
+  };
+  checkpoint(-130, 0, 'x', 1);
+  checkpoint(140, 0, 'x', -1);
+  checkpoint(0, 140, 'z', 1);
+
+  // Кусты лежат в карманах между кварталами и проспектами. Ни один куст не
+  // совмещён со зданием: это укрытие для разведки, а не дополнительная стена.
+  const bush = (x: number, z: number, w: number, d: number) => add(x, z, w, d, LOW);
+  for (const [sx, sz] of CORNERS) {
+    bush(sx * 48, sz * 112, 8, 6);
+    bush(sx * 112, sz * 46, 6, 8);
+    bush(sx * 104, sz * 126, 8, 6);
+    bush(sx * 212, sz * 120, 6, 8);
+    bush(sx * 88, sz * 170, 8, 6);
+    bush(sx * 222, sz * 88, 6, 8);
+    bush(sx * 232, sz * 180, 8, 6);
+    bush(sx * 150, sz * 250, 6, 8);
+    bush(sx * 234, sz * 190, 6, 8);
+    bush(sx * 220, sz * 242, 8, 6);
+  }
+
+  // Дорожный каркас. Главные оси связывают карту насквозь, вторичные улицы
+  // заходят в районы и заканчиваются дворами; поэтому застройка стала плотнее,
+  // но у игрока всегда остаётся понятный маршрут к следующему сектору.
+  for (const [x, z, w, d] of [
+    [0, 0, 520, 18], [0, 0, 18, 520],
+    [-160, 135, 160, 12], [-140, 190, 12, 150],
+    [170, -8, 14, 300], [224, -4, 12, 300],
+    [170, -112, 160, 12], [172, 110, 170, 12],
+    [-150, -150, 180, 12], [-138, -198, 12, 150],
+    [-18, -220, 180, 12], [170, 182, 160, 10],
+    [170, 232, 12, 110],
+  ] as const) street(x, z, w, d);
+
+  // Высокие линии связи и освещения обозначают промзону и дальнюю окраину.
+  for (const [x, z, h] of [
+    [132, -220, 9.5], [238, -220, 9.5], [238, 220, 9.5],
+    [-228, 224, 8.5], [-228, -224, 8.5], [64, -246, 8.5],
+  ] as const) pole(x, z, h);
+
+
+  // Наполнитель районов. Ручная расстановка landmark'ов и первых двух рядов
+  // застройки не в состоянии дотянуть 900×900 до плотности «Долины» и
+  // «Промзоны» — здесь та же идея, что у addTrees ниже: детерминированная
+  // джиттер-сетка с отсевом по существующим блокам, спавнам и границе карты,
+  // а не координаты по одной. Даёт третий-четвёртый ряд застройки без ручного
+  // подбора сотен цифр и без риска перекрыть уже проверенные маршруты —
+  // связность всё равно проверяется npm run check:map после сборки.
+  const filler = (zone: {
+    x0: number; x1: number; z0: number; z1: number;
+    spacing: number; keep: number; seed: number;
+    wMin: number; wMax: number; dMin: number; dMax: number;
+    hMin: number; hMax: number; lowChance: number;
+  }) => {
+    const { x0, x1, z0, z1, spacing, keep, seed, wMin, wMax, dMin, dMax, hMin, hMax, lowChance } = zone;
+    const cols = Math.max(1, Math.round((x1 - x0) / spacing));
+    const rows = Math.max(1, Math.round((z1 - z0) / spacing));
+    for (let ix = 0; ix <= cols; ix++) {
+      for (let iz = 0; iz <= rows; iz++) {
+        const hash = Math.abs((ix * 92821 + iz * 68917 + seed * 31337) % 1000);
+        if (hash / 1000 > keep) continue;
+        const jitter = spacing * 0.3;
+        const cx = x0 + ix * spacing + (((hash % 13) - 6) / 6) * jitter;
+        const cz = z0 + iz * spacing + (((Math.floor(hash / 13) % 13) - 6) / 6) * jitter;
+        const w = wMin + (wMax - wMin) * ((hash % 100) / 100);
+        const d = dMin + (dMax - dMin) * ((Math.floor(hash / 7) % 100) / 100);
+        const isLow = (Math.floor(hash / 3) % 1000) / 1000 < lowChance;
+        let h = isLow ? LOW : hMin + (hMax - hMin) * ((Math.floor(hash / 11) % 100) / 100);
+        // Не оставляем высоту в двусмысленной полосе вокруг SHELL_HEIGHT —
+        // тот же порог, что проверяет npm run check:map.
+        if (!isLow && h < SHELL_HEIGHT + 0.3) h = SHELL_HEIGHT + 0.3;
+
+        const rx = cx * FRONTIER_SCALE;
+        const rz = cz * FRONTIER_SCALE;
+        const hw = (w / 2) * FRONTIER_SCALE;
+        const hd = (d / 2) * FRONTIER_SCALE;
+        if (Math.abs(rx) + hw > ROYALE_HALF - 12 || Math.abs(rz) + hd > ROYALE_HALF - 12) continue;
+        if (ROYALE_SPAWNS.some(([sx, sz]) => Math.hypot(rx - sx, rz - sz) < 18)) continue;
+        const margin = 5;
+        const collides = boxes.some((b) => {
+          const bw = b.w / 2;
+          const bd = b.d / 2;
+          return Math.abs(rx - b.x) < hw + bw + margin && Math.abs(rz - b.z) < hd + bd + margin;
+        });
+        if (collides) continue;
+
+        add(cx, cz, w, d, h);
+      }
+    }
+  };
+
+  // Северо-запад: третий ряд между жилыми кварталами — сарайчики и заборы,
+  // не превращающие район в сплошную стену.
+  filler({
+    x0: -232, x1: -88, z0: 50, z1: 254,
+    spacing: 9, keep: 0.85, seed: 1,
+    wMin: 6, wMax: 10, dMin: 6, dMax: 10, hMin: 2.8, hMax: 3.8, lowChance: 0.2,
+  });
+  // Юго-запад: тот же приём, но пониже и пореже — приусадебные постройки,
+  // а не вторая волна домов.
+  filler({
+    x0: -232, x1: -88, z0: -254, z1: -50,
+    spacing: 9, keep: 0.8, seed: 2,
+    wMin: 5, wMax: 9, dMin: 5, dMax: 9, hMin: 2.4, hMax: 3.4, lowChance: 0.3,
+  });
+  // Промзона: контейнеры и мелкие пристройки между цехами.
+  filler({
+    x0: 92, x1: 232, z0: -162, z1: 162,
+    spacing: 9, keep: 0.85, seed: 3,
+    wMin: 7, wMax: 13, dMin: 5, dMax: 9, hMin: 2.6, hMax: 4.4, lowChance: 0.35,
+  });
+  // Зелёная зона: в основном низкие карманы кустов и оград — просека остаётся
+  // просекой, а не превращается в квартал.
+  filler({
+    x0: 64, x1: 248, z0: 104, z1: 284,
+    spacing: 10, keep: 0.75, seed: 4,
+    wMin: 5, wMax: 8, dMin: 5, dMax: 8, hMin: 2.4, hMax: 3.2, lowChance: 0.55,
+  });
+  // Южная окраина: та же переходная полоса, что и в ручной застройке выше —
+  // здесь наполнение нарочно реже, это коридор между районами, а не пятый район.
+  filler({
+    x0: -46, x1: 76, z0: -252, z1: -104,
+    spacing: 14, keep: 0.5, seed: 5,
+    wMin: 5, wMax: 8, dMin: 5, dMax: 8, hMin: 2.4, hMax: 3.4, lowChance: 0.4,
+  });
+  // Дальняя окраина у стены: полоса вдоль периметра почти не застроена ручной
+  // версией карты — без неё старт матча (широкий безопасный круг) проходит
+  // по голому полю. Плотность низкая и объекты по большей части низкие: это
+  // не пятый район, а первое, что видно после высадки.
+  for (const [x0, x1, z0, z1, seed] of [
+    [-270, 270, 226, 268, 6],
+    [-270, 270, -268, -226, 7],
+    [226, 268, -220, 220, 8],
+    [-268, -226, -220, 220, 9],
+  ] as const) {
+    filler({
+      x0, x1, z0, z1,
+      spacing: 20, keep: 0.35, seed,
+      wMin: 5, wMax: 8, dMin: 5, dMax: 8, hMin: 2.2, hMax: 3, lowChance: 0.6,
+    });
+  }
+
+  // Мелкий мусор — второй проход тем же генератором, но с объектами вдвое
+  // мельче и сеткой вдвое чаще: ящики, пни, обломки между уже расставленными
+  // домами. Крупная застройка выше не может стоять чаще без риска лабиринта,
+  // а этот слой как раз занимает то, что между ней осталось пустым —
+  // добавляет заметно больше объектов на глаз, почти не трогая проезды.
+  for (const [x0, x1, z0, z1, seed] of [
+    [-232, -88, 50, 254, 10],
+    [-232, -88, -254, -50, 11],
+    [92, 232, -162, 162, 12],
+    [64, 248, 104, 284, 13],
+    [-46, 76, -252, -104, 14],
+    [-90, 90, -90, 90, 15],
+  ] as const) {
+    filler({
+      x0, x1, z0, z1,
+      spacing: 7, keep: 0.7, seed,
+      wMin: 2.4, wMax: 4.2, dMin: 2.4, dMax: 4.2, hMin: 2.2, hMax: 3, lowChance: 0.5,
+    });
+  }
+
+  // Физический слой новых объектов добавляется после всей застройки, чтобы
+  // они не оказались внутри домов и складов. Низкие предметы блокируют корпус
+  // танка, но не становятся невидимой стеной для снарядов.
+  barrels(104, -58, 3);
+  barrels(206, 116, 2);
+  barrels(-112, 108, 3);
+  barrels(82, 206, 2);
+  pipes(128, -208, true, 18);
+  pipes(208, 168, false, 16);
+  pipes(-206, 94, true, 15);
+  wreck(-108, -42, true);
+  wreck(112, 72, false);
+  wreck(-208, 48, true);
+  wreck(62, -208, false);
+
+  return boxes;
+}
+
+interface TreeKind {
+  w: number;
+  d: number;
+  h: number;
+}
+
+const TREE_KINDS: TreeKind[] = [
+  { w: 2.8, d: 2.8, h: 3.8 },
+  { w: 3.6, d: 3.2, h: 5.4 },
+  { w: 4.8, d: 4.4, h: 7.2 },
+  { w: 5.8, d: 5.2, h: 9.4 },
+];
+
+/**
+ * Деревья — настоящие прямоугольные препятствия: ствол нельзя проехать насквозь,
+ * а крона держит снаряд. Расстановка общая для всех карт, но размер и плотность
+ * зависят от масштаба карты. Кандидаты отбрасываются возле зданий, дорог,
+ * спавнов и других деревьев, поэтому декоративная идея не режет старые маршруты.
+ */
+function addTrees(
+  base: Box[],
+  spawns: Array<[number, number]>,
+  half: number,
+  mapId: number,
+): Box[] {
+  const target = half >= 400 ? 42 : half >= 120 ? 22 : mapId === 2 ? 5 : 8;
+  const step = half >= 400 ? 52 : half >= 120 ? 24 : 19;
+  const margin = half >= 400 ? 1.6 : 1.2;
+  const candidates: Array<{ x: number; z: number; rank: number; kind: TreeKind }> = [];
+  const cells = Math.ceil((half * 2 - 18) / step);
+
+  for (let ix = 0; ix < cells; ix++) {
+    for (let iz = 0; iz < cells; iz++) {
+      const hash = Math.abs((ix * 92821 + iz * 68917 + mapId * 31337) % 1000);
+      // Не ставим деревья равномерной решёткой: небольшая выборка оставляет
+      // читаемые поля и создаёт естественные группы разной плотности.
+      if (hash % 5 > 2) continue;
+      const jitterX = ((hash % 17) - 8) * step * 0.018;
+      const jitterZ = (((Math.floor(hash / 17) % 17) - 8) * step * 0.018);
+      const x = -half + 9 + ix * step + step * 0.5 + jitterX;
+      const z = -half + 9 + iz * step + step * 0.5 + jitterZ;
+      const kind = TREE_KINDS[(hash + ix + iz * 3) % TREE_KINDS.length];
+      candidates.push({ x, z, rank: hash, kind });
+    }
+  }
+  candidates.sort((a, b) => a.rank - b.rank);
+
+  const overlaps = (a: Box, b: Box, extra: number) =>
+    Math.abs(a.x - b.x) < (a.w + b.w) / 2 + extra &&
+    Math.abs(a.z - b.z) < (a.d + b.d) / 2 + extra;
+  const nearSpawn = (tree: Box) =>
+    spawns.some(([x, z]) => Math.hypot(tree.x - x, tree.z - z) < 12);
+
+  let added = 0;
+  for (const candidate of candidates) {
+    if (added >= target) break;
+    const tree: Box = { ...candidate.kind, x: candidate.x, z: candidate.z, solid: true, style: 'tree' };
+    if (
+      Math.abs(tree.x) + tree.w / 2 > half - 4 ||
+      Math.abs(tree.z) + tree.d / 2 > half - 4 ||
+      nearSpawn(tree) ||
+      base.some((box) => overlaps(tree, box, margin))
+    ) continue;
+    base.push(tree);
+    added++;
+  }
+
+  return base;
+}
+
+function mapWithTrees(
+  mapId: number,
+  build: () => Box[],
+  spawns: Array<[number, number]>,
+  half: number,
+): () => Box[] {
+  return () => addTrees(build(), spawns, half, mapId);
+}
+
+/**
+ * «Мегаполис»: тот же охват, что у «Рубежа» (900×900), но не разбит на
+ * районы — сплошная сетка кварталов 12×12 с 12-метровыми улицами, без
+ * единого просвета крупнее квартала. Не вариация «Города» на большом холсте
+ * руками — цифрами там пришлось бы расставлять тысячи блоков, здесь тот же
+ * приём, что и в buildCity, просто развёрнутый на домен вчетверо больше
+ * стороны. Каждый шестой ряд и столбец — широкий проспект (целая полоса
+ * кварталов снесена), иначе доехать по прямой через весь город было бы
+ * нереально долго. Связность гарантирована самой сеткой, а не проверкой
+ * постфактум: улица есть между любыми двумя соседними кварталами всегда.
+ */
+const MEGA_HALF = ROYALE_HALF;
+const MEGA_BLOCK = 12;
+const MEGA_STREET = 12;
+const MEGA_SPACING = MEGA_BLOCK + MEGA_STREET;
+const MEGA_BOULEVARD_EVERY = 6;
+const MEGA_PLAZA_RADIUS = 1;
+
+/** Сетка кварталов — общие координаты для застройки и для точек спавна. */
+function megaGrid(): { centers: number[]; mid: number; isBoulevard: (i: number) => boolean } {
+  const margin = MEGA_HALF - MEGA_SPACING * 0.5;
+  let count = Math.floor((margin * 2) / MEGA_SPACING);
+  if (count % 2 === 0) count -= 1; // нечётное число кварталов — один стоит точно в центре
+  const mid = (count - 1) / 2;
+  const centers = Array.from({ length: count }, (_, i) => (i - mid) * MEGA_SPACING);
+  const isBoulevard = (i: number) => Math.abs(i - mid) % MEGA_BOULEVARD_EVERY === 0;
+  return { centers, mid, isBoulevard };
+}
+
+function buildMegapolis(): Box[] {
+  const boxes: Box[] = [];
+  const { centers, mid, isBoulevard } = megaGrid();
+  for (let ix = 0; ix < centers.length; ix++) {
+    for (let iz = 0; iz < centers.length; iz++) {
+      // Площадь в центре — единственный настоящий просвет на всю карту.
+      if (Math.abs(ix - mid) <= MEGA_PLAZA_RADIUS && Math.abs(iz - mid) <= MEGA_PLAZA_RADIUS) continue;
+      // Широкий проспект: вся полоса кварталов снесена, а не прорежена.
+      if (isBoulevard(ix) || isBoulevard(iz)) continue;
+      const h = 3 + ((Math.abs(ix - mid) + Math.abs(iz - mid)) % 5);
+      boxes.push({ x: centers[ix], z: centers[iz], w: MEGA_BLOCK, d: MEGA_BLOCK, h });
+    }
+  }
+  return boxes;
+}
+
+/**
+ * Спавны — пересечения проспектов через один: они гарантированно открыты по
+ * построению (проспект — снесённая полоса), и не жмутся кучей у одной точки.
+ */
+const MEGA_SPAWNS: Array<[number, number]> = (() => {
+  const { centers, mid, isBoulevard } = megaGrid();
+  const boulevardIdx = centers.map((_, i) => i).filter((i) => isBoulevard(i));
+  const pts: Array<[number, number]> = [];
+  for (let a = 0; a < boulevardIdx.length; a += 1) {
+    for (let b = 0; b < boulevardIdx.length; b += 1) {
+      const ix = boulevardIdx[a];
+      const iz = boulevardIdx[b];
+      if (ix === mid && iz === mid) continue; // сама площадь — не точка спавна
+      pts.push([centers[ix], centers[iz]]);
+    }
+  }
+  return pts;
+})();
+
 export const MAPS: MapDef[] = [
-  { name: 'Кремль', build: buildKremlin, spawns: ring(MAP_HALF - 10) },
-  { name: 'Форт', build: buildFort, spawns: perimeter(60) },
-  { name: 'Город', build: buildCity, spawns: perimeter(62) },
-  { name: 'Овраг', build: buildRavine, spawns: RAVINE_SPAWNS },
-  { name: 'Окопы', build: buildTrenches, spawns: TRENCH_SPAWNS },
-  { name: 'Автопарк', build: buildDepot, spawns: perimeter(63) },
-  { name: 'Дюны', build: buildDunes, spawns: ring(MAP_HALF - 8) },
+  { name: 'Кремль', build: mapWithTrees(0, buildKremlin, ring(MAP_HALF - 10), MAP_HALF), spawns: ring(MAP_HALF - 10) },
+  { name: 'Форт', build: mapWithTrees(1, buildFort, perimeter(60), MAP_HALF), spawns: perimeter(60) },
+  { name: 'Город', build: mapWithTrees(2, buildCity, perimeter(62), MAP_HALF), spawns: perimeter(62) },
+  { name: 'Овраг', build: mapWithTrees(3, buildRavine, RAVINE_SPAWNS, MAP_HALF), spawns: RAVINE_SPAWNS },
+  { name: 'Окопы', build: mapWithTrees(4, buildTrenches, TRENCH_SPAWNS, MAP_HALF), spawns: TRENCH_SPAWNS },
+  { name: 'Автопарк', build: mapWithTrees(5, buildDepot, perimeter(63), MAP_HALF), spawns: perimeter(63) },
+  { name: 'Дюны', build: mapWithTrees(6, buildDunes, ring(MAP_HALF - 8), MAP_HALF), spawns: ring(MAP_HALF - 8) },
   {
     name: 'Холмы',
-    build: buildHills,
+    build: mapWithTrees(7, buildHills, ring(MAP_HALF - 8), MAP_HALF),
     spawns: ring(MAP_HALF - 8),
   },
   {
     name: 'Долина',
-    build: buildValley,
+    build: mapWithTrees(8, buildValley, VALLEY_SPAWNS, BIG_HALF),
     spawns: VALLEY_SPAWNS,
     half: BIG_HALF,
   },
   {
     name: 'Промзона',
-    build: buildWorks,
+    build: mapWithTrees(9, buildWorks, WORKS_SPAWNS, BIG_HALF),
     spawns: WORKS_SPAWNS,
     half: BIG_HALF,
+  },
+  {
+    name: 'Рубеж',
+    build: mapWithTrees(10, buildFrontier, ROYALE_SPAWNS, ROYALE_HALF),
+    spawns: ROYALE_SPAWNS,
+    half: ROYALE_HALF,
+  },
+  {
+    name: 'Мегаполис',
+    build: mapWithTrees(11, buildMegapolis, MEGA_SPAWNS, MEGA_HALF),
+    spawns: MEGA_SPAWNS,
+    half: MEGA_HALF,
   },
 ];
 
 export const MAP_NAMES = MAPS.map((m) => m.name);
 export const MAP_COUNT = MAPS.length;
+/**
+ * Индекс «Рубежа» — карты королевской битвы. Ищем по имени, а не берём
+ * последний элемент MAPS: список карт растёт, и «последняя карта» рано или
+ * поздно перестанет быть «Рубежом» (ровно это и произошло при добавлении
+ * следующей огромной карты).
+ */
+export const ROYALE_MAP_ID = MAP_NAMES.indexOf('Рубеж');
 
 export function isMapId(v: unknown): v is number {
   return typeof v === 'number' && Number.isInteger(v) && v >= 0 && v < MAP_COUNT;
@@ -569,7 +1292,7 @@ export function spawnPoint(index: number, id = 0): { x: number; z: number; angle
  * каждом свипе было бы самой дорогой строчкой сервера.
  */
 export function coverBoxes(obstacles: Box[]): Box[] {
-  return obstacles.filter((box) => box.h >= SHELL_HEIGHT);
+  return obstacles.filter((box) => box.solid !== false && box.h >= SHELL_HEIGHT);
 }
 
 /**
@@ -582,7 +1305,7 @@ const BUSH_MIN_SIZE = 6;
 
 /** Единый критерий куста для физики, ботов и клиентского рендера. */
 export function isBush(box: Box): boolean {
-  return box.h < SHELL_HEIGHT && box.w >= BUSH_MIN_SIZE && box.d >= BUSH_MIN_SIZE;
+  return box.solid !== false && box.h < SHELL_HEIGHT && box.w >= BUSH_MIN_SIZE && box.d >= BUSH_MIN_SIZE;
 }
 
 /** Кусты карты — низкие блоки, в которые танк способен заехать целиком и спрятаться. */
@@ -592,7 +1315,7 @@ export function bushBoxes(obstacles: Box[]): Box[] {
 
 /** Тот же список препятствий, но без кустов — по нему едет танк: кусты не мешают. */
 export function passableObstacles(obstacles: Box[]): Box[] {
-  return obstacles.filter((box) => !isBush(box));
+  return obstacles.filter((box) => box.solid !== false && !isBush(box));
 }
 
 /**

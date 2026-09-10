@@ -5,7 +5,7 @@
  * Запуск: npm run check:map
  */
 import { SHELL_HEIGHT, TANK_RADIUS } from '../src/shared/constants.js';
-import { coverBoxes, MAPS, mapHalf, spawnCount, spawnPoint } from '../src/shared/map.js';
+import { coverBoxes, MAPS, mapHalf, passableObstacles, spawnCount, spawnPoint } from '../src/shared/map.js';
 import type { Box } from '../src/shared/types.js';
 
 /** Запас поверх радиуса танка: впритык он заезжает, но выехать уже не может. */
@@ -88,9 +88,12 @@ function reachability(
 
 for (let id = 0; id < MAPS.length; id++) {
   const boxes = MAPS[id].build();
+  // Крыши, козырьки и поднятые ворота enterable-объектов находятся над землёй
+  // и не должны превращаться в невидимые стены этой проверки.
+  const physicsBoxes = boxes.filter((box) => box.solid !== false);
   const count = spawnCount(id);
   const half = mapHalf(id);
-  const low = boxes.length - coverBoxes(boxes).length;
+  const low = physicsBoxes.length - coverBoxes(physicsBoxes).length;
   console.log(
     `\n=== ${MAPS[id].name} (${half * 2}×${half * 2}, ${boxes.length} блоков, ` +
       `из них низких ${low}, ${count} спавнов) ===`,
@@ -98,7 +101,7 @@ for (let id = 0; id < MAPS.length; id++) {
 
   // Блок ровно на высоте полёта — это не низкое укрытие и не стена, а лотерея
   // из погрешности: снаряд то проходит, то нет. Требуем внятного зазора.
-  const ambiguous = boxes.filter((b) => Math.abs(b.h - SHELL_HEIGHT) < 0.3);
+  const ambiguous = physicsBoxes.filter((b) => Math.abs(b.h - SHELL_HEIGHT) < 0.3);
   if (ambiguous.length > 0) {
     bad++;
     console.log(`  ${ambiguous.length} блоков стоят на самой высоте полёта — ДВУСМЫСЛЕННО`);
@@ -106,7 +109,7 @@ for (let id = 0; id < MAPS.length; id++) {
 
   // Блок за стеной — это не укрытие, а кусок геометрии, до которого не доехать
   // и в который снаряд не попадёт: свип гасит его о стену раньше.
-  const outside = boxes.filter(
+  const outside = physicsBoxes.filter(
     (b) => Math.abs(b.x) + b.w / 2 > half || Math.abs(b.z) + b.d / 2 > half,
   );
   if (outside.length > 0) {
@@ -117,7 +120,7 @@ for (let id = 0; id < MAPS.length; id++) {
   let worst = Infinity;
   for (let i = 0; i < count; i++) {
     const spawn = spawnPoint(i, id);
-    const toBox = gap(spawn.x, spawn.z, boxes);
+    const toBox = gap(spawn.x, spawn.z, physicsBoxes);
     const toWall = half - Math.max(Math.abs(spawn.x), Math.abs(spawn.z));
     const ok = toBox >= CLEARANCE && toWall >= CLEARANCE;
     if (!ok) {
@@ -131,7 +134,7 @@ for (let id = 0; id < MAPS.length; id++) {
   }
   console.log(`  спавны: минимальный зазор ${worst.toFixed(2)} м (нужно ${CLEARANCE.toFixed(1)})`);
 
-  const { free, reached } = reachability(boxes, spawnPoint(0, id), half);
+  const { free, reached } = reachability(passableObstacles(physicsBoxes), spawnPoint(0, id), half);
   const share = (reached / free) * 100;
   if (reached !== free) bad++;
   console.log(
