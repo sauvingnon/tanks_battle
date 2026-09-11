@@ -196,6 +196,12 @@ export interface BotBrain {
   patrolZ: number;
   /** Тик, на котором пора выбрать новую точку патруля. */
   patrolAt: number;
+  /** В BR часть ботов играет от засады, а не от постоянного патруля. */
+  ambusher: boolean;
+  /** Выбранный куст и срок, до которого засадник держит позицию. */
+  ambushX: number;
+  ambushZ: number;
+  ambushUntil: number;
   /**
    * Видел ли цель прямо сейчас (итог think() за последний тик). Читает только
    * room.ts при попадании: если бот уже реально дерётся, случайный обстрел
@@ -230,6 +236,12 @@ export function createBrain(tier: number, tick: number, index: number): BotBrain
     patrolX: 0,
     patrolZ: 0,
     patrolAt: tick,
+    // Каждый пятый слот — засадник. Выбор по индексу, а не бросок кубика,
+    // гарантирует смесь ролей в каждом матче, включая тестовые 40 танков.
+    ambusher: index % 5 === 0,
+    ambushX: 0,
+    ambushZ: 0,
+    ambushUntil: tick,
     engaged: false,
   };
 }
@@ -372,6 +384,13 @@ export interface BotPolicy {
   retreatTo(self: BotSelf, world: BotWorld): { x: number; z: number } | null;
   /** Куда стягиваться, когда своей цели нет вовсе; null — как раньше, случайный патруль. */
   regroupPoint(self: BotSelf, world: BotWorld): { x: number; z: number } | null;
+  /**
+   * Долгая позиция засадника, когда контакта нет. Обычному боту возвращает
+   * null — тот продолжает случайный патруль.
+   */
+  ambushPoint(self: BotSelf, world: BotWorld): { x: number; z: number } | null;
+  /** Засадник в позиции ждёт, пока цель не подойдёт достаточно близко. */
+  holdAmbush(self: BotSelf, candidate: BotTarget, dist: number, world: BotWorld): boolean;
 }
 
 /**
@@ -404,6 +423,8 @@ export function think(self: BotSelf, world: BotWorld, policy?: BotPolicy): Input
       if (hidePoint) return hide(self, world, hidePoint.x, hidePoint.z);
     }
     if (world.tick < brain.searchUntil) return search(self, world, brain.lastX, brain.lastZ);
+    const ambush = policy?.ambushPoint(self, world);
+    if (ambush) return hide(self, world, ambush.x, ambush.z);
     const regroup = policy?.regroupPoint(self, world);
     if (regroup) return search(self, world, regroup.x, regroup.z);
     return patrol(self, world);
@@ -449,6 +470,7 @@ export function think(self: BotSelf, world: BotWorld, policy?: BotPolicy): Input
   // на прицеле, BR-политика ведёт его за корму/на фланг и запрещает ранний
   // выстрел, который выдал бы обход. Укрытие и зона ниже всё равно важнее.
   const stalk = visible && policy ? policy.stalkPoint(self, target, realDist, world) : null;
+  const ambush = visible && policy ? policy.holdAmbush(self, target, realDist, world) : false;
 
   // --- Прицел ---
   // Место цели бот освежает раз в tier.reaction и только пока видит её —
@@ -478,7 +500,7 @@ export function think(self: BotSelf, world: BotWorld, policy?: BotPolicy): Input
   const focusShot =
     (visible || brain.bank !== null) && focusAllowed(self, target, world, tier.focusers);
   const fire =
-    !stalk && clear && aimed && dist < MAX_ENGAGE && world.tick >= brain.readyAt && !self.dead && focusShot;
+    !stalk && !ambush && clear && aimed && dist < MAX_ENGAGE && world.tick >= brain.readyAt && !self.dead && focusShot;
   // Свой таймер бот держит длиннее перезарядки ровно на hesitate, поэтому комната
   // его выстрел никогда не отклонит: она готова раньше, чем он решится.
   if (fire) brain.readyAt = world.tick + Math.round((RELOAD_S + tier.hesitate) * TICK_HZ);
@@ -489,6 +511,17 @@ export function think(self: BotSelf, world: BotWorld, policy?: BotPolicy): Input
   // Отступает не вслепую, а туда, где есть смысл — например, в куст; policy
   // не задана или точки не нашла — работает старый heading() «просто назад».
   const retreatPoint = retreat ? (policy?.retreatTo(self, world) ?? null) : null;
+  // Важнее обычной орбиты: дойдя до куста, бот обязан в нём замереть. Раньше
+  // этот путь шёл через pointHeading и раненый танк бесцельно нарезал круги.
+  if (retreatPoint && zoneMove === null) {
+    const retreatMove = hide(self, world, retreatPoint.x, retreatPoint.z);
+    return { ...retreatMove, turret, fire: self.suppressed && fire };
+  }
+  // Засада не является вечным оглушением: реальный снаряд снимает её через
+  // dodge(), а попадание — через self.suppressed в политике.
+  if (ambush && zoneMove === null && dodge(self, world) === null) {
+    return { seq: 0, throttle: 0, steer: 0, turret, fire: false };
+  }
   const want =
     dodge(self, world) ??
     zoneMove ??

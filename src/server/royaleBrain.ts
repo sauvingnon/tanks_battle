@@ -34,6 +34,12 @@ const STALK_BEHIND_RANGE = 54;
 const STALK_FLANK = 18;
 /** Полуугол опасного сектора башни противника. */
 const STALK_THREAT_ARC = (75 * Math.PI) / 180;
+/** Доля BR-ботов с ролью засадника задаётся в createBrain() (каждый пятый). */
+const AMBUSH_HOLD_S = 32;
+/** С такой дистанции засада уже превращается в осмысленную первую атаку. */
+const AMBUSH_TRIGGER_RANGE = 46;
+/** Угол позиции от последнего известного противника, где прятаться уже глупо. */
+const AMBUSH_AWAY_FROM_THREAT = NEARBY_RADIUS * 0.45;
 
 /** Насколько низкое HP цели перевешивает выбор — в тех же «метрах», что и dist (см. targetScore). */
 const WEAK_WEIGHT = 40;
@@ -222,6 +228,50 @@ export class RoyalePolicy implements BotPolicy {
       }
     }
     return best;
+  }
+
+  /**
+   * Отдельная роль, а не побочный эффект малого HP: засадник выбирает куст и
+   * удерживает его, пока круг не вынудит сменить точку. Это даёт матчу тех
+   * самых тихих «крыс», а остальные боты всё ещё случайно бродят по карте.
+   */
+  ambushPoint(self: BotSelf, world: BotWorld): { x: number; z: number } | null {
+    const brain = self.brain;
+    const bushes = world.bushes;
+    if (!brain.ambusher || self.suppressed || !bushes || bushes.length === 0) return null;
+    const zone = world.zone;
+    const pointIsSafe =
+      !zone ||
+      zone.phase === 'over' ||
+      Math.hypot(brain.ambushX - zone.x, brain.ambushZ - zone.z) <= zone.r - 4;
+    if (world.tick < brain.ambushUntil && pointIsSafe) return { x: brain.ambushX, z: brain.ambushZ };
+
+    let best: { x: number; z: number } | null = null;
+    let bestScore = Infinity;
+    for (const bush of bushes) {
+      if (zone && zone.phase !== 'over' && Math.hypot(bush.x - zone.x, bush.z - zone.z) > zone.r - 4) continue;
+      // Не занимаем куст под носом у последней замеченной цели.
+      if (Math.hypot(bush.x - brain.lastX, bush.z - brain.lastZ) < AMBUSH_AWAY_FROM_THREAT) continue;
+      const distance = Math.hypot(bush.x - self.state.x, bush.z - self.state.z);
+      // Немного случайности не даёт всем засадникам набиться в один ближайший куст.
+      const score = distance + Math.random() * 28;
+      if (score < bestScore) {
+        bestScore = score;
+        best = { x: bush.x, z: bush.z };
+      }
+    }
+    if (!best) return null;
+    brain.ambushX = best.x;
+    brain.ambushZ = best.z;
+    brain.ambushUntil = world.tick + Math.round(AMBUSH_HOLD_S * TICK_HZ);
+    return best;
+  }
+
+  holdAmbush(self: BotSelf, _candidate: BotTarget, dist: number, world: BotWorld): boolean {
+    const brain = self.brain;
+    if (!brain.ambusher || self.suppressed || world.tick >= brain.ambushUntil) return false;
+    if (Math.hypot(self.state.x - brain.ambushX, self.state.z - brain.ambushZ) >= 6) return false;
+    return dist > AMBUSH_TRIGGER_RANGE;
   }
 
   regroupPoint(self: BotSelf, world: BotWorld): { x: number; z: number } | null {

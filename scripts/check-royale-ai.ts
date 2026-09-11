@@ -257,6 +257,34 @@ function withCallout(self: BotSelf, mate: BotSelf, target: Foe, extra: Partial<B
   check('без кустов отход остаётся прежним (null — решает heading)', policy.retreatTo(hurt, world) === null);
 }
 
+// --- Засада: в куст въехал — значит действительно сидит, пока не прижали ---
+{
+  const intel = new RoyaleIntel();
+  const policy = new RoyalePolicy(intel);
+  const camper = me(1, 0, 0, 0);
+  const target = foe(2, 1, 0, 80);
+  camper.brain.ambusher = true;
+  camper.brain.ambushX = 0;
+  camper.brain.ambushZ = 0;
+  camper.brain.ambushUntil = TICK_HZ * 10;
+  const world = worldOf([camper, target], { tick: 1, bushes: [bush(0, 0)], half: 200 });
+  const waiting = royaleThink(camper, world, intel, policy);
+  check('засадник в кусте не катается и не выдаёт себя далёким выстрелом', waiting.throttle === 0 && waiting.steer === 0 && !waiting.fire);
+
+  camper.suppressed = true;
+  check('обстрел снимает засадный режим', !policy.holdAmbush(camper, target, 80, world));
+}
+
+{
+  const intel = new RoyaleIntel();
+  const policy = new RoyalePolicy(intel);
+  const hurt = me(1, 0, 0, 0, CRITICAL_HP - 1);
+  const target = foe(2, 1, 0, 80);
+  const world = worldOf([hurt, target], { tick: 1, bushes: [bush(0, 0)], half: 200 });
+  const input = royaleThink(hurt, world, intel, policy);
+  check('раненый бот с уже найденной целью замирает в достигнутом кусте', input.throttle === 0 && input.steer === 0);
+}
+
 // --- Эндгейм: малый круг не отменяет ценность укрытия ---
 {
   const intel = new RoyaleIntel();
