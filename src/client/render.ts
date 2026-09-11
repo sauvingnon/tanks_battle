@@ -871,6 +871,8 @@ interface Effect {
 
 interface BushHandle {
   mesh: THREE.InstancedMesh;
+  opaqueMaterial: THREE.MeshStandardMaterial;
+  fpvMaterial: THREE.MeshStandardMaterial;
   centerX: number;
   centerZ: number;
   halfW: number;
@@ -1130,11 +1132,8 @@ export class Scene3D {
 
   /**
    * По одному InstancedMesh на куст, в том же порядке, что и bushBoxes() —
-   * см. setActiveBush: прятать нужно не листву вообще, а ровно тот куст,
-   * внутри которого сейчас камера. Полупрозрачность тут не годится: изнутри
-   * густого куста луч взгляда проходит через десяток кубиков подряд, и даже
-   * лёгкая полупрозрачность каждого в сумме всё равно даёт почти сплошную
-   * стену — работает только полное скрытие одного, самого мешающего куста.
+   * см. setActiveBush: только куст под FPV-камерой получает отдельный
+   * полупрозрачный материал, остальные остаются непрозрачными.
    */
   private bushMeshes: THREE.InstancedMesh[] = [];
   private bushHandles: BushHandle[] = [];
@@ -2313,6 +2312,14 @@ export class Scene3D {
     this.bushMeshes.push(mesh);
     this.bushHandles.push({
       mesh,
+      opaqueMaterial: material,
+      fpvMaterial: (() => {
+        const fpvMaterial = material.clone();
+        fpvMaterial.transparent = true;
+        fpvMaterial.opacity = 0.28;
+        fpvMaterial.depthWrite = false;
+        return fpvMaterial;
+      })(),
       centerX: box.x,
       centerZ: box.z,
       halfW: box.w / 2,
@@ -2328,13 +2335,21 @@ export class Scene3D {
 
   /** Снимает прошлую карту вместе с её буферами. */
   private clearWorld(): void {
+    const materials = new Set<THREE.Material>();
     for (const child of this.world.children) {
       const mesh = child as THREE.Mesh;
       mesh.geometry?.dispose();
       const material = mesh.material;
-      if (Array.isArray(material)) for (const m of material) m.dispose();
-      else material?.dispose();
+      if (Array.isArray(material)) for (const m of material) materials.add(m);
+      else if (material) materials.add(material);
     }
+    // У активного FPV-куста отдельный прозрачный материал; он может быть не
+    // назначен mesh в момент смены карты, поэтому собираем его отдельно.
+    for (const bush of this.bushHandles) {
+      materials.add(bush.opaqueMaterial);
+      materials.add(bush.fpvMaterial);
+    }
+    for (const material of materials) material.dispose();
     this.world.clear();
     this.bushMeshes = [];
     this.bushHandles = [];
@@ -2923,15 +2938,18 @@ export class Scene3D {
   /**
    * Кусты непрозрачны по умолчанию — так они читаются как заросли снаружи, в
    * третьем лице и с чужих экранов. index — тот куст (см. bushIndexAt в
-   * main.ts), внутри которого сейчас физически камера от первого лица: его
-   * целиком прячем (не притушиваем!), иначе взгляд изнутри густого куста идёт
-   * сквозь десяток кубиков подряд и лёгкая полупрозрачность каждого в сумме
-   * всё равно даёт сплошную стену. -1 — камера не в кусте, всё видно как есть.
+   * main.ts), внутри которого сейчас физически камера от первого лица: он
+   * остаётся видимым, но становится полупрозрачным. -1 — камера не в кусте,
+   * всё видно как есть.
    */
   setActiveBush(index: number): void {
     if (index === this.activeBush) return;
     this.activeBush = index;
-    for (let i = 0; i < this.bushMeshes.length; i++) this.bushMeshes[i].visible = i !== index;
+    for (let i = 0; i < this.bushMeshes.length; i++) {
+      const bush = this.bushHandles[i];
+      bush.mesh.visible = true;
+      bush.mesh.material = i === index ? bush.fpvMaterial : bush.opaqueMaterial;
+    }
   }
 
   /**
