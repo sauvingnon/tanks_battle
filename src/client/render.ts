@@ -71,7 +71,6 @@ import {
   houseWallTexture,
   scaleBoxUv,
 } from './textures.js';
-import { TOP_HEIGHT, TOP_ZOOM_SCALE, topFrustum, topParticleFov } from './topview.js';
 import {
   BOOM_GROUND,
   BOOM_HIT,
@@ -734,19 +733,6 @@ export class Scene3D {
   readonly scene = new THREE.Scene();
   readonly camera: THREE.PerspectiveCamera;
 
-  /**
-   * Камера вида сверху. Проекция именно ортографическая, а не «перспектива с
-   * большой высоты»: у края экрана танк тогда виден строго так же, как в центре,
-   * и по картинке можно судить о расстояниях — а на телефоне только по ней и судят.
-   */
-  private readonly topCamera: THREE.OrthographicCamera;
-
-  /** Через какую камеру сейчас смотрим: с неё же считаются ники и метка прицела. */
-  private active: THREE.PerspectiveCamera | THREE.OrthographicCamera;
-
-  /** Сколько метров видно вокруг танка по короткой стороне экрана. */
-  private topRadius = CAMERA_DISTANCE * TOP_ZOOM_SCALE;
-
   /** Земля, стены и блоки текущей карты: при смене карты группа собирается заново. */
   private readonly world = new THREE.Group();
   /** Граница безопасной зоны BR; сама зона не перекрывает рельеф и укрытия. */
@@ -990,13 +976,6 @@ export class Scene3D {
 
     this.camera = new THREE.PerspectiveCamera(62, 1, 0.5, 1200);
     this.camera.position.set(0, 20, -30);
-
-    // Границы кадра задаст resize; дальняя плоскость с запасом на всю высоту.
-    this.topCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 1, TOP_HEIGHT * 2);
-    // Верх экрана — север карты (-Z), право — +X. Именно этот up развернёт кадр
-    // так, чтобы движение вправо по экрану было движением в +X, а не зеркалом.
-    this.topCamera.up.set(0, 0, -1);
-    this.active = this.camera;
 
     // Небо не должно проваливаться в почти чёрный фон: при дальнем зуме оно
     // занимает заметную часть кадра и задаёт общий уровень света сцены.
@@ -1548,8 +1527,8 @@ export class Scene3D {
   private updateWeather(dt: number): void {
     if (!this.weatherPoints.visible || (this.weatherKind !== 'rain' && this.weatherKind !== 'snow')) return;
     this.weatherTime += dt;
-    const anchorX = this.active.position.x;
-    const anchorZ = this.active.position.z;
+    const anchorX = this.camera.position.x;
+    const anchorZ = this.camera.position.z;
     for (let i = 0; i < this.weatherSpeeds.length; i++) {
       const at = i * 3;
       this.weatherPositions[at + 1] -= this.weatherSpeeds[i] * dt;
@@ -2719,62 +2698,11 @@ export class Scene3D {
     this.camera.lookAt(this.cameraTarget);
   }
 
-  /**
-   * Вид сверху: камера висит прямо над танком и не поворачивается вместе с ним.
-   *
-   * Карта держится севером вверх намеренно. Разворачивать её по курсу — значит
-   * крутить весь экран на каждом повороте гусениц; читать в такой картинке, где
-   * стены и где противник, невозможно, а на телефоне это единственный источник
-   * сведений о мире: обзора вокруг себя, как в виде от третьего лица, тут нет.
-   */
-  updateTopCamera(x: number, z: number, zoom: number, dt: number): void {
-    const radius = zoom * TOP_ZOOM_SCALE;
-    if (radius !== this.topRadius) {
-      this.topRadius = radius;
-      this.applyTopFrustum();
-      this.syncParticleScale();
-    }
-
-    const drop = this.royaleDropHeight;
-    this.topCamera.position.set(x, TOP_HEIGHT + drop, z);
-    // Разворот считаем до тряски: у ортокамеры наклон не качает кадр, а сдвигает
-    // всю картинку вбок целиком, и толчок читался бы как рывок карты.
-    this.topCamera.lookAt(x, drop, z);
-    this.applyShake(dt);
-  }
-
-  /**
-   * Переключение вида. Пересобирать проходы постобработки не нужно — достаточно
-   * подсунуть RenderPass другую камеру, шейдеры при этом не перекомпилируются.
-   */
-  setTopView(on: boolean): void {
-    const next = on ? this.topCamera : this.camera;
-    if (next === this.active) return;
-    this.active = next;
-    this.renderPass.camera = next;
-    // Вернувшись к виду от третьего лица, камера не должна плавно съезжать
-    // с девяноста метров: высоту берём сразу, без догонялки.
-    this.cameraReady = false;
-    this.trauma = 0;
-    this.resize();
-  }
-
-  private applyTopFrustum(): void {
-    const { halfWidth, halfHeight } = topFrustum(this.topRadius, this.viewWidth / this.viewHeight);
-    this.topCamera.left = -halfWidth;
-    this.topCamera.right = halfWidth;
-    this.topCamera.top = halfHeight;
-    this.topCamera.bottom = -halfHeight;
-    this.topCamera.updateProjectionMatrix();
-  }
-
   /** Размер частиц: он задан в метрах, а шейдер выдаёт пиксели устройства. */
   private syncParticleScale(): void {
     const heightPx = this.viewHeight * this.renderer.getPixelRatio();
-    const fov =
-      this.active === this.camera ? this.camera.fov : topParticleFov(this.topCamera.top);
-    this.dust.setViewport(heightPx, fov);
-    this.debris.setViewport(heightPx, fov);
+    this.dust.setViewport(heightPx, this.camera.fov);
+    this.debris.setViewport(heightPx, this.camera.fov);
   }
 
   /**
@@ -2796,9 +2724,9 @@ export class Scene3D {
     const power = this.trauma * this.trauma * SHAKE_AMPLITUDE;
     // Вертикаль в виде сверху — это ось взгляда: у ортокамеры она ничего не
     // двигает, и толчок остаётся честным сдвигом карты по двум осям.
-    this.active.position.x += Math.sin(t * 1.7) * power;
-    this.active.position.y += Math.sin(t * 2.3 + 1.1) * power;
-    this.active.position.z += Math.sin(t * 1.3 + 2.7) * power;
+    this.camera.position.x += Math.sin(t * 1.7) * power;
+    this.camera.position.y += Math.sin(t * 2.3 + 1.1) * power;
+    this.camera.position.z += Math.sin(t * 1.3 + 2.7) * power;
   }
 
   /**
@@ -2806,7 +2734,7 @@ export class Scene3D {
    * null — точка за камерой, рисовать нечего.
    */
   project(x: number, y: number, z: number): { x: number; y: number } | null {
-    this.projected.set(x, y, z).project(this.active);
+    this.projected.set(x, y, z).project(this.camera);
     if (this.projected.z < -1 || this.projected.z > 1) return null;
     return {
       x: (this.projected.x * 0.5 + 0.5) * this.viewWidth,
@@ -2979,7 +2907,7 @@ export class Scene3D {
   /** Поднимает и гасит цифры урона; отработавшие убирает из DOM. */
   private updateDamageNumbers(dt: number): void {
     if (this.damageNumbers.length === 0) return;
-    this.active.updateMatrixWorld();
+    this.camera.updateMatrixWorld();
 
     for (let i = this.damageNumbers.length - 1; i >= 0; i--) {
       const dn = this.damageNumbers[i];
@@ -2996,7 +2924,7 @@ export class Scene3D {
       const y = dn.baseY + DAMAGE_NUMBER_RISE * ease;
 
       this.projected.set(dn.x + dn.driftX * t, y, dn.z);
-      this.projected.project(this.active);
+      this.projected.project(this.camera);
       if (this.projected.z < -1 || this.projected.z > 1) {
         dn.el.style.opacity = '0';
         continue;
@@ -3322,7 +3250,7 @@ export class Scene3D {
     this.dust.update(this.clock);
     this.debris.update(this.clock);
     if (this.bloomOn) this.composer.render();
-    else this.renderer.render(this.scene, this.active);
+    else this.renderer.render(this.scene, this.camera);
     this.updateLabels();
     this.updateDamageNumbers(dt);
   }
@@ -3340,7 +3268,7 @@ export class Scene3D {
    * пиксели, из-за чего текст на ходу становится мыльным и дрожит.
    */
   private updateLabels(): void {
-    this.active.updateMatrixWorld();
+    this.camera.updateMatrixWorld();
 
     for (const handle of this.tanks.values()) {
       this.projected.set(
@@ -3348,8 +3276,8 @@ export class Scene3D {
         LABEL_HEIGHT,
         handle.root.position.z,
       );
-      const distance = this.projected.distanceTo(this.active.position);
-      this.projected.project(this.active);
+      const distance = this.projected.distanceTo(this.camera.position);
+      this.projected.project(this.camera);
 
       // z вне [-1, 1] значит «за камерой или за дальней плоскостью».
       const visible =
@@ -3375,8 +3303,8 @@ export class Scene3D {
 
     for (const marker of this.contactMarkers.values()) {
       this.projected.set(marker.x, 1.25, marker.z);
-      const distance = this.projected.distanceTo(this.active.position);
-      this.projected.project(this.active);
+      const distance = this.projected.distanceTo(this.camera.position);
+      this.projected.project(this.camera);
       const visible =
         distance < LABEL_MAX_DISTANCE * 1.4 &&
         this.projected.z > -1 &&
@@ -3397,7 +3325,6 @@ export class Scene3D {
     this.viewHeight = height;
     this.camera.aspect = width / height;
     this.camera.updateProjectionMatrix();
-    this.applyTopFrustum();
     this.renderer.setSize(width, height, false);
     // Композитор тянет пиксельную плотность из рендерера сам, поэтому размер
     // ему отдаётся в тех же условных пикселях, что и рендереру.

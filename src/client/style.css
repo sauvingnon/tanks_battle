@@ -1100,41 +1100,6 @@ kbd {
   background: rgba(216, 162, 58, 0.75);
 }
 
-/* Стик наводки: живёт только в виде сверху и появляется под пальцем. */
-#aim {
-  position: absolute;
-  left: 0;
-  top: 0;
-  width: 132px;
-  height: 132px;
-  border-radius: 50%;
-  border: 1px solid rgba(255, 140, 90, 0.35);
-  background: rgba(40, 22, 18, 0.4);
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity 0.12s, border-color 0.12s;
-}
-
-/* Стик уведён достаточно далеко — башня не только доворачивается, но и бьёт. */
-#aim.is-firing {
-  border-color: rgba(255, 140, 90, 0.9);
-}
-
-#aim-knob {
-  position: absolute;
-  left: 50%;
-  top: 50%;
-  width: 54px;
-  height: 54px;
-  margin: -27px 0 0 -27px;
-  border-radius: 50%;
-  background: rgba(200, 90, 60, 0.75);
-}
-
-#aim.is-firing #aim-knob {
-  background: rgba(240, 110, 60, 0.95);
-}
-
 /* Кнопка огня — единственный элемент тач-слоя, который ловит касания. */
 #fire-button {
   position: absolute;

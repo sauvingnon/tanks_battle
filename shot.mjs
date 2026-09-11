@@ -14,8 +14,6 @@ const DRIVE = Number(process.env.SHOT_DRIVE ?? 4500);
 /** Довернуть перед выездом: a или d, мс. Иначе с иного спавна упираешься в блок. */
 const TURN = process.env.SHOT_TURN ?? '';
 const TURN_MS = Number(process.env.SHOT_TURN_MS ?? 600);
-/** Отъезд камеры колесом: на 280 метрах вид сверху иначе показывает один блок. */
-const ZOOM = Number(process.env.SHOT_ZOOM ?? 0);
 
 const browser = await chromium.launch({
   args: ['--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader'],
@@ -48,16 +46,6 @@ await page.waitForTimeout(DRIVE);
 await page.keyboard.up('w');
 await page.waitForTimeout(1200);
 await page.screenshot({ path: `${OUT}/${NAME}-chase.png` });
-
-// Вид сверху той же карты.
-await page.keyboard.press('v');
-await page.waitForTimeout(600);
-if (ZOOM) {
-  await page.mouse.move(640, 360);
-  await page.mouse.wheel(0, ZOOM);
-}
-await page.waitForTimeout(1200);
-await page.screenshot({ path: `${OUT}/${NAME}-top.png` });
 
 console.log('снимки готовы');
 await browser.close();

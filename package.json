@@ -21,7 +21,6 @@
     "check:effects": "tsx scripts/check-effects.ts",
     "check:expedition": "tsx scripts/check-expedition.ts",
     "check:team": "tsx scripts/check-team.ts",
-    "check:view": "tsx scripts/check-view.ts",
     "bench:pve": "tsx scripts/bench-pve.ts",
     "smoke": "node scripts/smoke.mjs"
   },

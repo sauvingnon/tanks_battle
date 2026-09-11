@@ -105,14 +105,7 @@ let reticleStyle: ReticleStyle = RETICLE_STYLES.some(([id]) => id === savedRetic
 crosshair.dataset.style = reticleStyle;
 
 const scene = new Scene3D(canvas, el('labels'));
-const controls = new Controls(
-  canvas,
-  el('stick'),
-  el('stick-knob'),
-  el('fire-button'),
-  el('aim'),
-  el('aim-knob'),
-);
+const controls = new Controls(canvas, el('stick'), el('stick-knob'), el('fire-button'));
 controls.attach();
 const audio = new AudioManager();
 window.addEventListener('pointerdown', () => audio.unlock(), { passive: true });
@@ -772,19 +765,18 @@ function drawSelf(dt: number, renderTime: number): void {
   const camX = camera?.x ?? state.x;
   const camZ = camera?.z ?? state.z;
 
-  if (topView) scene.updateTopCamera(camX, camZ, controls.distance, dt);
   // Камера в FPV крутится свободно и мгновенно за мышью — это глаза, а не
   // ствол. Честность с ботом не в скорости взгляда, а в том, что реально
   // стреляет ствол: он и так доворачивается с TURRET_RATE, независимо от
   // камеры (см. updateTank выше — рисуется по настоящему state.turret), и
   // выстрел раньше, чем довернётся, всё равно уйдёт мимо. Синхронизировать с
   // ним ещё и обзор было лишним — так живой человек головой не смотрит.
-  else if (fpv) scene.updateFirstPersonCamera(camX, camZ, controls.yaw, controls.pitch, dt);
+  if (fpv) scene.updateFirstPersonCamera(camX, camZ, controls.yaw, controls.pitch, dt);
   else scene.updateCamera(camX, camZ, controls.yaw, controls.pitch, dt, controls.distance);
   // Куст, внутри которого физически камера, целиком прячется — иначе взгляд
   // от первого лица упирается в стену из десятков полупрозрачных кубиков
   // подряд, а это на глаз неотличимо от сплошной (см. setActiveBush).
-  scene.setActiveBush(fpv && !topView ? bushIndexAt(bushes, camX, camZ) : -1);
+  scene.setActiveBush(fpv ? bushIndexAt(bushes, camX, camZ) : -1);
   drawAim(state.x, state.z, state.turret);
 }
 
@@ -1063,13 +1055,10 @@ const setupStances = el('setup-stances');
 const setupBonuses = el<HTMLInputElement>('setup-bonuses');
 const setupBloom = el<HTMLInputElement>('setup-bloom');
 const setupWeather = el<HTMLInputElement>('setup-weather');
-const setupTop = el<HTMLInputElement>('setup-top');
 const setupFpv = el<HTMLInputElement>('setup-fpv');
 const setupReticles = el('setup-reticles');
 const hintChase = el('hint-chase');
-const hintTopView = el('hint-top');
 const hintFpvView = el('hint-fpv');
-const aimStick = el('aim');
 const hintMap = el('hint-map');
 const hintMode = el('hint-mode');
 const hintRules = el('hint-rules');
@@ -1390,17 +1379,6 @@ setupWeather.addEventListener('change', () => {
 });
 
 /**
- * Вид сверху — тоже личная настройка, и в сеть она не уходит: сервер шлёт всем
- * одни и те же снапшоты, а во что их превращать, каждый решает сам. Поэтому в
- * одной комнате спокойно уживаются телефон с видом сверху и ПК с видом сзади.
- *
- * На тач-устройстве он стоит по умолчанию: обзор пальцем в трёх измерениях на
- * телефоне — это отдельная работа, за которую платят снятой рукой с руля.
- */
-let topView =
-  (localStorage.getItem('tanks:view') ?? (controls.isTouch ? 'top' : 'chase')) === 'top';
-
-/**
  * Вид от первого лица — от прицела башни, буквально вид игрока и бота почти
  * на равных: то же ограниченное поле зрения, тот же довод ствола (взгляд
  * идёт за реальным углом башни, см. drawSelf).
@@ -1424,20 +1402,8 @@ function fpvForced(): boolean {
 }
 
 function applyView(): void {
-  controls.setTopView(topView);
-  scene.setTopView(topView);
-  aimStick.hidden = !topView;
-  hintChase.hidden = topView || fpv;
-  hintTopView.hidden = !topView;
-  hintFpvView.hidden = topView || !fpv;
-}
-
-function setTopView(on: boolean): void {
-  if (on === topView) return;
-  topView = on;
-  localStorage.setItem('tanks:view', on ? 'top' : 'chase');
-  applyView();
-  renderSetup();
+  hintChase.hidden = fpv;
+  hintFpvView.hidden = !fpv;
 }
 
 function setFpv(on: boolean, manual: boolean): void {
@@ -1453,7 +1419,6 @@ function setFpv(on: boolean, manual: boolean): void {
   renderSetup();
 }
 
-setupTop.addEventListener('change', () => setTopView(setupTop.checked));
 setupFpv.addEventListener('change', () => setFpv(setupFpv.checked, true));
 
 function renderSetup(): void {
@@ -1492,19 +1457,14 @@ function renderSetup(): void {
   }
   hintRoyaleSize.textContent = 'Срабатывает сразу: матч перезапустится с выбранным размером отряда.';
 
-  // Три галки в панели, которые работают у всех: они не про бой.
-  setupTop.checked = topView;
+  // Галка в панели, которая работает у всех: она не про бой.
   setupFpv.checked = fpv;
-  setupFpv.disabled = topView || fpvForced();
-  hintView.textContent = topView
-    ? controls.isTouch
-      ? 'Карта под тобой, север сверху. Левый палец — ход, правый — башня; уведи его дальше от центра, и танк стреляет.'
-      : 'Карта под тобой, север сверху. Курсор наводит башню, мышь не захватывается.'
-    : fpv
-      ? fpvForced()
-        ? 'Включён правилами «Реализм» и не выключается: камера сидит у башни и доворачивается не быстрее самой башни — тем же обзором, что и у бота.'
-        : 'Камера сидит у башни и смотрит только туда, куда наводишь, — ни кругового обзора, ни вида на себя со стороны, как у бота.'
-      : 'Выключено: камера за танком. На телефоне обзор придётся крутить пальцем — тем же, которым стреляешь.';
+  setupFpv.disabled = fpvForced();
+  hintView.textContent = fpv
+    ? fpvForced()
+      ? 'Включён правилами «Реализм» и не выключается: камера сидит у башни и доворачивается не быстрее самой башни — тем же обзором, что и у бота.'
+      : 'Камера сидит у башни и смотрит только туда, куда наводишь, — ни кругового обзора, ни вида на себя со стороны, как у бота.'
+    : 'Выключено: камера за танком. На телефоне обзор придётся крутить пальцем — тем же, которым стреляешь.';
 
   setupBloom.checked = bloomOn;
   hintBloom.textContent = bloomOn
@@ -1629,7 +1589,6 @@ window.addEventListener('keydown', (event) => {
   if (event.target instanceof HTMLInputElement) return;
   if (hud.hidden) return; // до входа в бой настраивать нечего
   if (event.code === 'KeyM') toggleSetup();
-  else if (event.code === 'KeyV') setTopView(!topView);
   else if (event.code === 'KeyF') setFpv(!fpv, true);
 });
 

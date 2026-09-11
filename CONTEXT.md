@@ -17,7 +17,6 @@
 ```bash
 npm run typecheck
 npm run check:map          # геометрия карт, спавны, проходимость
-npm run check:view         # оси вида сверху
 npm run check:combat       # урон, рикошеты, таран
 npm run check:bots         # волны, настройки комнаты, ИИ
 npm run check:effects      # шейдеры частиц
