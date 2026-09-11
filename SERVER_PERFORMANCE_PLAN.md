@@ -31,17 +31,21 @@
 
 Measured result: benchmark p50 3.58 ms, p95 6.09 ms, p99 8.04 ms, max 9.50 ms after BoxGrid (before: p50 10.21 ms, p95 15.73 ms, p99 18.95 ms). Live BR: 30.27 TPS and 15.6% of one CPU core, down from 55.2%.
 
-Measured follow-up: the LOS-cache experiment was reverted. Behavior checks passed, but benchmark p50 moved from 3.58 ms to 3.31 ms and p99 from 8.04 ms to 7.90 ms; a live 15-second run measured 24.8% of one CPU core versus 15.6% for the accepted broad-phase change, below the stage criterion.
-
-Snapshot fan-out measurement (`bench:snapshots`): total p95 was 0.073/0.112/0.228/0.244 ms for 1/4/8/16 clients, with 235/940/2480/4260 bytes per fan-out. A live 16-client BR run sustained 30.27 TPS at 27.3% of one CPU core, so no snapshot code change was accepted.
-
 ### 3. Частота и кэширование AI
+
+Status: measured and rejected; the LOS-cache experiment is documented above and was reverted because it did not meet the CPU criterion.
+
+Measured result: behavior checks passed, but benchmark p50 moved from 3.58 ms to 3.31 ms and p99 from 8.04 ms to 7.90 ms; a live 15-second run measured 24.8% of one CPU core versus 15.6% for the accepted broad-phase change, below the stage criterion.
 
 Оставить физику на 30 Гц, но тактический retarget, выбор цели и поиск укрытия выполнять с ограниченной частотой (5–10 Гц). Результаты LOS для пары «бот–цель» кэшировать на короткое окно и инвалидировать при движении, выстреле, смерти или смене укрытия.
 
 Критерий: поведение BR-тестов не меняется, p99 не растёт, CPU снижается ещё минимум на 20%.
 
 ### 4. Снапшоты и сетевой fan-out
+
+Status: measured; fan-out is below the tick budget, so no code change was accepted.
+
+Measured result: `bench:snapshots` total p95 was 0.073/0.112/0.228/0.244 ms for 1/4/8/16 clients, with 235/940/2480/4260 bytes per fan-out. A live 16-client BR run sustained 30.27 TPS at 27.3% of one CPU core, so no snapshot code change was accepted.
 
 Замерить отдельно сериализацию и рассылку снапшотов при 1, 4, 8 и 16 клиентах. Убрать повторные обходы списков и вычисления видимости, не меняющиеся между клиентами.
 
