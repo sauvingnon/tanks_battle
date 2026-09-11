@@ -14,6 +14,7 @@ import {
   MAX_BOUNCES,
   RELOAD_S,
   SHELL_LIFETIME,
+  SHELL_RADIUS,
   SHELL_SPEED,
   TANK_RADIUS,
   TICK_HZ,
@@ -30,6 +31,7 @@ import {
 } from '../shared/sim.js';
 import { bushBlockers, spawnCount, spawnPoint } from '../shared/map.js';
 import { createTankState, type Box, type Input, type ShellState, type TankState } from '../shared/types.js';
+import type { BoxQuery } from './boxIndex.js';
 
 /** Что тир меняет в поведении. Характеристики самого танка одинаковы у всех. */
 export interface BotTier {
@@ -253,14 +255,20 @@ export interface BotWorld {
   tick: number;
   /** Всё, обо что можно удариться: по нему бот прокладывает объезд. */
   obstacles: Box[];
+  /** Broad-phase кандидаты для объезда; если не задан, используется полный список. */
+  obstacleIndex?: BoxQuery;
   /** Только то, что держит снаряд. Низкое укрытие бот простреливает насквозь. */
   cover: Box[];
+  /** Broad-phase кандидаты для лучей обзора. */
+  coverIndex?: BoxQuery;
   /**
    * Кусты карты — рвут луч обзора бота (см. hasShot), снаряд не держат. Только
    * для ИИ: на то, что видит на экране человек, кусты не влияют. Не заданы —
    * кустов нет.
    */
   bushes?: Box[];
+  /** Broad-phase кандидаты для кустов в луче обзора. */
+  bushIndex?: BoxQuery;
   tanks: Iterable<BotTarget>;
   /** Летящие снаряды — для уклонения (см. dodge()). Не заданы — уклонения нет. */
   shells?: Iterable<ShellState>;
@@ -396,12 +404,12 @@ export function think(self: BotSelf, world: BotWorld, policy?: BotPolicy): Input
   // подмешана нарочно — иначе на длинных коридорах бот жал бы вперёд просто
   // потому, что цель дальше tier.sight, хотя видно её прекрасно, и толпа
   // забивала бы единственные ворота на карте.
-  const shot = hasShot(me, target.state, world.cover, world.bushes, world.half);
+  const shot = hasShot(me, target.state, world.cover, world.bushes, world.half, MAX_ENGAGE, world.coverIndex, world.bushIndex);
   // Загородил именно куст, а не стена: за стеной цель прячется по праву и её
   // логично обходить искать угол, а спрятавшегося в листве нужно не обходить,
   // а решительно подъехать вплотную — вблизи куст переставит слепить (см.
   // bushBlockers), и охота вообще имеет смысл только так.
-  const bushOnly = !shot && hasShot(me, target.state, world.cover, undefined, world.half);
+  const bushOnly = !shot && hasShot(me, target.state, world.cover, undefined, world.half, MAX_ENGAGE, world.coverIndex);
   const visible =
     inSight(me, tier, target.state.x, target.state.z, realDist) &&
     shot &&
@@ -470,7 +478,7 @@ export function think(self: BotSelf, world: BotWorld, policy?: BotPolicy): Input
     zoneMove ??
     (retreatPoint ? pointHeading(self, world, retreatPoint) : null) ??
     heading(self, createTankState(trackX, trackZ), dist, tier, world, retreat, shot, bushOnly);
-  const drive = unstick(brain, me, world.tick, steerTo(me, want, world.obstacles, world.half));
+  const drive = unstick(brain, me, world.tick, steerTo(me, want, world.obstacles, world.half, world.obstacleIndex));
 
   return { seq: 0, throttle: drive.throttle, steer: drive.steer, turret, fire };
 }
@@ -500,7 +508,7 @@ function zoneHeading(self: BotSelf, world: BotWorld): number | null {
   const targetZ = zone.z + dz * scale;
   const base = Math.atan2(targetX - me.x, targetZ - me.z);
   const { vx, vz } = spread(self, world, Math.sin(base), Math.cos(base));
-  return avoid(me, Math.atan2(vx, vz), world.obstacles, world.half);
+  return avoid(me, Math.atan2(vx, vz), world.obstacles, world.half, world.obstacleIndex);
 }
 
 /** Угол на произвольную точку с тем же расталкиванием/объездом, что и zoneHeading(). */
@@ -508,12 +516,12 @@ function pointHeading(self: BotSelf, world: BotWorld, point: { x: number; z: num
   const me = self.state;
   const base = Math.atan2(point.x - me.x, point.z - me.z);
   const { vx, vz } = spread(self, world, Math.sin(base), Math.cos(base));
-  return avoid(me, Math.atan2(vx, vz), world.obstacles, world.half);
+  return avoid(me, Math.atan2(vx, vz), world.obstacles, world.half, world.obstacleIndex);
 }
 
 /** Движение к зоне, когда цели нет: сохраняет расталкивание и выход из упора. */
 function driveTo(self: BotSelf, world: BotWorld, want: number, throttle: number): Input {
-  const drive = steerTo(self.state, want, world.obstacles, world.half);
+  const drive = steerTo(self.state, want, world.obstacles, world.half, world.obstacleIndex);
   const move = unstick(self.brain, self.state, world.tick, {
     throttle: drive.throttle * throttle,
     steer: drive.steer,
@@ -579,7 +587,7 @@ function retarget(self: BotSelf, world: BotWorld, tier: BotTier, policy?: BotPol
     // гоняет каждый тик.
     if (
       !inSight(me, tier, tank.state.x, tank.state.z, d) ||
-      !hasShot(me, tank.state, world.cover, world.bushes, world.half)
+      !hasShot(me, tank.state, world.cover, world.bushes, world.half, MAX_ENGAGE, world.coverIndex, world.bushIndex)
     )
       continue;
     const score = policy ? policy.targetScore(self, tank, d, world) : d;
@@ -716,7 +724,7 @@ function heading(
   const tangent = (radial === 0 ? 1 : 0.45) * self.brain.orbit;
 
   const { vx, vz } = spread(self, world, tx * radial - tz * tangent, tz * radial + tx * tangent);
-  return avoid(me, Math.atan2(vx, vz), world.obstacles, world.half);
+  return avoid(me, Math.atan2(vx, vz), world.obstacles, world.half, world.obstacleIndex);
 }
 
 /**
@@ -765,8 +773,8 @@ function patrol(self: BotSelf, world: BotWorld): Input {
 
   const base = dodge(self, world) ?? Math.atan2(brain.patrolX - me.x, brain.patrolZ - me.z);
   const { vx, vz } = spread(self, world, Math.sin(base), Math.cos(base));
-  const want = avoid(me, Math.atan2(vx, vz), world.obstacles, world.half);
-  const drive = steerTo(me, want, world.obstacles, world.half);
+  const want = avoid(me, Math.atan2(vx, vz), world.obstacles, world.half, world.obstacleIndex);
+  const drive = steerTo(me, want, world.obstacles, world.half, world.obstacleIndex);
   // Газ убавлен, но выезд из упора идёт на полном: иначе бот так и останется в блоке.
   const move = unstick(self.brain, me, world.tick, {
     throttle: drive.throttle * 0.6,
@@ -787,8 +795,8 @@ function search(self: BotSelf, world: BotWorld, x: number, z: number): Input {
 
   const base = dodge(self, world) ?? Math.atan2(x - me.x, z - me.z);
   const { vx, vz } = spread(self, world, Math.sin(base), Math.cos(base));
-  const want = avoid(me, Math.atan2(vx, vz), world.obstacles, world.half);
-  const drive = steerTo(me, want, world.obstacles, world.half);
+  const want = avoid(me, Math.atan2(vx, vz), world.obstacles, world.half, world.obstacleIndex);
+  const drive = steerTo(me, want, world.obstacles, world.half, world.obstacleIndex);
   const move = unstick(self.brain, me, world.tick, {
     throttle: drive.throttle * 0.75,
     steer: drive.steer,
@@ -809,8 +817,8 @@ function hide(self: BotSelf, world: BotWorld, x: number, z: number): Input {
   const close = evade === null && Math.hypot(x - me.x, z - me.z) < 6;
   const base = evade ?? (close ? me.angle : Math.atan2(x - me.x, z - me.z));
   const { vx, vz } = spread(self, world, Math.sin(base), Math.cos(base));
-  const want = avoid(me, Math.atan2(vx, vz), world.obstacles, world.half);
-  const drive = steerTo(me, want, world.obstacles, world.half);
+  const want = avoid(me, Math.atan2(vx, vz), world.obstacles, world.half, world.obstacleIndex);
+  const drive = steerTo(me, want, world.obstacles, world.half, world.obstacleIndex);
   const move = unstick(self.brain, me, world.tick, {
     throttle: close ? 0 : drive.throttle * 0.75,
     steer: close ? 0 : drive.steer,
@@ -830,8 +838,8 @@ const AVOID_FAN = [0, 0.4, -0.4, 0.8, -0.8, 1.25, -1.25];
  * всего, со штрафом за отклонение от нужного курса. Прямой путь свободен —
  * никаких лишних щупов, это самый частый случай.
  */
-function avoid(me: TankState, want: number, obstacles: Box[], half?: number): number {
-  const ahead = free(me.x, me.z, want, FEELER, obstacles, half);
+function avoid(me: TankState, want: number, obstacles: Box[], half?: number, index?: BoxQuery): number {
+  const ahead = free(me.x, me.z, want, FEELER, obstacles, half, index);
   if (ahead > 0.85) return want;
 
   let bestAngle = want;
@@ -840,7 +848,7 @@ function avoid(me: TankState, want: number, obstacles: Box[], half?: number): nu
     if (offset === 0) continue;
     const angle = want + offset;
     // Отклонение штрафуем, иначе бот уезжает вбок при малейшем камешке.
-    const score = free(me.x, me.z, angle, FEELER, obstacles, half) - Math.abs(offset) * 0.2;
+    const score = free(me.x, me.z, angle, FEELER, obstacles, half, index) - Math.abs(offset) * 0.2;
     if (score > bestScore) {
       bestScore = score;
       bestAngle = angle;
@@ -860,6 +868,7 @@ function free(
   dist: number,
   obstacles: Box[],
   half?: number,
+  index?: BoxQuery,
 ): number {
   const dx = Math.sin(angle);
   const dz = Math.cos(angle);
@@ -867,7 +876,8 @@ function free(
   let worst = 1;
   for (const side of [-TANK_RADIUS * 0.9, TANK_RADIUS * 0.9]) {
     const probe = ray(x - dz * side, z + dx * side, dx * dist, dz * dist);
-    const hit = sweepShell(probe, 1, obstacles, half);
+    const candidates = index?.querySegment(probe.x, probe.z, probe.vx, probe.vz, TANK_RADIUS) ?? obstacles;
+    const hit = sweepShell(probe, 1, candidates, half);
     if (hit) worst = Math.min(worst, hit.stuck ? 0 : hit.t);
   }
   return worst;
@@ -904,6 +914,8 @@ function rayClear(
   cover: Box[],
   bushes: Box[],
   half?: number,
+  coverIndex?: BoxQuery,
+  bushIndex?: BoxQuery,
 ): boolean {
   const dx = x - me.x;
   const dz = z - me.z;
@@ -911,8 +923,11 @@ function rayClear(
   if (dist < 1e-3) return true;
   const shorten = Math.max(0, dist - pullback) / dist;
   const probe = ray(me.x, me.z, dx * shorten, dz * shorten);
-  if (sweepShell(probe, 1, cover, half) !== null) return false;
-  return bushes.length === 0 || sweepShell(probe, 1, bushes, half) === null;
+  const coverCandidates = coverIndex?.querySegment(probe.x, probe.z, probe.vx, probe.vz, SHELL_RADIUS) ?? cover;
+  if (sweepShell(probe, 1, coverCandidates, half) !== null) return false;
+  if (bushes.length === 0) return true;
+  const bushCandidates = bushIndex?.querySegment(probe.x, probe.z, probe.vx, probe.vz, SHELL_RADIUS) ?? bushes;
+  return sweepShell(probe, 1, bushBlockers(bushCandidates, me.x, me.z), half) === null;
 }
 
 /**
@@ -944,6 +959,8 @@ export function hasShot(
   bushes: Box[] = [],
   half?: number,
   maxDistance = MAX_ENGAGE,
+  coverIndex?: BoxQuery,
+  bushIndex?: BoxQuery,
 ): boolean {
   const dx = target.x - me.x;
   const dz = target.z - me.z;
@@ -951,13 +968,12 @@ export function hasShot(
   if (dist < 1e-3) return true;
   if (dist > maxDistance) return false;
 
-  const blockers = bushBlockers(bushes, me.x, me.z);
-  if (rayClear(me, target.x, target.z, TANK_RADIUS, cover, blockers, half)) return true;
+  if (rayClear(me, target.x, target.z, TANK_RADIUS, cover, bushes, half, coverIndex, bushIndex)) return true;
   const nx = (-dz / dist) * EDGE_PROBE;
   const nz = (dx / dist) * EDGE_PROBE;
   return (
-    rayClear(me, target.x + nx, target.z + nz, EDGE_PULLBACK, cover, blockers, half) ||
-    rayClear(me, target.x - nx, target.z - nz, EDGE_PULLBACK, cover, blockers, half)
+    rayClear(me, target.x + nx, target.z + nz, EDGE_PULLBACK, cover, bushes, half, coverIndex, bushIndex) ||
+    rayClear(me, target.x - nx, target.z - nz, EDGE_PULLBACK, cover, bushes, half, coverIndex, bushIndex)
   );
 }
 
@@ -1027,6 +1043,7 @@ function steerTo(
   want: number,
   obstacles: Box[],
   half?: number,
+  index?: BoxQuery,
 ): { throttle: number; steer: number } {
   const err = angleDiff(me.angle, want);
   if (Math.abs(err) > 2.2) {
@@ -1038,7 +1055,7 @@ function steerTo(
   }
 
   // Щуп берём по курсу корпуса, а не по желаемому: едет танк всё-таки туда, куда смотрит.
-  const room = free(me.x, me.z, me.angle, FEELER, obstacles, half);
+  const room = free(me.x, me.z, me.angle, FEELER, obstacles, half, index);
   const byWall = 0.4 + room * 0.6;
   const byTurn = Math.max(0.35, 1 - Math.abs(err) * 0.45);
   return {

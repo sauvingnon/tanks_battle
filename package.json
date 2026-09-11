@@ -23,6 +23,7 @@
     "check:expedition": "tsx scripts/check-expedition.ts",
     "check:team": "tsx scripts/check-team.ts",
     "bench:pve": "tsx scripts/bench-pve.ts",
+    "bench:server": "tsx scripts/bench-server.ts",
     "smoke": "node scripts/smoke.mjs"
   },
   "dependencies": {

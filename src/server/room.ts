@@ -139,6 +139,7 @@ import {
 } from './bot.js';
 import { RoyaleIntel, RoyalePolicy, royaleThink } from './royaleBrain.js';
 import { RoyaleSpawner, type RoyaleDrop } from './royaleSpawn.js';
+import { BoxGrid } from './boxIndex.js';
 
 /** Перезарядка и респавн считаются в тиках, чтобы жить в тех же часах, что и симуляция. */
 const RELOAD_TICKS = Math.round(RELOAD_S * TICK_HZ);
@@ -288,6 +289,11 @@ export class Room {
    */
   private liveObstacles: Box[] = this.moveObstacles;
   private liveCover: Box[] = this.cover;
+  private obstacleIndex = new BoxGrid(this.moveObstacles);
+  private coverIndex = new BoxGrid(this.cover);
+  private bushIndex = new BoxGrid(this.bushes);
+  private liveObstacleIndex = this.obstacleIndex;
+  private liveCoverIndex = this.coverIndex;
   readonly players = new Map<number, Player>();
 
   /** Индекс карты в MAPS. */
@@ -981,8 +987,11 @@ export class Room {
     const world: BotWorld = {
       tick: this.tick,
       obstacles: this.liveObstacles,
+      obstacleIndex: this.liveObstacleIndex,
       cover: this.liveCover,
+      coverIndex: this.liveCoverIndex,
       bushes: this.bushes,
+      bushIndex: this.bushIndex,
       tanks: this.tanks,
       shells: this.shells,
       stance: this.stance,
@@ -1111,6 +1120,8 @@ export class Room {
     this.liveObstacles = wrecks.length ? [...this.moveObstacles, ...wrecks] : this.moveObstacles;
     // WRECK_HEIGHT ≥ SHELL_HEIGHT — труп сам себе укрытие, отдельный фильтр не нужен.
     this.liveCover = wrecks.length ? [...this.cover, ...wrecks] : this.cover;
+    this.liveObstacleIndex = wrecks.length ? new BoxGrid(this.liveObstacles) : this.obstacleIndex;
+    this.liveCoverIndex = wrecks.length ? new BoxGrid(this.liveCover) : this.coverIndex;
   }
 
   /**
@@ -1587,6 +1598,11 @@ export class Room {
       this.cover = coverBoxes(this.obstacles);
       this.bushes = bushBoxes(this.obstacles);
       this.moveObstacles = passableObstacles(this.obstacles);
+      this.obstacleIndex = new BoxGrid(this.moveObstacles);
+      this.coverIndex = new BoxGrid(this.cover);
+      this.bushIndex = new BoxGrid(this.bushes);
+      this.liveObstacleIndex = this.obstacleIndex;
+      this.liveCoverIndex = this.coverIndex;
       // Геометрию клиент не строит сам — шлём её раньше рестарта, чтобы к первому
       // же снапшоту нового мира у него была правильная карта.
       this.emit({ t: 'map', id: this.mapId, half: this.half, obstacles: this.obstacles });
@@ -2157,12 +2173,12 @@ export class Room {
     const viewerBush = bushIndexAt(this.bushes, viewer.state.x, viewer.state.z);
     if (targetBush >= 0 && targetBush !== viewerBush && recentShot && distance <= ROYALE_SHOT_REVEAL_RANGE) {
       // Выстрел выдаёт куст, но здание всё ещё сохраняет укрытие.
-      return hasShot(viewer.state, target.state, this.cover, undefined, this.half, ROYALE_SHOT_REVEAL_RANGE);
+      return hasShot(viewer.state, target.state, this.cover, undefined, this.half, ROYALE_SHOT_REVEAL_RANGE, this.coverIndex);
     }
     if (recentShot && distance <= ROYALE_SHOT_REVEAL_RANGE) {
-      return hasShot(viewer.state, target.state, this.cover, this.bushes, this.half, ROYALE_SHOT_REVEAL_RANGE);
+      return hasShot(viewer.state, target.state, this.cover, this.bushes, this.half, ROYALE_SHOT_REVEAL_RANGE, this.coverIndex, this.bushIndex);
     }
-    return distance <= ROYALE_SIGHT_RANGE && hasShot(viewer.state, target.state, this.cover, this.bushes, this.half, ROYALE_SIGHT_RANGE);
+    return distance <= ROYALE_SIGHT_RANGE && hasShot(viewer.state, target.state, this.cover, this.bushes, this.half, ROYALE_SIGHT_RANGE, this.coverIndex, this.bushIndex);
   }
 
   snapshotShells(viewer?: Player): SnapshotShell[] {
