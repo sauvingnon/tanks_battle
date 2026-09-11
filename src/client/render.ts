@@ -298,8 +298,9 @@ function weatherColor(kind: WeatherKind): number {
 }
 
 /**
- * Декоративная форма препятствия. Коллизии по-прежнему считают исходный Box,
- * поэтому фаски не меняют проезды и прострелы — это только более живой силуэт.
+ * Декоративная форма препятствия. Коллизии считают физические размеры Box
+ * (collisionW/collisionD, если они заданы), поэтому фаски и крона не меняют
+ * проезды и прострелы — это только более живой силуэт.
  */
 function obstacleGeometry(box: Box, look: BoxLook): THREE.BufferGeometry {
   const shortest = Math.min(box.w, box.h, box.d);
@@ -2044,7 +2045,7 @@ export class Scene3D {
     add(batch.rocks, rockMaterial);
   }
 
-  /** Разные деревья в одном low-poly стиле; Box остаётся точной коллизией ствола. */
+  /** Разные деревья в одном low-poly стиле; collisionW/collisionD — коллизия ствола. */
   private buildTree(box: Box, batch: DecorBatch): void {
     const variant = boxVariant(box);
     const trunkHeight = Math.max(2.1, box.h * 0.52);

@@ -113,6 +113,9 @@ export const MUZZLE_OFFSET = 4.2;
  * как броневой блок, а не как низкое укрытие навылет.
  */
 export const WRECK_HEIGHT = 2.5;
+/** Физический след остова совпадает с ходовой модели, а не с радиусом живого танка. */
+export const WRECK_COLLISION_W = 3.6;
+export const WRECK_COLLISION_D = 4.4;
 
 // --- Рикошет ---
 

@@ -43,7 +43,7 @@ import {
 } from '../src/shared/constants.js';
 import { buildMap, bushBoxes, MAP_NAMES, spawnCount, spawnPoint } from '../src/shared/map.js';
 import { sweepShell } from '../src/shared/sim.js';
-import { createTankState, TEAM_BOTS, TEAM_PLAYERS, type ShellState } from '../src/shared/types.js';
+import { boxCollisionSize, createTankState, TEAM_BOTS, TEAM_PLAYERS, type ShellState } from '../src/shared/types.js';
 import { createBrain, findBankShot, think } from '../src/server/bot.js';
 import { Room, type Player } from '../src/server/room.js';
 
@@ -277,9 +277,11 @@ function duel(victim: Player, shooter: Player): void {
   check(
     'игрок перенесён на спавн новой карты',
     room.obstacles.every(
-      (box) =>
-        Math.abs(player.state.x - box.x) > box.w / 2 ||
-        Math.abs(player.state.z - box.z) > box.d / 2,
+      (box) => {
+        const size = boxCollisionSize(box);
+        return Math.abs(player.state.x - box.x) > size.w / 2 ||
+          Math.abs(player.state.z - box.z) > size.d / 2;
+      },
     ) && Number.isFinite(spot.x),
   );
 
@@ -441,7 +443,10 @@ function dropOn(room: Room, player: Player, kind: number): void {
   check('бонусы включены — ящик появился на карте', room.bonusCount > 0);
   const spot = room.bonuses[0];
   const inWall = buildMap().some(
-    (box) => Math.abs(spot.x - box.x) < box.w / 2 && Math.abs(spot.z - box.z) < box.d / 2,
+    (box) => {
+      const size = boxCollisionSize(box);
+      return Math.abs(spot.x - box.x) < size.w / 2 && Math.abs(spot.z - box.z) < size.d / 2;
+    },
   );
   check('ящик не лежит внутри препятствия', !inWall);
 

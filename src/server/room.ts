@@ -59,6 +59,8 @@
   WAVE_OVER_S,
   WAVE_SPAWN_DELAY_S,
   WRECK_HEIGHT,
+  WRECK_COLLISION_W,
+  WRECK_COLLISION_D,
   ROYALE_SQUAD_COUNT,
   ROYALE_SQUAD_SIZE,
   ROYALE_START_COUNTDOWN_S,
@@ -105,6 +107,7 @@ import {
   TEAM_ONE,
   TEAM_PLAYERS,
   TEAM_TWO,
+  boxCollisionSize,
   createTankState,
   type BonusState,
   type Boom,
@@ -755,7 +758,8 @@ export class Room {
   private royaleSpawnIsFree(x: number, z: number): boolean {
     if (Math.abs(x) > this.half - TANK_RADIUS || Math.abs(z) > this.half - TANK_RADIUS) return false;
     return this.moveObstacles.every((box) =>
-      Math.abs(x - box.x) > box.w / 2 + TANK_RADIUS && Math.abs(z - box.z) > box.d / 2 + TANK_RADIUS,
+      Math.abs(x - box.x) > boxCollisionSize(box).w / 2 + TANK_RADIUS &&
+      Math.abs(z - box.z) > boxCollisionSize(box).d / 2 + TANK_RADIUS,
     );
   }
 
@@ -1088,8 +1092,8 @@ export class Room {
    * Живая геометрия на этот тик: карта плюс остовы подбитых. Труп не убирают
    * до возрождения — в PvE это конец волны, в DM короткий таймер респауна, —
    * и всё это время он держит выстрел и перекрывает путь, как обычный блок.
-   * Квадрат TANK_RADIUS*2 — то же огрубление, которым уже пользуются объезд
-   * ботов и попадание по танку; ротацию по курсу Box не поддерживает.
+   * След остова соответствует гусеницам модели, а не кругу попадания живого
+   * танка: иначе по краю нарисованного остова выстрел останавливался в пустоте.
    */
   private refreshWrecks(): void {
     const wrecks: Box[] = [];
@@ -1098,8 +1102,8 @@ export class Room {
       wrecks.push({
         x: p.state.x,
         z: p.state.z,
-        w: TANK_RADIUS * 2,
-        d: TANK_RADIUS * 2,
+        w: WRECK_COLLISION_W,
+        d: WRECK_COLLISION_D,
         h: WRECK_HEIGHT,
       });
     }
@@ -1438,10 +1442,11 @@ export class Room {
     for (const [dx, dz] of attempts) {
       const candidate = { x: x + dx, z: z + dz };
       if (Math.abs(candidate.x) > this.half - 8 || Math.abs(candidate.z) > this.half - 8) continue;
-      if (this.obstacles.some((box) =>
-        Math.abs(candidate.x - box.x) < box.w / 2 + pad &&
-        Math.abs(candidate.z - box.z) < box.d / 2 + pad,
-      )) continue;
+      if (this.obstacles.some((box) => {
+        const size = boxCollisionSize(box);
+        return Math.abs(candidate.x - box.x) < size.w / 2 + pad &&
+          Math.abs(candidate.z - box.z) < size.d / 2 + pad;
+      })) continue;
       if (this.bonuses.some((bonus) => Math.hypot(bonus.x - candidate.x, bonus.z - candidate.z) < 22)) continue;
       return candidate;
     }
@@ -1471,7 +1476,8 @@ export class Room {
 
       let taken = false;
       for (const box of this.obstacles) {
-        if (Math.abs(x - box.x) < box.w / 2 + pad && Math.abs(z - box.z) < box.d / 2 + pad) {
+        const size = boxCollisionSize(box);
+        if (Math.abs(x - box.x) < size.w / 2 + pad && Math.abs(z - box.z) < size.d / 2 + pad) {
           taken = true;
           break;
         }

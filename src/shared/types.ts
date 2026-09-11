@@ -4,6 +4,10 @@ export interface Box {
   z: number;
   w: number; // размер по X
   d: number; // размер по Z
+  /** Размер физического основания по X; если не задан, совпадает с w. */
+  collisionW?: number;
+  /** Размер физического основания по Z; если не задан, совпадает с d. */
+  collisionD?: number;
   h: number; // высота над собственным основанием
   /** Высота основания для чисто визуальных деталей (по умолчанию 0). */
   y?: number;
@@ -21,6 +25,14 @@ export interface Box {
     | 'barrel'
     | 'pipe'
     | 'wreck';
+}
+
+/** Размеры, которыми Box участвует в физике, а не его визуальный силуэт. */
+export function boxCollisionSize(box: Box): { w: number; d: number } {
+  return {
+    w: box.collisionW ?? box.w,
+    d: box.collisionD ?? box.d,
+  };
 }
 
 /** Полное состояние танка в симуляции. */

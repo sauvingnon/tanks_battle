@@ -24,6 +24,8 @@ import {
   SHELL_SPEED,
   TANK_RADIUS,
   TICK_HZ,
+  WRECK_COLLISION_D,
+  WRECK_COLLISION_W,
 } from '../src/shared/constants.js';
 import { bounceShell, canRicochet, stepTank, sweepShell } from '../src/shared/sim.js';
 import { coverBoxes } from '../src/shared/map.js';
@@ -246,6 +248,33 @@ const noop = () => {};
 
   // Тройной шаг перелетает блок насквозь — свип обязан всё равно найти вход.
   check('свип не проскакивает сквозь тонкий блок', sweepShell(ahead(), DT * 3, obstacles) !== null);
+
+  // Визуальная крона может быть широкой, но выстрел должен держаться только
+  // за ствол — физический размер теперь явно отделён от силуэта Box.
+  const tree: Box = {
+    x: 0,
+    z: 30,
+    w: 6,
+    d: 6,
+    collisionW: 1.8,
+    collisionD: 1.8,
+    h: 9,
+  };
+  const treeShot = (x: number): ShellState => ({
+    id: 2,
+    owner: 1,
+    x,
+    z: 20,
+    vx: 0,
+    vz: SHELL_SPEED,
+    life: SHELL_LIFETIME,
+    bounces: 0,
+  });
+  check('выстрел проходит рядом с кроной дерева', sweepShell(treeShot(2.2), 0.3, [tree]) === null);
+  check('выстрел останавливается о ствол дерева', sweepShell(treeShot(0), 0.3, [tree]) !== null);
+
+  const wreck: Box = { x: 0, z: 30, w: WRECK_COLLISION_W, d: WRECK_COLLISION_D, h: 2.5 };
+  check('выстрел проходит рядом с остовом', sweepShell(treeShot(2.2), 0.3, [wreck]) === null);
 }
 
 // --- 6. Правила рикошета на чистой геометрии ---

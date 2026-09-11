@@ -6,7 +6,7 @@
  */
 import { SHELL_HEIGHT, TANK_RADIUS } from '../src/shared/constants.js';
 import { coverBoxes, MAPS, mapHalf, passableObstacles, spawnCount, spawnPoint } from '../src/shared/map.js';
-import type { Box } from '../src/shared/types.js';
+import { boxCollisionSize, type Box } from '../src/shared/types.js';
 
 /** Запас поверх радиуса танка: впритык он заезжает, но выехать уже не может. */
 const CLEARANCE = TANK_RADIUS + 0.6;
@@ -19,8 +19,9 @@ let bad = 0;
 function gap(x: number, z: number, boxes: Box[]): number {
   let nearest = Infinity;
   for (const box of boxes) {
-    const hw = box.w / 2;
-    const hd = box.d / 2;
+    const size = boxCollisionSize(box);
+    const hw = size.w / 2;
+    const hd = size.d / 2;
     const nx = Math.min(Math.max(x, box.x - hw), box.x + hw);
     const nz = Math.min(Math.max(z, box.z - hd), box.z + hd);
     nearest = Math.min(nearest, Math.hypot(x - nx, z - nz));

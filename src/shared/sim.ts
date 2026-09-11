@@ -28,7 +28,7 @@ import {
   TURN_RATE_STILL,
   TURRET_RATE,
 } from './constants.js';
-import type { Box, Input, ShellState, TankState } from './types.js';
+import { boxCollisionSize, type Box, type Input, type ShellState, type TankState } from './types.js';
 
 // Живёт в constants.ts, чтобы рельеф мог им пользоваться, не замыкая импорты
 // на симуляцию. Половина проекта берёт clamp отсюда, поэтому здесь он и остаётся.
@@ -165,8 +165,9 @@ function resolveBounds(state: TankState, half: number): number {
 function resolveObstacles(state: TankState, obstacles: Box[]): number {
   let worst = 0;
   for (const box of obstacles) {
-    const hw = box.w / 2;
-    const hd = box.d / 2;
+    const { w, d } = boxCollisionSize(box);
+    const hw = w / 2;
+    const hd = d / 2;
 
     // Ближайшая к центру танка точка прямоугольника.
     const nearestX = clamp(state.x, box.x - hw, box.x + hw);
@@ -263,8 +264,9 @@ export function sweepShell(
 
 /** Раздутый прямоугольник препятствия. */
 function sweepBox(px: number, pz: number, dx: number, dz: number, box: Box): ShellHit | null {
-  const hw = box.w / 2 + SHELL_RADIUS;
-  const hd = box.d / 2 + SHELL_RADIUS;
+  const { w, d } = boxCollisionSize(box);
+  const hw = w / 2 + SHELL_RADIUS;
+  const hd = d / 2 + SHELL_RADIUS;
 
   const sx = slab(px, dx, box.x - hw, box.x + hw);
   if (sx === null) return null;
