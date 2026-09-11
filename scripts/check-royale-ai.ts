@@ -151,8 +151,14 @@ function withCallout(self: BotSelf, mate: BotSelf, target: Foe, extra: Partial<B
   check('вышел из сектора башни цели — скрытный заход прекращается', policy.stalkPoint(hunter, watched, 78, world) === null);
 
   watched.state.turret = Math.PI;
+  hunter.suppressed = true;
+  check('после попадания бот бросает скрытный заход', policy.stalkPoint(hunter, watched, 78, world) === null);
+  hunter.suppressed = false;
+
   hunter.brain.targetId = watched.id;
-  hunter.brain.rethinkAt = 0;
+  // Цель уже замечена ранее: не бросаем здесь случайную ошибку прицела через
+  // retarget(), иначе проверка перехода «тень → огонь» зависела бы от рандома.
+  hunter.brain.rethinkAt = 100;
   hunter.brain.readyAt = 0;
   hunter.brain.aimFor = watched.id;
   hunter.brain.aimAt = 100;

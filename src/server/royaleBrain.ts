@@ -165,8 +165,12 @@ export class RoyalePolicy implements BotPolicy {
    * лобовой размен: заходим к корме по выбранной ботом стороне. Как только
    * вышли из опасного сектора или сблизились, возвращаем управление обычному
    * бою — он уже сам проверит линию огня, прицел и право фокусного огня.
-   */
+  */
   stalkPoint(self: BotSelf, candidate: BotTarget, dist: number, _world: BotWorld): { x: number; z: number } | null {
+    // Взрыв рядом или попадание означает, что нас уже раскрыли. Продолжать
+    // обход молча бессмысленно: dodge() в общем think() уведёт с траектории,
+    // а затем обычный бой сможет ответить огнём.
+    if (self.suppressed) return null;
     if (dist < STALK_MIN_RANGE || dist > STALK_MAX_RANGE) return null;
     const bearing = Math.atan2(self.state.x - candidate.state.x, self.state.z - candidate.state.z);
     if (Math.abs(angleDiff(candidate.state.turret, bearing)) > STALK_THREAT_ARC) return null;
