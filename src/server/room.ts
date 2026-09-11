@@ -149,6 +149,8 @@ const SUPPRESS_TICKS = Math.round(SUPPRESS_S * TICK_HZ);
 const HEARING_FRAC = 0.4;
 const HEARING_MIN = 25;
 const HEARING_MAX = 55;
+/** Дальность, на которой сторонний игрок видит цифры урона чужого боя. */
+const DAMAGE_EVENT_RANGE = 120;
 
 /**
  * На сколько отрезков максимум режется путь снаряда за тик. Каждый отскок начинает
@@ -210,6 +212,12 @@ export interface KillEvent {
 export interface TeamRoundResult {
   winner: number | 'draw';
   entries: { name: string; team: number; kills: number }[];
+}
+
+/** Внутреннее событие урона: id нужны только серверу для адресной рассылки. */
+interface HitEvent extends HitFx {
+  victimId: number;
+  sourceId: number;
 }
 
 /** Цвета людей и ботов не пересекаются: врага видно по корпусу, а не только по нику. */
@@ -393,7 +401,7 @@ export class Room {
   /** События одного тика: очищаются в начале update(), забираются после. */
   private booms: Boom[] = [];
   /** Сумма урона по каждому попаданию — снаряд ли, таран ли, клиент рисует цифрой. */
-  private hits: HitFx[] = [];
+  private hits: HitEvent[] = [];
   private kills: KillEvent[] = [];
 
   /** emit рассылает сообщение всем людям в комнате; в тестах его можно не давать. */
@@ -1192,7 +1200,13 @@ export class Room {
 
     // Цифра всплывает там, где сейчас стоит жертва, — не там, где снаряд взорвался
     // (у тарана взрыва вовсе нет), и одна точка годится и на выстрел, и на таран.
-    this.hits.push({ x: victim.state.x, z: victim.state.z, amount });
+    this.hits.push({
+      x: victim.state.x,
+      z: victim.state.z,
+      amount,
+      victimId: victim.id,
+      sourceId: killerId,
+    });
 
     victim.hp -= amount;
     if (victim.hp > 0) {
@@ -2026,9 +2040,29 @@ export class Room {
     return this.booms;
   }
 
-  /** Попадания этого тика — сумма урона на каждое. */
-  get hitEvents(): HitFx[] {
-    return this.hits;
+  /**
+   * Попадания этого тика для конкретного клиента. Стрелок и жертва получают
+   * свою цифру независимо от расстояния, а наблюдатель — только рядом с боем.
+   * В BR дополнительно проверяем видимость цели, чтобы событие не раскрывало
+   * скрытого противника через один лишь урон в снапшоте.
+   */
+  snapshotHits(viewer: Player): HitFx[] {
+    const rangeSq = DAMAGE_EVENT_RANGE * DAMAGE_EVENT_RANGE;
+    const result: HitFx[] = [];
+    for (const hit of this.hits) {
+      const participant = hit.victimId === viewer.id || hit.sourceId === viewer.id;
+      if (!participant) {
+        const dx = hit.x - viewer.state.x;
+        const dz = hit.z - viewer.state.z;
+        if (dx * dx + dz * dz > rangeSq) continue;
+        if (this.mode === MODE_ROYALE) {
+          const victim = this.players.get(hit.victimId);
+          if (victim && !this.royaleVisible(viewer, victim)) continue;
+        }
+      }
+      result.push({ x: hit.x, z: hit.z, amount: hit.amount });
+    }
+    return result;
   }
 
   /** Забирает накопленные фраги: вызывать раз за тик после update(). */

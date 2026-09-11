@@ -290,7 +290,8 @@ setInterval(() => {
     };
     if (room.shellCount > 0) payload.shells = room.snapshotShells(player);
     if (room.boomEvents.length > 0) payload.booms = room.boomEvents;
-    if (room.hitEvents.length > 0) payload.hits = room.hitEvents;
+    const hits = room.snapshotHits(player);
+    if (hits.length > 0) payload.hits = hits;
     if (room.bonusCount > 0) payload.bonuses = room.snapshotBonuses();
     if (zone) payload.zone = zone;
     if (room.mode === MODE_ROYALE) payload.contacts = room.snapshotContacts(player);

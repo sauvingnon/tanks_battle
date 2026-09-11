@@ -112,6 +112,13 @@ const OBSTACLE_BEVEL_SEGMENTS = 1;
 const LEAF_CUBE = 1.55; // м, шаг посадки листовых комков
 const BUSH_LAYERS = 3;
 const LEAF_PALETTE = LEAF_COLORS.map((c) => new THREE.Color(c));
+/** Радиус визуального толчка листвы вокруг корпуса танка. */
+const BUSH_PUSH_RADIUS = 4.8;
+/** Максимальный сдвиг отдельного комка от корпуса, м. */
+const BUSH_PUSH_DISTANCE = 1.35;
+/** Куст быстро расходится от танка, но заметно мягче собирается обратно. */
+const BUSH_PUSH_RESPONSE = 14;
+const BUSH_RETURN_RESPONSE = 4.5;
 
 /** Визуальные профили не меняют физику куста — только его силуэт. */
 const BUSH_PROFILES = [
@@ -780,6 +787,21 @@ interface Effect {
   alpha: number;
 }
 
+interface BushHandle {
+  mesh: THREE.InstancedMesh;
+  centerX: number;
+  centerZ: number;
+  halfW: number;
+  halfD: number;
+  /** Исходные матрицы нужны, чтобы анимация не накапливала погрешность. */
+  baseMatrices: THREE.Matrix4[];
+  baseX: Float32Array;
+  baseZ: Float32Array;
+  offsetX: Float32Array;
+  offsetZ: Float32Array;
+  displaced: boolean;
+}
+
 export class Scene3D {
   readonly scene = new THREE.Scene();
   readonly camera: THREE.PerspectiveCamera;
@@ -1029,6 +1051,7 @@ export class Scene3D {
    * стену — работает только полное скрытие одного, самого мешающего куста.
    */
   private bushMeshes: THREE.InstancedMesh[] = [];
+  private bushHandles: BushHandle[] = [];
   private activeBush = -1;
 
   /** Всплывающие цифры урона — DOM-элементы поверх сцены, как и ники. */
@@ -1038,6 +1061,8 @@ export class Scene3D {
   private readonly muzzlePoint = new THREE.Vector3();
   /** Общая болванка матрицы: ей расставляем звенья без аллокаций каждый кадр. */
   private readonly trackLinkDummy = new THREE.Object3D();
+  /** Переиспользуемая матрица для движения отдельных комков кустов. */
+  private readonly bushMatrix = new THREE.Matrix4();
 
   constructor(
     private readonly canvas: HTMLCanvasElement,
@@ -2149,9 +2174,15 @@ export class Scene3D {
     const stepY = profile.height / BUSH_LAYERS;
 
     const mesh = new THREE.InstancedMesh(geometry, material, cols * rows * BUSH_LAYERS);
+    mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     mesh.castShadow = true;
     mesh.receiveShadow = true;
     const dummy = new THREE.Object3D();
+    const baseMatrices: THREE.Matrix4[] = [];
+    const baseX = new Float32Array(mesh.count);
+    const baseZ = new Float32Array(mesh.count);
+    const offsetX = new Float32Array(mesh.count);
+    const offsetZ = new Float32Array(mesh.count);
     let i = 0;
     for (let layer = 0; layer < BUSH_LAYERS; layer++) {
       for (let cx = 0; cx < cols; cx++) {
@@ -2183,11 +2214,17 @@ export class Scene3D {
           );
           dummy.updateMatrix();
           mesh.setMatrixAt(i, dummy.matrix);
+          baseMatrices.push(dummy.matrix.clone());
+          baseX[i] = x;
+          baseZ[i] = z;
           mesh.setColorAt(i, LEAF_PALETTE[Math.floor(sample * LEAF_PALETTE.length) % LEAF_PALETTE.length]);
           i++;
         }
       }
     }
+    // Верхний ярус может пропускать крайние комки, поэтому не оставляем
+    // неиспользованные экземпляры с нулевой матрицей в центре карты.
+    mesh.count = i;
     mesh.instanceMatrix.needsUpdate = true;
     if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
     this.world.add(mesh);
@@ -2195,6 +2232,19 @@ export class Scene3D {
     // отфильтрованному списку obstacles, так что индекс тут и есть тот самый
     // индекс, который main.ts получает от bushIndexAt (см. setActiveBush).
     this.bushMeshes.push(mesh);
+    this.bushHandles.push({
+      mesh,
+      centerX: box.x,
+      centerZ: box.z,
+      halfW: box.w / 2,
+      halfD: box.d / 2,
+      baseMatrices,
+      baseX,
+      baseZ,
+      offsetX,
+      offsetZ,
+      displaced: false,
+    });
   }
 
   /** Снимает прошлую карту вместе с её буферами. */
@@ -2208,6 +2258,7 @@ export class Scene3D {
     }
     this.world.clear();
     this.bushMeshes = [];
+    this.bushHandles = [];
     this.activeBush = -1;
   }
 
@@ -3404,6 +3455,96 @@ export class Scene3D {
           this.clock,
         );
       }
+    }
+
+    this.updateBushes(dt);
+  }
+
+  /**
+   * Клиентская деформация кустов: каждый листовой комок получает мягкий
+   * радиальный толчок от ближайшего танка. В карты и физику это не попадает —
+   * меняются только instance-матрицы уже нарисованной листвы.
+   */
+  private updateBushes(dt: number): void {
+    if (this.bushHandles.length === 0) return;
+    const radiusSq = BUSH_PUSH_RADIUS * BUSH_PUSH_RADIUS;
+    let selfTank: TankHandle | null = null;
+    for (const tank of this.tanks.values()) {
+      if (tank.isSelf) {
+        selfTank = tank;
+        break;
+      }
+    }
+    const canPush = selfTank !== null && selfTank.alive && !selfTank.cloaked;
+    const tankX = selfTank?.root.position.x ?? 0;
+    const tankZ = selfTank?.root.position.z ?? 0;
+
+    for (const bush of this.bushHandles) {
+      // Большинство кустов далеко от игрока: их матрицы не трогаем вообще.
+      // Уже раздвинутый куст всё равно дорабатывает обратную анимацию.
+      const boxDx = canPush ? Math.max(0, Math.abs(tankX - bush.centerX) - bush.halfW) : Infinity;
+      const boxDz = canPush ? Math.max(0, Math.abs(tankZ - bush.centerZ) - bush.halfD) : Infinity;
+      const nearTank = boxDx * boxDx + boxDz * boxDz <= radiusSq;
+      if (!nearTank && !bush.displaced) continue;
+
+      let changed = false;
+      let stillDisplaced = false;
+      for (let i = 0; i < bush.mesh.count; i++) {
+        const x = bush.baseX[i];
+        const z = bush.baseZ[i];
+        let targetX = 0;
+        let targetZ = 0;
+
+        if (nearTank && selfTank && canPush) {
+          const dx = x - selfTank.root.position.x;
+          const dz = z - selfTank.root.position.z;
+          const distanceSq = dx * dx + dz * dz;
+          if (distanceSq <= radiusSq) {
+            const distance = Math.sqrt(distanceSq);
+            let dirX: number;
+            let dirZ: number;
+            if (distance > 0.001) {
+              dirX = dx / distance;
+              dirZ = dz / distance;
+            } else {
+              // В самом центре куста нет радиального направления: комок
+              // расходится по ходу корпуса, как будто танк проталкивает его.
+              const sign = selfTank.speed < -0.1 ? -1 : 1;
+              dirX = Math.sin(selfTank.root.rotation.y) * sign;
+              dirZ = Math.cos(selfTank.root.rotation.y) * sign;
+            }
+
+            const strength = 1 - distance / BUSH_PUSH_RADIUS;
+            const push = strength * strength * BUSH_PUSH_DISTANCE;
+            targetX = dirX * push;
+            targetZ = dirZ * push;
+          }
+        }
+
+        const targetLength = Math.hypot(targetX, targetZ);
+        if (targetLength > BUSH_PUSH_DISTANCE) {
+          const scale = BUSH_PUSH_DISTANCE / targetLength;
+          targetX *= scale;
+          targetZ *= scale;
+        }
+
+        const response = targetLength > 0.001 ? BUSH_PUSH_RESPONSE : BUSH_RETURN_RESPONSE;
+        const blend = 1 - Math.exp(-dt * response);
+        const nextX = bush.offsetX[i] + (targetX - bush.offsetX[i]) * blend;
+        const nextZ = bush.offsetZ[i] + (targetZ - bush.offsetZ[i]) * blend;
+        if (Math.abs(nextX - bush.offsetX[i]) < 0.0001 && Math.abs(nextZ - bush.offsetZ[i]) < 0.0001) continue;
+
+        bush.offsetX[i] = nextX;
+        bush.offsetZ[i] = nextZ;
+        if (Math.abs(nextX) > 0.0005 || Math.abs(nextZ) > 0.0005) stillDisplaced = true;
+        this.bushMatrix.copy(bush.baseMatrices[i]);
+        this.bushMatrix.elements[12] += nextX;
+        this.bushMatrix.elements[14] += nextZ;
+        bush.mesh.setMatrixAt(i, this.bushMatrix);
+        changed = true;
+      }
+      bush.displaced = stillDisplaced;
+      if (changed) bush.mesh.instanceMatrix.needsUpdate = true;
     }
   }
 
