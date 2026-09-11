@@ -132,6 +132,42 @@ function withCallout(self: BotSelf, mate: BotSelf, target: Foe, extra: Partial<B
   );
 }
 
+// --- Пассивное преследование: обход под стволом и атака после выхода из сектора ---
+{
+  const intel = new RoyaleIntel();
+  const policy = new RoyalePolicy(intel);
+  const hunter = me(1, 0, 0, 0);
+  const watched = foe(2, 1, 0, 78);
+  watched.state.turret = Math.PI; // противник смотрит прямо на охотника
+  hunter.brain.orbit = 1;
+  const world = worldOf([hunter, watched], { half: 450 });
+  const shadow = policy.stalkPoint(hunter, watched, 78, world);
+  check(
+    'под стволом на средней дистанции BR-бот заходит к корме по флангу',
+    shadow !== null && shadow.z > watched.state.z && Math.abs(shadow.x) > 1,
+  );
+
+  watched.state.turret = 0; // отвернулся — момент для атаки уже наступил
+  check('вышел из сектора башни цели — скрытный заход прекращается', policy.stalkPoint(hunter, watched, 78, world) === null);
+
+  watched.state.turret = Math.PI;
+  hunter.brain.targetId = watched.id;
+  hunter.brain.rethinkAt = 0;
+  hunter.brain.readyAt = 0;
+  hunter.brain.aimFor = watched.id;
+  hunter.brain.aimAt = 100;
+  hunter.brain.aimX = watched.state.x;
+  hunter.brain.aimZ = watched.state.z;
+  world.tick = 10;
+  const stalking = royaleThink(hunter, world, intel, policy);
+  check('во время обхода бот не выдаёт себя выстрелом', !stalking.fire);
+
+  watched.state.turret = 0;
+  world.tick++;
+  const opportunity = royaleThink(hunter, world, intel, policy);
+  check('после выхода из сектора бот открывает огонь при готовом прицеле', opportunity.fire);
+}
+
 // --- targetScore: кого бот предпочитает при равной дистанции ---
 {
   const intel = new RoyaleIntel();

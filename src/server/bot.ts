@@ -361,6 +361,11 @@ export interface BotPolicy {
   canSee(self: BotSelf, candidate: BotTarget, tier: BotTier, dist: number, world: BotWorld): boolean;
   /** Дальность луча для поиска цели; право стрелять всё равно ограничено MAX_ENGAGE. */
   sightRayRange: number;
+  /**
+   * Точка скрытного захода к видимой цели или null, если момент уже выгоден
+   * для атаки. Пока точка есть, бот не стреляет и обходит цель по флангу.
+   */
+  stalkPoint(self: BotSelf, candidate: BotTarget, dist: number, world: BotWorld): { x: number; z: number } | null;
   /** Заменяет плоское tier.cover && hp <= BOT_HP*0.35. */
   shouldRetreat(self: BotSelf, world: BotWorld): boolean;
   /** Точка отхода — например, ближайший куст в безопасной зоне; null — как раньше, просто назад от цели. */
@@ -440,6 +445,10 @@ export function think(self: BotSelf, world: BotWorld, policy?: BotPolicy): Input
   const trackX = visible ? target.state.x : brain.lastX;
   const trackZ = visible ? target.state.z : brain.lastZ;
   const dist = Math.hypot(trackX - me.x, trackZ - me.z) || 1e-6;
+  // «Тень» — не просто ехать к последней точке: пока противник держит бота
+  // на прицеле, BR-политика ведёт его за корму/на фланг и запрещает ранний
+  // выстрел, который выдал бы обход. Укрытие и зона ниже всё равно важнее.
+  const stalk = visible && policy ? policy.stalkPoint(self, target, realDist, world) : null;
 
   // --- Прицел ---
   // Место цели бот освежает раз в tier.reaction и только пока видит её —
@@ -469,7 +478,7 @@ export function think(self: BotSelf, world: BotWorld, policy?: BotPolicy): Input
   const focusShot =
     (visible || brain.bank !== null) && focusAllowed(self, target, world, tier.focusers);
   const fire =
-    clear && aimed && dist < MAX_ENGAGE && world.tick >= brain.readyAt && !self.dead && focusShot;
+    !stalk && clear && aimed && dist < MAX_ENGAGE && world.tick >= brain.readyAt && !self.dead && focusShot;
   // Свой таймер бот держит длиннее перезарядки ровно на hesitate, поэтому комната
   // его выстрел никогда не отклонит: она готова раньше, чем он решится.
   if (fire) brain.readyAt = world.tick + Math.round((RELOAD_S + tier.hesitate) * TICK_HZ);
@@ -484,6 +493,7 @@ export function think(self: BotSelf, world: BotWorld, policy?: BotPolicy): Input
     dodge(self, world) ??
     zoneMove ??
     (retreatPoint ? pointHeading(self, world, retreatPoint) : null) ??
+    (stalk ? pointHeading(self, world, stalk) : null) ??
     heading(self, createTankState(trackX, trackZ), dist, tier, world, retreat, shot, bushOnly);
   const drive = unstick(brain, me, world.tick, steerTo(me, want, world.obstacles, world.half, world.obstacleIndex));
 

@@ -1,4 +1,5 @@
 import { BOT_HP, ROYALE_SIGHT_RANGE, SHELL_DAMAGE, SHELL_DAMAGE_SPREAD, TICK_HZ } from '../shared/constants.js';
+import { angleDiff } from '../shared/sim.js';
 import { think, type BotBrain, type BotPolicy, type BotSelf, type BotTarget, type BotTier, type BotWorld } from './bot.js';
 import type { Input } from '../shared/types.js';
 
@@ -23,6 +24,16 @@ const OUTNUMBER_MARGIN = 1;
 const NEARBY_RADIUS = 40;
 /** Не прячемся ближе этого к последнему известному врагу — иначе «укрытие» у него на глазах. */
 const HIDE_AWAY_FROM_THREAT = NEARBY_RADIUS * 0.3;
+/** С этой дистанции уже можно открыть огонь, но пока невыгодно лезть под башню цели. */
+const STALK_MIN_RANGE = 42;
+/** Дальше бот ещё не ведёт бой, а выбирает фланг и постепенно сокращает дистанцию. */
+const STALK_MAX_RANGE = 110;
+/** Предпочтительная дистанция позади цели: вне ближнего размена, но в пределах одного рывка. */
+const STALK_BEHIND_RANGE = 54;
+/** Увод точки захода вбок, чтобы не ехать буквально след в след. */
+const STALK_FLANK = 18;
+/** Полуугол опасного сектора башни противника. */
+const STALK_THREAT_ARC = (75 * Math.PI) / 180;
 
 /** Насколько низкое HP цели перевешивает выбор — в тех же «метрах», что и dist (см. targetScore). */
 const WEAK_WEIGHT = 40;
@@ -147,6 +158,26 @@ export class RoyalePolicy implements BotPolicy {
    */
   canSee(_self: BotSelf, _candidate: BotTarget, _tier: BotTier, dist: number, _world: BotWorld): boolean {
     return dist <= ROYALE_SIGHT_RANGE;
+  }
+
+  /**
+   * Пока ствол цели смотрит в нашу сторону на средней дистанции, не начинаем
+   * лобовой размен: заходим к корме по выбранной ботом стороне. Как только
+   * вышли из опасного сектора или сблизились, возвращаем управление обычному
+   * бою — он уже сам проверит линию огня, прицел и право фокусного огня.
+   */
+  stalkPoint(self: BotSelf, candidate: BotTarget, dist: number, _world: BotWorld): { x: number; z: number } | null {
+    if (dist < STALK_MIN_RANGE || dist > STALK_MAX_RANGE) return null;
+    const bearing = Math.atan2(self.state.x - candidate.state.x, self.state.z - candidate.state.z);
+    if (Math.abs(angleDiff(candidate.state.turret, bearing)) > STALK_THREAT_ARC) return null;
+
+    const facingX = Math.sin(candidate.state.turret);
+    const facingZ = Math.cos(candidate.state.turret);
+    const side = self.brain.orbit;
+    return {
+      x: candidate.state.x - facingX * STALK_BEHIND_RANGE + facingZ * STALK_FLANK * side,
+      z: candidate.state.z - facingZ * STALK_BEHIND_RANGE - facingX * STALK_FLANK * side,
+    };
   }
 
   targetScore(self: BotSelf, candidate: BotTarget, dist: number, world: BotWorld): number {
