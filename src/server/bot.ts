@@ -353,6 +353,14 @@ const UNSTICK_TICKS = Math.round(TICK_HZ * 0.8);
 export interface BotPolicy {
   /** Ниже — предпочтительнее; без policy побеждает просто ближайший (см. retarget()). */
   targetScore(self: BotSelf, candidate: BotTarget, dist: number, world: BotWorld): number;
+  /**
+   * Правило восприятия конкретного режима. По умолчанию бот смотрит в конус
+   * корпуса с дальностью своего тира; BR заменяет это на обзор игрока от
+   * третьего лица. Луч до цели всё равно проверяется отдельно в think()/retarget().
+   */
+  canSee(self: BotSelf, candidate: BotTarget, tier: BotTier, dist: number, world: BotWorld): boolean;
+  /** Дальность луча для поиска цели; право стрелять всё равно ограничено MAX_ENGAGE. */
+  sightRayRange: number;
   /** Заменяет плоское tier.cover && hp <= BOT_HP*0.35. */
   shouldRetreat(self: BotSelf, world: BotWorld): boolean;
   /** Точка отхода — например, ближайший куст в безопасной зоне; null — как раньше, просто назад от цели. */
@@ -399,19 +407,18 @@ export function think(self: BotSelf, world: BotWorld, policy?: BotPolicy): Input
   // Реальная дистанция до цели — только для того, чтобы решить, видно ли её
   // вообще (см. tier.sight). Дальше бот работает не с ней, а с тем, что «знает».
   const realDist = Math.hypot(target.state.x - me.x, target.state.z - me.z) || 1e-6;
-  // Чистая линия огня, без предела дальности: ею тактика объезда решает, есть
-  // ли смысл довернуть в обход препятствия. Дальность восприятия сюда не
-  // подмешана нарочно — иначе на длинных коридорах бот жал бы вперёд просто
-  // потому, что цель дальше tier.sight, хотя видно её прекрасно, и толпа
-  // забивала бы единственные ворота на карте.
-  const shot = hasShot(me, target.state, world.cover, world.bushes, world.half, MAX_ENGAGE, world.coverIndex, world.bushIndex);
+  // Чистая линия до цели. В BR этот луч длиннее дальности выстрела: сначала
+  // заметить и сблизиться, а MAX_ENGAGE ниже по-прежнему запрещает стрелять
+  // дальше срока жизни снаряда.
+  const sightRayRange = policy?.sightRayRange ?? MAX_ENGAGE;
+  const shot = hasShot(me, target.state, world.cover, world.bushes, world.half, sightRayRange, world.coverIndex, world.bushIndex);
   // Загородил именно куст, а не стена: за стеной цель прячется по праву и её
   // логично обходить искать угол, а спрятавшегося в листве нужно не обходить,
   // а решительно подъехать вплотную — вблизи куст переставит слепить (см.
   // bushBlockers), и охота вообще имеет смысл только так.
-  const bushOnly = !shot && hasShot(me, target.state, world.cover, undefined, world.half, MAX_ENGAGE, world.coverIndex);
+  const bushOnly = !shot && hasShot(me, target.state, world.cover, undefined, world.half, sightRayRange, world.coverIndex);
   const visible =
-    inSight(me, tier, target.state.x, target.state.z, realDist) &&
+    (policy ? policy.canSee(self, target, tier, realDist, world) : inSight(me, tier, target.state.x, target.state.z, realDist)) &&
     shot &&
     !(target.stealth && realDist > BONUS_STEALTH_RANGE);
   brain.engaged = visible;
@@ -586,8 +593,8 @@ function retarget(self: BotSelf, world: BotWorld, tier: BotTier, policy?: BotPol
     // кандидат на смену цели не участвует: это ровно тот же тест, что think()
     // гоняет каждый тик.
     if (
-      !inSight(me, tier, tank.state.x, tank.state.z, d) ||
-      !hasShot(me, tank.state, world.cover, world.bushes, world.half, MAX_ENGAGE, world.coverIndex, world.bushIndex)
+      !(policy ? policy.canSee(self, tank, tier, d, world) : inSight(me, tier, tank.state.x, tank.state.z, d)) ||
+      !hasShot(me, tank.state, world.cover, world.bushes, world.half, policy?.sightRayRange ?? MAX_ENGAGE, world.coverIndex, world.bushIndex)
     )
       continue;
     const score = policy ? policy.targetScore(self, tank, d, world) : d;
@@ -766,8 +773,19 @@ function patrol(self: BotSelf, world: BotWorld): Input {
 
   if (world.tick >= brain.patrolAt || Math.hypot(brain.patrolX - me.x, brain.patrolZ - me.z) < 8) {
     const half = world.half ?? 70;
-    brain.patrolX = (Math.random() * 2 - 1) * half * 0.8;
-    brain.patrolZ = (Math.random() * 2 - 1) * half * 0.8;
+    const zone = world.zone;
+    if (zone && zone.phase !== 'over') {
+      // После сжатия BR не нужно выбирать точки по всей карте: иначе бот
+      // тратит матч на возвращение в круг вместо поиска последнего врага.
+      const radius = Math.min(half * 0.8, Math.max(10, zone.r - ZONE_MARGIN * 1.5));
+      const angle = Math.random() * Math.PI * 2;
+      const distance = Math.sqrt(Math.random()) * radius;
+      brain.patrolX = clamp(zone.x + Math.cos(angle) * distance, -half * 0.8, half * 0.8);
+      brain.patrolZ = clamp(zone.z + Math.sin(angle) * distance, -half * 0.8, half * 0.8);
+    } else {
+      brain.patrolX = (Math.random() * 2 - 1) * half * 0.8;
+      brain.patrolZ = (Math.random() * 2 - 1) * half * 0.8;
+    }
     brain.patrolAt = world.tick + Math.round(PATROL_S * TICK_HZ);
   }
 

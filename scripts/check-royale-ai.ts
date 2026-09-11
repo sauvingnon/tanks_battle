@@ -16,6 +16,7 @@
 import {
   BOT_HP,
   MODE_ROYALE,
+  ROYALE_SIGHT_RANGE,
   ROYALE_SQUAD_SIZES,
   ROYALE_START_COUNTDOWN_S,
   SHELL_DAMAGE,
@@ -24,8 +25,8 @@ import {
 } from '../src/shared/constants.js';
 import { buildMap, bushBoxes } from '../src/shared/map.js';
 import { createTankState, type Box } from '../src/shared/types.js';
-import { createBrain, type BotSelf, type BotTarget, type BotWorld, type BotZone } from '../src/server/bot.js';
-import { RoyaleIntel, RoyalePolicy } from '../src/server/royaleBrain.js';
+import { BOT_TIERS, createBrain, type BotSelf, type BotTarget, type BotWorld, type BotZone } from '../src/server/bot.js';
+import { royaleThink, RoyaleIntel, RoyalePolicy } from '../src/server/royaleBrain.js';
 import { Room, type Player } from '../src/server/room.js';
 
 const checks: Array<[string, boolean]> = [];
@@ -110,6 +111,27 @@ function withCallout(self: BotSelf, mate: BotSelf, target: Foe, extra: Partial<B
   check('раненый бот с прикрытием сквада бой не бросает', !backedPolicy.shouldRetreat(woundedBacked, worldBacked));
 }
 
+// --- Обзор BR: тот же радиус и круговой обзор, что у игрока в третьем лице ---
+{
+  const intel = new RoyaleIntel();
+  const policy = new RoyalePolicy(intel);
+  const scout = me(1, 0, 0, 0);
+  const behind = foe(2, 1, 0, -120);
+  scout.brain.rethinkAt = 0;
+  // BR идёт на большой карте: без half() синтетический мир по умолчанию
+  // имеет исторические 140 м и край корпуса почти касается границы.
+  const world = worldOf([scout, behind], { half: 450 });
+  royaleThink(scout, world, intel, policy);
+  check('BR-бот замечает врага за корпусом на дистанции обзора игрока', scout.brain.targetId === behind.id);
+
+  const nearLimit = foe(3, 1, 0, -ROYALE_SIGHT_RANGE + 0.1);
+  const far = foe(4, 1, 0, -ROYALE_SIGHT_RANGE - 0.1);
+  check('BR-обзор обрывается ровно на серверной дальности игрока',
+    policy.canSee(scout, nearLimit, BOT_TIERS[scout.brain.tier], ROYALE_SIGHT_RANGE - 0.1, world) &&
+    !policy.canSee(scout, far, BOT_TIERS[scout.brain.tier], ROYALE_SIGHT_RANGE + 0.1, world),
+  );
+}
+
 // --- targetScore: кого бот предпочитает при равной дистанции ---
 {
   const intel = new RoyaleIntel();
@@ -191,6 +213,19 @@ function withCallout(self: BotSelf, mate: BotSelf, target: Foe, extra: Partial<B
   const world = worldOf([hurt], { zone: zoneAt(0, 0, 300) });
   intel.refreshIfNeeded(world);
   check('без кустов отход остаётся прежним (null — решает heading)', policy.retreatTo(hurt, world) === null);
+}
+
+// --- Эндгейм: малый круг не отменяет ценность укрытия ---
+{
+  const intel = new RoyaleIntel();
+  const policy = new RoyalePolicy(intel);
+  const hunter = me(1, 0, -30, 0, CRITICAL_HP - 1);
+  const lastEnemy = foe(2, 1, 30, 0);
+  const world = worldOf([hunter, lastEnemy], { zone: zoneAt(12, -8, 80) });
+  intel.refreshIfNeeded(world);
+  const point = policy.regroupPoint(hunter, world);
+  check('в финальной дуэли критический бот сохраняет право спрятаться', policy.shouldRetreat(hunter, world));
+  check('без контакта в финальной дуэли бот не выдаёт себя походом в центр', point === null);
 }
 
 // --- regroupPoint и вызовы сквада ---

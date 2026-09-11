@@ -1,5 +1,5 @@
-import { BOT_HP, SHELL_DAMAGE, SHELL_DAMAGE_SPREAD, TICK_HZ } from '../shared/constants.js';
-import { think, type BotBrain, type BotPolicy, type BotSelf, type BotTarget, type BotWorld } from './bot.js';
+import { BOT_HP, ROYALE_SIGHT_RANGE, SHELL_DAMAGE, SHELL_DAMAGE_SPREAD, TICK_HZ } from '../shared/constants.js';
+import { think, type BotBrain, type BotPolicy, type BotSelf, type BotTarget, type BotTier, type BotWorld } from './bot.js';
 import type { Input } from '../shared/types.js';
 
 /**
@@ -137,6 +137,18 @@ export class RoyaleIntel {
 export class RoyalePolicy implements BotPolicy {
   constructor(private readonly intel: RoyaleIntel) {}
 
+  /** На этой дальности BR-бот проверяет линию видимости, но не стреляет автоматически. */
+  readonly sightRayRange = ROYALE_SIGHT_RANGE;
+
+  /**
+   * Камера игрока от третьего лица крутится независимо от корпуса, и сервер
+   * даёт ему засвет по кругу в ROYALE_SIGHT_RANGE. Бот получает ту же
+   * геометрию; стены и кусты всё равно отсекаются общим hasShot().
+   */
+  canSee(_self: BotSelf, _candidate: BotTarget, _tier: BotTier, dist: number, _world: BotWorld): boolean {
+    return dist <= ROYALE_SIGHT_RANGE;
+  }
+
   targetScore(self: BotSelf, candidate: BotTarget, dist: number, world: BotWorld): number {
     const hp = (candidate as BotTarget & { hp?: number }).hp;
     const weak = hp === undefined ? 0 : Math.max(0, 1 - hp / BOT_HP) * WEAK_WEIGHT;
@@ -179,8 +191,8 @@ export class RoyalePolicy implements BotPolicy {
 
   regroupPoint(self: BotSelf, world: BotWorld): { x: number; z: number } | null {
     const callout = this.intel.calloutFor(self.team, world.tick);
-    if (!callout || callout.targetId === self.brain.targetId) return null;
-    return { x: callout.x, z: callout.z };
+    if (callout && callout.targetId !== self.brain.targetId) return { x: callout.x, z: callout.z };
+    return null;
   }
 }
 
