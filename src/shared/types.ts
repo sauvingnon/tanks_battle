@@ -1,4 +1,4 @@
-/** Прямоугольное препятствие, выровненное по осям (вид сверху) + высота. */
+/** Препятствие карты, обычно прямоугольное, с высотой над землёй. */
 export interface Box {
   x: number;
   z: number;
@@ -12,6 +12,8 @@ export interface Box {
   collisionRadius?: number;
   /** Радиус танка для этой коллизии; нужен объектам с более точным силуэтом. */
   collisionTankRadius?: number;
+  /** Выпуклый контур основания в локальных координатах относительно x/z. */
+  collisionPolygon?: Array<[number, number]>;
   h: number; // высота над собственным основанием
   /** Высота основания для чисто визуальных деталей (по умолчанию 0). */
   y?: number;
@@ -37,6 +39,84 @@ export function boxCollisionSize(box: Box): { w: number; d: number } {
     w: box.collisionW ?? box.w,
     d: box.collisionD ?? box.d,
   };
+}
+
+/** Многоугольник коллизии в мировых координатах; для обычных Box — прямоугольник. */
+export function worldCollisionPolygon(box: Box): Array<[number, number]> {
+  if (box.collisionPolygon && box.collisionPolygon.length >= 3) {
+    return box.collisionPolygon.map(([x, z]) => [box.x + x, box.z + z]);
+  }
+  const { w, d } = boxCollisionSize(box);
+  const hw = w / 2;
+  const hd = d / 2;
+  return [
+    [box.x - hw, box.z - hd],
+    [box.x + hw, box.z - hd],
+    [box.x + hw, box.z + hd],
+    [box.x - hw, box.z + hd],
+  ];
+}
+
+/** Точка внутри выпуклого многоугольника. Вершины могут быть по часовой стрелке. */
+export function pointInPolygon(x: number, z: number, polygon: Array<[number, number]>): boolean {
+  let sign = 0;
+  for (let i = 0; i < polygon.length; i++) {
+    const [ax, az] = polygon[i];
+    const [bx, bz] = polygon[(i + 1) % polygon.length];
+    const cross = (bx - ax) * (z - az) - (bz - az) * (x - ax);
+    if (Math.abs(cross) < 1e-9) continue;
+    const current = Math.sign(cross);
+    if (sign === 0) sign = current;
+    else if (current !== sign) return false;
+  }
+  return true;
+}
+
+/** Квадрат расстояния от точки до отрезка. */
+export function distanceSquaredToSegment(
+  x: number,
+  z: number,
+  ax: number,
+  az: number,
+  bx: number,
+  bz: number,
+): number {
+  const dx = bx - ax;
+  const dz = bz - az;
+  const length2 = dx * dx + dz * dz;
+  const t = length2 > 1e-9 ? Math.max(0, Math.min(1, ((x - ax) * dx + (z - az) * dz) / length2)) : 0;
+  const px = ax + dx * t;
+  const pz = az + dz * t;
+  return (x - px) ** 2 + (z - pz) ** 2;
+}
+
+/** Пересекается ли круг с выпуклым многоугольником. */
+export function circleIntersectsPolygon(
+  x: number,
+  z: number,
+  radius: number,
+  polygon: Array<[number, number]>,
+): boolean {
+  if (pointInPolygon(x, z, polygon)) return true;
+  const radius2 = radius * radius;
+  for (let i = 0; i < polygon.length; i++) {
+    const [ax, az] = polygon[i];
+    const [bx, bz] = polygon[(i + 1) % polygon.length];
+    if (distanceSquaredToSegment(x, z, ax, az, bx, bz) <= radius2) return true;
+  }
+  return false;
+}
+
+/** Расстояние от точки до многоугольника; внутри расстояние равно нулю. */
+export function distanceToPolygon(x: number, z: number, polygon: Array<[number, number]>): number {
+  if (pointInPolygon(x, z, polygon)) return 0;
+  let best = Infinity;
+  for (let i = 0; i < polygon.length; i++) {
+    const [ax, az] = polygon[i];
+    const [bx, bz] = polygon[(i + 1) % polygon.length];
+    best = Math.min(best, distanceSquaredToSegment(x, z, ax, az, bx, bz));
+  }
+  return Math.sqrt(best);
 }
 
 /** Полное состояние танка в симуляции. */

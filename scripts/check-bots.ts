@@ -21,7 +21,7 @@ import {
   MODE_DM,
   MODE_PVE,
   MODE_ROYALE,
-  ROYALE_SQUAD_COUNT,
+  royaleSquadCount,
   ROYALE_SQUAD_SIZES,
   ROYALE_SQUAD_SIZE,
   ROYALE_START_COUNTDOWN_S,
@@ -41,7 +41,7 @@ import {
   waveConcurrent,
   waveQuota,
 } from '../src/shared/constants.js';
-import { buildMap, bushBoxes, MAP_NAMES, spawnCount, spawnPoint } from '../src/shared/map.js';
+import { buildMap, bushBoxes, MAP_NAMES, spawnPoint } from '../src/shared/map.js';
 import { sweepShell } from '../src/shared/sim.js';
 import { boxCollisionSize, createTankState, TEAM_BOTS, TEAM_PLAYERS, type ShellState } from '../src/shared/types.js';
 import { createBrain, findBankShot, think } from '../src/server/bot.js';
@@ -864,10 +864,15 @@ function holdDistance(stance: number): number {
   const zone = room.royaleZoneState();
   check('BR автоматически выбрал большую карту', room.half === 450 && MAP_NAMES[room.mapId] === 'Рубеж');
   check('BR заполнил союзный сквад', allies.length === ROYALE_SQUAD_SIZE - 1);
-  check('BR создал три вражеских сквада', enemies.length === ROYALE_SQUAD_SIZE * 3);
-  const allDropsInsideZone = zone !== undefined && Array.from({ length: spawnCount(room.mapId) }, (_, index) => spawnPoint(index, room.mapId))
-    .every((spawn) => Math.hypot(spawn.x - zone.x, spawn.z - zone.z) <= zone.r);
+  const defaultSquadCount = royaleSquadCount(ROYALE_SQUAD_SIZE);
+  check(
+    `BR создал ${defaultSquadCount - 1} вражеских сквада`,
+    enemies.length === ROYALE_SQUAD_SIZE * (defaultSquadCount - 1),
+  );
+  const allDropsInsideZone = zone !== undefined &&
+    [player, ...royaleBots].every((p) => Math.hypot(p.state.x - zone.x, p.state.z - zone.z) <= zone.r);
   check('BR все точки высадки внутри стартовой зоны', allDropsInsideZone);
+  check('BR стартовая зона накрывает всю карту', zone !== undefined && zone.r >= room.half);
   check('BR контейнеры лута стоят по карте', room.bonuses.length >= 8);
   check('BR контейнеры не истекают сами', room.bonuses.every((loot) => loot.until === Number.MAX_SAFE_INTEGER));
   const armorLoot = room.bonuses.find((loot) => loot.kind === ROYALE_LOOT_ARMOR);
@@ -887,8 +892,10 @@ function holdDistance(stance: number): number {
     run(formatRoom, 2);
     const formatAllies = bots(formatRoom).filter((bot) => bot.team === formatPlayer.team);
     const formatEnemies = bots(formatRoom).filter((bot) => bot.team !== formatPlayer.team);
+    const formatSquadCount = royaleSquadCount(size);
     check(`BR ${size === 1 ? 'соло' : size === 2 ? 'дуо' : 'сквад'} заполняет союзный состав`, formatAllies.length === size - 1);
-    check(`BR ${size === 1 ? 'соло' : size === 2 ? 'дуо' : 'сквад'} создаёт ${ROYALE_SQUAD_COUNT - 1} вражеских сквада`, formatEnemies.length === size * (ROYALE_SQUAD_COUNT - 1));
+    check(`BR ${size === 1 ? 'соло' : size === 2 ? 'дуо' : 'сквад'} создаёт ${formatSquadCount - 1} вражеских сквада`, formatEnemies.length === size * (formatSquadCount - 1));
+    check(`BR ${size === 1 ? 'соло' : size === 2 ? 'дуо' : 'сквад'} держит ровно 40 танков`, formatAllies.length + formatEnemies.length + 1 === 40);
   }
   check('BR отдаёт зону', zone !== undefined && zone.r > 400 && zone.phase === 'safe');
   check('сквад считается союзным для клиента', alliedTeams(MODE_ROYALE, player.team, allies[0]?.team ?? -1));

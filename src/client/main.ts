@@ -117,6 +117,13 @@ let selfId = 0;
 let worldBuilt = false;
 
 const players = new Map<number, PlayerInfo>();
+/**
+ * Танки, которых игрок уже знает (players.has), но которым ещё не построена
+ * 3D-модель: очередь на addTank(). Нужна, потому что BR роняет на карту до
+ * 40 ботов одним залпом 'joined' — построить все их меши в один кадр значит
+ * подвесить именно тот кадр, на котором игрок только что увидел бой.
+ */
+const pendingSpawns: PlayerInfo[] = [];
 
 /** Свой танк: предсказание, реконсиляция и сглаживание живут в prediction.ts. */
 const self = new SelfPrediction();
@@ -265,12 +272,15 @@ const RULES_NAMES: Record<Ruleset, string> = {
   [RULES_REAL]: 'Реализм',
 };
 
-/** Что меняют правила — подпись под выбором. */
+/**
+ * Что меняют правила — подпись под выбором. Подписи над танками (ник и
+ * полоска HP) от правил не зависят вовсе: они всегда только у товарищей,
+ * и никогда — над чужими или над собой.
+ */
 const RULES_HINTS: Record<Ruleset, string> = {
-  [RULES_ARCADE]:
-    'Срабатывает сразу: бой начинается заново. Над каждым танком ник и полоска HP — видно всех, кто попал в кадр.',
+  [RULES_ARCADE]: 'Срабатывает сразу: бой начинается заново.',
   [RULES_REAL]:
-    'Срабатывает сразу: бой начинается заново. Подписей нет: ни ников, ни полосок HP, ни своей. Противника ищешь глазами; в бою против ботов подписаны только товарищи.',
+    'Срабатывает сразу: бой начинается заново. Дополнительно включает вид от первого лица без права выключить — камера над танком видит то, чего бот не видит.',
 };
 
 /** Маска бонусов, действующих на мой танк; приходит в снапшоте. */
@@ -378,10 +388,31 @@ function handleMessage(msg: ServerMessage): void {
 
 function addPlayer(info: PlayerInfo): void {
   players.set(info.id, info);
+  // Свой танк нужен сразу — на нём стоит камера. Остальных (в BR это до
+  // 39 ботов разом) откладываем в очередь: updateTank() и снапшоты молча
+  // не трогают танк без модели, так что достроить её парой кадров позже
+  // безопасно, а вот полсотни addTank() за один кадр — нет.
+  if (info.id === selfId) spawnTankVisual(info);
+  else pendingSpawns.push(info);
+  updateHud();
+}
+
+function spawnTankVisual(info: PlayerInfo): void {
   scene.addTank(info.id, info.name, info.color, info.id === selfId, info.bot === 1);
   scene.setTankFaction(info.id, factionOf(info));
   scene.setNameplate(info.id, plated(info));
-  updateHud();
+}
+
+/** Не больше нескольких новых танков за кадр — иначе всплеск ботов в BR подвешивает кадр. */
+const SPAWN_BATCH_PER_FRAME = 4;
+
+function spawnPendingTanks(): void {
+  for (let i = 0; i < SPAWN_BATCH_PER_FRAME && pendingSpawns.length > 0; i++) {
+    const info = pendingSpawns.shift()!;
+    // Мог успеть выйти, пока ждал своей очереди на постройку модели.
+    if (players.get(info.id) !== info) continue;
+    spawnTankVisual(info);
+  }
 }
 
 function factionOf(info: PlayerInfo): TankFaction {
@@ -397,15 +428,15 @@ function applyFactions(): void {
 }
 
 /**
- * Подписан ли этот танк при нынешних правилах. В аркаде — все, в реализме
- * только товарищ: чужой танк надо разглядеть, а не прочитать.
+ * Подписан ли этот танк: только если это товарищ — правила боя тут ни при
+ * чём, подписи всегда только у своих. Чужой танк надо разглядеть, а не
+ * прочитать; там, где товарищей нет вовсе (например, «Все против всех»),
+ * не подписан вообще никто.
  *
- * Своя подпись в реализме гаснет тоже. Здоровье и так висит в HUD, а ник с
- * полоской над собственной башней — самое аркадное, что есть на экране, и
- * висит он в кадре постоянно.
+ * Своя подпись тоже не рисуется: здоровье и так висит в HUD, а ник с
+ * полоской над собственной башней висел бы в кадре постоянно без всякой пользы.
  */
 function plated(info: PlayerInfo): boolean {
-  if (rules === RULES_ARCADE) return true;
   if (info.id === selfId) return false;
   const me = players.get(selfId);
   return me !== undefined && alliedTeams(mode, me.team, info.team);
@@ -661,6 +692,7 @@ function frame(now: number): void {
   lastFrame = now;
 
   controls.update();
+  spawnPendingTanks();
 
   if (self.ready) {
     stepAccumulator += dt;
@@ -690,7 +722,7 @@ function frame(now: number): void {
         void crosshair.offsetWidth;
         crosshair.classList.add('is-firing');
         audio.playShot();
-        scene.tankFired(selfId);
+        scene.tankFired(selfId, true);
         scene.addShake(SELF_SHOT_SHAKE);
         firePending = true;
         firePendingUntil = now + FIRE_ACK_TIMEOUT_MS;

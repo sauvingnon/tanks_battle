@@ -69,6 +69,96 @@ const CORNERS: Array<[number, number]> = [
   [-1, -1],
 ];
 
+/** Сторона здания, на которой оставляем проём для танка. */
+type BuildingDoor = 'north' | 'south' | 'east' | 'west';
+
+/**
+ * Настоящее здание вместо цельной коробки: четыре физических стены, открытые
+ * дверные проёмы, плоская декоративная крыша и пара предметов внутри.
+ *
+ * Крыша не solid специально: она видна сверху и создаёт силуэт квартала, но
+ * не превращает внутреннее пространство в невидимый карман. Проёмы шириной
+ * 7.5 м заметно шире танка и позволяют въехать, развернуться и выехать.
+ */
+function addVisitableBuilding(
+  boxes: Box[],
+  x: number,
+  z: number,
+  w: number,
+  d: number,
+  h: number,
+  doors: BuildingDoor[] = ['south'],
+): void {
+  const wall = 2.2;
+  // Делаем проём с запасом не только для корпуса, но и для сеточной проверки
+  // проходимости: узкая дверь на шаге 2 м могла выглядеть свободной, но
+  // отрезать внутреннюю комнату от улицы.
+  const doorWidth = Math.min(8, Math.max(7.5, Math.min(w, d) * 0.54));
+  const halfW = w / 2;
+  const halfD = d / 2;
+  const addWall = (wx: number, wz: number, ww: number, wd: number) => {
+    boxes.push({ x: wx, z: wz, w: ww, d: wd, h });
+  };
+
+  const addHorizontal = (side: 'north' | 'south') => {
+    const edgeZ = side === 'north' ? z + halfD - wall / 2 : z - halfD + wall / 2;
+    if (!doors.includes(side)) {
+      addWall(x, edgeZ, w, wall);
+      return;
+    }
+    const leftLength = halfW - doorWidth / 2;
+    const rightLength = leftLength;
+    if (leftLength > 1) addWall(x - (doorWidth + leftLength) / 2, edgeZ, leftLength, wall);
+    if (rightLength > 1) addWall(x + (doorWidth + rightLength) / 2, edgeZ, rightLength, wall);
+  };
+
+  const addVertical = (side: 'east' | 'west') => {
+    const edgeX = side === 'east' ? x + halfW - wall / 2 : x - halfW + wall / 2;
+    if (!doors.includes(side)) {
+      addWall(edgeX, z, wall, d);
+      return;
+    }
+    const nearLength = halfD - doorWidth / 2;
+    const farLength = nearLength;
+    if (nearLength > 1) addWall(edgeX, z - (doorWidth + nearLength) / 2, wall, nearLength);
+    if (farLength > 1) addWall(edgeX, z + (doorWidth + farLength) / 2, wall, farLength);
+  };
+
+  addHorizontal('north');
+  addHorizontal('south');
+  addVertical('east');
+  addVertical('west');
+
+  // Крыша остаётся декоративной: танк может заехать внутрь, а камера не
+  // сталкивается с невидимой плитой над головой.
+  boxes.push({ x, z, w: w + 1.2, d: d + 1.2, h: 0.35, y: h + 0.1, solid: false, style: 'roof' });
+
+  // Внутренние предметы создают укрытие и повод маневрировать в комнате.
+  if (w >= 16 && d >= 16) {
+    boxes.push({ x: x - w * 0.24, z: z + d * 0.18, w: 3.1, d: 3.1, h: 1.5 });
+    boxes.push({ x: x + w * 0.22, z: z - d * 0.2, w: 2.8, d: 2.8, h: 1.5 });
+  }
+
+  // Чёрные стойки читаются как открытая дверь с улицы и не закрывают проём.
+  const frameH = Math.min(3.1, h - 0.4);
+  const frame = (fx: number, fz: number, fw: number, fd: number, fh: number, fy = 0) => {
+    boxes.push({ x: fx, z: fz, w: fw, d: fd, h: fh, y: fy, solid: false, style: 'gate' });
+  };
+  for (const side of doors) {
+    if (side === 'south' || side === 'north') {
+      const doorZ = side === 'south' ? z - halfD - 0.08 : z + halfD + 0.08;
+      frame(x - doorWidth / 2, doorZ, 0.32, 0.28, frameH);
+      frame(x + doorWidth / 2, doorZ, 0.32, 0.28, frameH);
+      frame(x, doorZ, doorWidth + 0.64, 0.28, 0.32, frameH);
+    } else {
+      const doorX = side === 'west' ? x - halfW - 0.08 : x + halfW + 0.08;
+      frame(doorX, z - doorWidth / 2, 0.28, 0.32, frameH);
+      frame(doorX, z + doorWidth / 2, 0.28, 0.32, frameH);
+      frame(doorX, z, 0.28, doorWidth + 0.64, 0.32, frameH);
+    }
+  }
+}
+
 /** Симметричная расстановка блоков вокруг центра — карта, с которой всё началось. */
 function buildKremlin(): Box[] {
   const boxes: Box[] = [];
@@ -139,9 +229,9 @@ function buildFort(): Box[] {
 }
 
 /**
- * «Город»: сетка кварталов с улицами по 12 м. Линии огня короткие, зато углов и
- * рикошетов — сколько угодно. Ботам здесь негде работать с любимой дистанции
- * 32-44 м, поэтому дерутся они заметно ближе и злее.
+ * «Город»: сетка небольших посещаемых домов с улицами по 10 м. Линии огня
+ * короткие, зато дверей, углов и рикошетов — сколько угодно. Ботам здесь
+ * негде работать с любимой дистанции 32-44 м, поэтому дерутся они ближе и злее.
  */
 function buildCity(): Box[] {
   const boxes: Box[] = [];
@@ -153,7 +243,9 @@ function buildCity(): Box[] {
       if (x === 0 && z === 0) continue;
       // Высоты вразнобой, но все выше высоты полёта снаряда.
       const h = 3 + ((Math.abs(x) + Math.abs(z)) % 3);
-      boxes.push({ x, z, w: 12, d: 12, h });
+      const doors: BuildingDoor[] =
+        (Math.abs(x / 24) + Math.abs(z / 24)) % 2 === 0 ? ['south', 'north'] : ['east', 'west'];
+      addVisitableBuilding(boxes, x, z, 14, 14, h, doors);
     }
   }
   return boxes;
@@ -201,6 +293,16 @@ for (const x of [-62, 62]) {
 
 /** Высота низкого укрытия: ниже SHELL_HEIGHT, значит простреливается насквозь. */
 const LOW = 1.5;
+
+/** Общий выпуклый силуэт для визуального кластера камней. Точки идут против часовой стрелки. */
+const ROCK_FOOTPRINT: Array<[number, number]> = [
+  [-0.46, -0.2], [-0.3, -0.45], [0.12, -0.5], [0.47, -0.28],
+  [0.42, 0.24], [0.18, 0.45], [-0.28, 0.4], [-0.5, 0.1],
+];
+
+function rockFootprint(w: number, d: number): Array<[number, number]> {
+  return ROCK_FOOTPRINT.map(([x, z]) => [x * w, z * d]);
+}
 
 /**
  * «Окопы»: поперечные брустверы с разбежкой в проходах. Стрелять можно через всю
@@ -252,15 +354,15 @@ const TRENCH_SPAWNS: Array<[number, number]> = [
 ];
 
 /**
- * «Автопарк»: ряды контейнеров и один высокий ангар посередине. Контейнеры ниже
- * высоты полёта, поэтому весь парк простреливается поверху, а ехать приходится
- * по проездам. Дуэль тут выигрывает тот, кто раньше понял, что его видно.
+ * «Автопарк»: ряды контейнеров, проходимый ангар посередине и четыре маленькие
+ * сторожевые будки. Контейнеры ниже высоты полёта, а в зданиях можно менять
+ * направление и пережидать перезарядку.
  */
 function buildDepot(): Box[] {
   const boxes: Box[] = [];
 
   // Ангар — единственное настоящее укрытие, поэтому он в центре и за него дерутся.
-  boxes.push({ x: 0, z: 0, w: 20, d: 14, h: 5 });
+  addVisitableBuilding(boxes, 0, 0, 22, 16, 5, ['north', 'south', 'east', 'west']);
 
   // Контейнеры 4x12: шаг 15 по X даёт проезд 11 м, шаг 22 по Z — 10 м.
   for (const x of [-52.5, -37.5, -22.5, -7.5, 7.5, 22.5, 37.5, 52.5]) {
@@ -271,8 +373,12 @@ function buildDepot(): Box[] {
     }
   }
 
-  // Пара сторожевых будок по углам: чтобы укрытие было не только в центре.
-  for (const [sx, sz] of CORNERS) boxes.push({ x: sx * 45, z: sz * 45, w: 7, d: 7, h: 4 });
+  // Сторожевые будки по углам: маленькие, но в них тоже можно заехать и
+  // переждать перезарядку. Вход направлен в сторону центра карты.
+  for (const [sx, sz] of CORNERS) {
+    const door: BuildingDoor = sx > 0 ? 'west' : 'east';
+    addVisitableBuilding(boxes, sx * 45, sz * 45, 10, 10, 4, [door]);
+  }
 
   return boxes;
 }
@@ -285,7 +391,7 @@ function buildDepot(): Box[] {
 function buildDunes(): Box[] {
   const boxes: Box[] = [];
   const low = (x: number, z: number, w: number, d: number) => {
-    boxes.push({ x, z, w, d, h: LOW });
+    boxes.push({ x, z, w, d, h: LOW, collisionPolygon: rockFootprint(w, d) });
   };
 
   for (const [sx, sz] of CORNERS) {
@@ -296,9 +402,9 @@ function buildDunes(): Box[] {
   }
 
   // Три скальных выхода — единственное, что держит снаряд.
-  boxes.push({ x: 0, z: 0, w: 12, d: 12, h: 4.5 });
-  boxes.push({ x: -38, z: 38, w: 9, d: 9, h: 4 });
-  boxes.push({ x: 38, z: -38, w: 9, d: 9, h: 4 });
+  boxes.push({ x: 0, z: 0, w: 12, d: 12, h: 4.5, collisionPolygon: rockFootprint(12, 12) });
+  boxes.push({ x: -38, z: 38, w: 9, d: 9, h: 4, collisionPolygon: rockFootprint(9, 9) });
+  boxes.push({ x: 38, z: -38, w: 9, d: 9, h: 4, collisionPolygon: rockFootprint(9, 9) });
 
   return boxes;
 }
@@ -316,7 +422,7 @@ function buildDunes(): Box[] {
 function buildHills(): Box[] {
   const boxes: Box[] = [];
   const rock = (x: number, z: number, w: number, d: number, h: number) => {
-    boxes.push({ x, z, w, d, h });
+    boxes.push({ x, z, w, d, h, collisionPolygon: rockFootprint(w, d) });
   };
 
   // Скалы: единственное, что держит снаряд независимо от того, кто где стоит.
@@ -390,12 +496,14 @@ function buildValley(): Box[] {
     boxes.push({ x, z, w, d, h });
   };
 
-  // Хутор: восемь строений вокруг площади, улицы по 12 м. Единственное место
-  // карты, где дерутся вплотную.
+  // Хутор: восемь посещаемых строений вокруг площади, улицы по 10 м. Это
+  // единственное место карты, где можно постоянно менять бой улица/комната.
   for (const x of [-26, 0, 26]) {
     for (const z of [-26, 0, 26]) {
       if (x === 0 && z === 0) continue;
-      add(x, z, 14, 14, 4 + ((Math.abs(x) + Math.abs(z)) % 3));
+      const h = 4 + ((Math.abs(x) + Math.abs(z)) % 3);
+      const doors: BuildingDoor[] = (x + z) % 2 === 0 ? ['south', 'north'] : ['east', 'west'];
+      addVisitableBuilding(boxes, x, z, 16, 16, h, doors);
     }
   }
 

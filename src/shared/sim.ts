@@ -28,7 +28,17 @@ import {
   TURN_RATE_STILL,
   TURRET_RATE,
 } from './constants.js';
-import { boxCollisionSize, type Box, type Input, type ShellState, type TankState } from './types.js';
+import {
+  boxCollisionSize,
+  circleIntersectsPolygon,
+  distanceSquaredToSegment,
+  pointInPolygon,
+  type Box,
+  type Input,
+  type ShellState,
+  type TankState,
+  worldCollisionPolygon,
+} from './types.js';
 
 // Живёт в constants.ts, чтобы рельеф мог им пользоваться, не замыкая импорты
 // на симуляцию. Половина проекта берёт clamp отсюда, поэтому здесь он и остаётся.
@@ -161,11 +171,15 @@ function resolveBounds(state: TankState, half: number): number {
   return headOn(state, nx, nz);
 }
 
-/** Выталкивание круга танка из прямоугольных препятствий; результат — как у resolveBounds. */
+/** Выталкивание круга танка из препятствий; результат — как у resolveBounds. */
 function resolveObstacles(state: TankState, obstacles: Box[]): number {
   let worst = 0;
   for (const box of obstacles) {
     const tankRadius = box.collisionTankRadius ?? TANK_RADIUS;
+    if (box.collisionPolygon && box.collisionPolygon.length >= 3) {
+      worst = Math.max(worst, resolvePolygonObstacle(state, box, tankRadius));
+      continue;
+    }
     if (box.collisionRadius !== undefined) {
       const minDist = tankRadius + box.collisionRadius;
       const dx = state.x - box.x;
@@ -226,6 +240,71 @@ function resolveObstacles(state: TankState, obstacles: Box[]): number {
   return worst;
 }
 
+/** Выталкивание круга танка из выпуклого многоугольника. */
+function resolvePolygonObstacle(state: TankState, box: Box, radius: number): number {
+  const polygon = worldCollisionPolygon(box);
+  if (!circleIntersectsPolygon(state.x, state.z, radius, polygon)) return 0;
+
+  let nearestX = 0;
+  let nearestZ = 0;
+  let nearestDistance2 = Infinity;
+  let nearestNormal = { x: 0, z: 0 };
+  const winding = polygonArea(polygon) >= 0 ? 1 : -1;
+
+  for (let i = 0; i < polygon.length; i++) {
+    const [ax, az] = polygon[i];
+    const [bx, bz] = polygon[(i + 1) % polygon.length];
+    const edgeX = bx - ax;
+    const edgeZ = bz - az;
+    const edgeLength = Math.hypot(edgeX, edgeZ) || 1;
+    const normal = { x: edgeZ * winding / edgeLength, z: -edgeX * winding / edgeLength };
+    const length2 = edgeX * edgeX + edgeZ * edgeZ || 1;
+    const t = Math.max(0, Math.min(1, ((state.x - ax) * edgeX + (state.z - az) * edgeZ) / length2));
+    const pointX = ax + edgeX * t;
+    const pointZ = az + edgeZ * t;
+    const dx = state.x - pointX;
+    const dz = state.z - pointZ;
+    const distance2 = dx * dx + dz * dz;
+    if (distance2 < nearestDistance2) {
+      nearestDistance2 = distance2;
+      nearestX = pointX;
+      nearestZ = pointZ;
+      nearestNormal = normal;
+    }
+  }
+
+  if (pointInPolygon(state.x, state.z, polygon)) {
+    // Центр оказался внутри камня: выталкиваем через ближайшую грань, как из
+    // обычного Box, но уже по нормали конкретного ребра.
+    const distance = Math.sqrt(nearestDistance2);
+    state.x += nearestNormal.x * (radius + distance);
+    state.z += nearestNormal.z * (radius + distance);
+    return 1;
+  }
+
+  const distance = Math.sqrt(nearestDistance2);
+  if (distance > 1e-8) {
+    const push = (radius - distance) / distance;
+    state.x += (state.x - nearestX) * push;
+    state.z += (state.z - nearestZ) * push;
+    return headOn(state, (state.x - nearestX) / distance, (state.z - nearestZ) / distance);
+  }
+
+  state.x += nearestNormal.x * radius;
+  state.z += nearestNormal.z * radius;
+  return headOn(state, nearestNormal.x, nearestNormal.z);
+}
+
+function polygonArea(polygon: Array<[number, number]>): number {
+  let area = 0;
+  for (let i = 0; i < polygon.length; i++) {
+    const [ax, az] = polygon[i];
+    const [bx, bz] = polygon[(i + 1) % polygon.length];
+    area += ax * bz - bx * az;
+  }
+  return area * 0.5;
+}
+
 // --- Снаряды ---
 
 /** Снаряд, вылетающий из башни танка. Скорость танка не добавляется — так проще целиться. */
@@ -264,9 +343,10 @@ export interface ShellHit {
 /**
  * Ближайшее препятствие или стена карты на пути снаряда за время dt; null — путь свободен.
  *
- * Прямоугольники раздуты на радиус снаряда, поэтому сам снаряд считается точкой,
- * и задача сводится к пересечению отрезка с AABB методом слэбов. Заодно это
- * избавляет от подшагов: касание находится точно, сквозь тонкий блок не проскочить.
+ * Прямоугольники и выпуклые многоугольники раздуваются на радиус снаряда,
+ * поэтому сам снаряд считается точкой. Для прямоугольников используется AABB,
+ * для камней — пересечение с набором полуплоскостей. Заодно это избавляет от
+ * подшагов: касание находится точно, сквозь тонкий блок не проскочить.
  */
 export function sweepShell(
   shell: ShellState,
@@ -280,12 +360,85 @@ export function sweepShell(
 
   let best = sweepBounds(shell.x, shell.z, dx, dz, half);
   for (const box of obstacles) {
-    const hit = box.collisionRadius !== undefined
+    const hit = box.collisionPolygon && box.collisionPolygon.length >= 3
+      ? sweepPolygonObstacle(shell, dt, box)
+      : box.collisionRadius !== undefined
       ? sweepCircleObstacle(shell, dt, box)
       : sweepBox(shell.x, shell.z, dx, dz, box);
     if (hit && (best === null || hit.t < best.t)) best = hit;
   }
   return best;
+}
+
+/** Свип снаряда по выпуклому многоугольнику, раздутому на радиус снаряда. */
+function sweepPolygonObstacle(shell: ShellState, dt: number, box: Box): ShellHit | null {
+  const polygon = worldCollisionPolygon(box);
+  const dx = shell.vx * dt;
+  const dz = shell.vz * dt;
+  const winding = polygonArea(polygon) >= 0 ? 1 : -1;
+  let enter = 0;
+  let exit = 1;
+  let hitNormal = { x: 0, z: 0 };
+
+  for (let i = 0; i < polygon.length; i++) {
+    const [ax, az] = polygon[i];
+    const [bx, bz] = polygon[(i + 1) % polygon.length];
+    const edgeX = bx - ax;
+    const edgeZ = bz - az;
+    const edgeLength = Math.hypot(edgeX, edgeZ) || 1;
+    const nx = edgeZ * winding / edgeLength;
+    const nz = -edgeX * winding / edgeLength;
+    // Для выпуклого полигона внутри означает dot(outward, p - edge) <= radius.
+    const start = (shell.x - ax) * nx + (shell.z - az) * nz - SHELL_RADIUS;
+    const travel = dx * nx + dz * nz;
+    if (Math.abs(travel) < 1e-9) {
+      if (start > 0) return null;
+      continue;
+    }
+
+    const crossing = -start / travel;
+    if (travel < 0) {
+      if (crossing > enter) {
+        enter = crossing;
+        hitNormal = { x: nx, z: nz };
+      }
+    } else {
+      exit = Math.min(exit, crossing);
+    }
+    if (enter > exit) return null;
+  }
+
+  if (enter < 0 || pointInPolygon(shell.x, shell.z, polygon)) {
+    return { t: 0, nx: 0, nz: 0, stuck: true };
+  }
+  if (enter > 1) return null;
+  if (hitNormal.x === 0 && hitNormal.z === 0) {
+    hitNormal = nearestPolygonNormal(shell.x, shell.z, polygon, winding);
+  }
+  return { t: enter, nx: hitNormal.x, nz: hitNormal.z, stuck: false };
+}
+
+function nearestPolygonNormal(
+  x: number,
+  z: number,
+  polygon: Array<[number, number]>,
+  winding: number,
+): { x: number; z: number } {
+  let best = Infinity;
+  let result = { x: 0, z: 0 };
+  for (let i = 0; i < polygon.length; i++) {
+    const [ax, az] = polygon[i];
+    const [bx, bz] = polygon[(i + 1) % polygon.length];
+    const edgeX = bx - ax;
+    const edgeZ = bz - az;
+    const length = Math.hypot(edgeX, edgeZ) || 1;
+    const distance = distanceSquaredToSegment(x, z, ax, az, bx, bz);
+    if (distance < best) {
+      best = distance;
+      result = { x: edgeZ * winding / length, z: -edgeX * winding / length };
+    }
+  }
+  return result;
 }
 
 /** Свип круглого ствола: крона остаётся декорацией, а форма коллизии не квадратная. */

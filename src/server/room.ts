@@ -62,7 +62,7 @@
   WRECK_COLLISION_W,
   WRECK_COLLISION_D,
   WRECK_TANK_COLLISION_RADIUS,
-  ROYALE_SQUAD_COUNT,
+  royaleSquadCount,
   ROYALE_SQUAD_SIZE,
   ROYALE_START_COUNTDOWN_S,
   isRoyaleSquadSize,
@@ -83,7 +83,7 @@
   type RoyaleSquadSize,
   type Ruleset,
 } from '../shared/constants.js';
-import { buildScene, bushBoxes, bushIndexAt, coverBoxes, isMapId, passableObstacles, ROYALE_MAP_ID, spawnCount, spawnPoint } from '../shared/map.js';
+import { buildScene, bushBoxes, bushIndexAt, coverBoxes, isMapId, passableObstacles, ROYALE_MAP_ID, spawnPoint } from '../shared/map.js';
 import type { RoomConfig, RoyaleZoneState, ServerMessage, WavePhase, WaveState } from '../shared/protocol.js';
 import {
   bounceShell,
@@ -109,6 +109,7 @@ import {
   TEAM_PLAYERS,
   TEAM_TWO,
   boxCollisionSize,
+  circleIntersectsPolygon,
   createTankState,
   type BonusState,
   type Boom,
@@ -123,8 +124,10 @@ import {
   type SnapshotEntry,
   type SnapshotShell,
   type TankState,
+  worldCollisionPolygon,
 } from '../shared/types.js';
 import { botName, botSpawn, createBrain, hasShot, think, type BotBrain, type BotZone } from './bot.js';
+import { RoyaleSpawner, type RoyaleDrop } from './royaleSpawn.js';
 
 /** Перезарядка и респавн считаются в тиках, чтобы жить в тех же часах, что и симуляция. */
 const RELOAD_TICKS = Math.round(RELOAD_S * TICK_HZ);
@@ -643,15 +646,11 @@ export class Room {
     // а финал всегда один. Может попасть в застройку — это честная
     // случайность, а не курируемый список удачных мест.
     const { x: centerX, z: centerZ } = this.randomZoneCenter();
-    // Стартовый круг обязан накрывать все реальные точки высадки, даже если
-    // случайный центр зоны оказался в другом районе. Иначе танк честно
-    // десантировался бы сразу вне безопасной зоны и получал бы урон до старта.
-    let farthestSpawn = 0;
-    for (let i = 0; i < spawnCount(this.mapId); i++) {
-      const spawn = spawnPoint(i, this.mapId);
-      farthestSpawn = Math.max(farthestSpawn, Math.hypot(spawn.x - centerX, spawn.z - centerZ));
-    }
-    const startRadius = Math.max(ROYALE_ZONE_FINAL_RADIUS + 1, this.half - 12, farthestSpawn + 10);
+    // Зона в первой фазе матча — вся карта: круг с запасом накрывает даже
+    // углы квадратной карты, чтобы высадка была честно «где угодно», а не
+    // сразу отрезала четверти карты как недоступные. Сжиматься она начнёт
+    // только после ROYALE_ZONE_START_WAIT_S — см. updateRoyaleZone.
+    const startRadius = Math.hypot(this.half, this.half) + 5;
     this.royaleZone = {
       x: centerX,
       z: centerZ,
@@ -668,105 +667,50 @@ export class Room {
     };
     this.spawnRoyaleLoot();
 
+    // Один спавнер на весь матч: он копит уже занятые точки по ходу расстановки,
+    // так что сквады не садятся друг другу в корпус, хотя точка для каждого —
+    // случайная, где угодно внутри зоны (она пока и есть вся карта).
+    const spawner = new RoyaleSpawner(this.half, this.moveObstacles);
+    const squadCount = royaleSquadCount(this.royaleSquadSize);
+    const drops = new Map<number, RoyaleDrop[]>();
+    const dropFor = (team: number): RoyaleDrop[] => {
+      let drop = drops.get(team);
+      if (!drop) {
+        drop = spawner.squadDrop(this.royaleZone, this.royaleSquadSize);
+        drops.set(team, drop);
+      }
+      return drop;
+    };
+
     // Люди распределяются по сквадам по порядку входа. В соло каждый получает
     // отдельную команду, в дуо — по два места, в скваде — до четырёх.
     const humans = [...this.players.values()].filter((player) => !player.brain).sort((a, b) => a.id - b.id);
     humans.forEach((player, index) => {
       const team = Math.floor(index / this.royaleSquadSize);
       player.team = team;
-      // Перемещаем людей на ту же компактную точку, которую получат их
+      // Перемещаем людей на ту же случайную точку высадки, которую получат их
       // союзные боты. Иначе бот-напарник был бы рядом с игроком только по
-      // team id, но физически оставался на обычном одиночном спавне.
-      this.respawn(player, this.royaleSquadSpawn(team, index % this.royaleSquadSize));
+      // team id, но физически оставался бы в другом месте карты.
+      this.respawn(player, dropFor(team)[index % this.royaleSquadSize]);
     });
 
-    // Заполняем все четыре сквада ботами, включая свободные места в людском.
-    for (let team = 0; team < ROYALE_SQUAD_COUNT; team++) {
-      while (this.countTeam(team) < this.royaleSquadSize) this.spawnRoyaleBot(team);
+    // Заполняем все сквады ботами, включая свободные места в людском.
+    for (let team = 0; team < squadCount; team++) {
+      while (this.countTeam(team) < this.royaleSquadSize) {
+        this.spawnRoyaleBot(team, dropFor(team)[this.countTeam(team)]);
+      }
     }
     this.emitWave();
   }
 
-  private spawnRoyaleBot(team: number): void {
+  private spawnRoyaleBot(team: number, spawn: RoyaleDrop): void {
     const index = this.botCounter++;
-    const bot = this.create(
-      botName(index),
-      team,
-      this.royaleSquadSpawn(team, this.countTeam(team)),
-      NO_SEND,
-    );
+    const bot = this.create(botName(index), team, spawn, NO_SEND);
     const tier = Math.min(MAX_TIER, this.difficulty + (team === TEAM_PLAYERS ? 0 : Math.random() < 0.25 ? 1 : 0));
     bot.brain = createBrain(tier, this.tick, index);
     bot.hp = BOT_HP;
     this.players.set(bot.id, bot);
     this.emit({ t: 'joined', player: this.info(bot) });
-  }
-
-  /**
-   * Компактная формация высадки одного BR-сквада.
-   *
-   * Обычный botSpawn специально ищет дальнюю от врагов точку — для командного
-   * боя это полезно, но в BR он разбрасывал союзников по всей карте. Здесь у
-   * каждого сквада свой якорь на внешнем кольце карты, а его участники стоят
-   * рядом с ним, сохраняя небольшую дистанцию между корпусами.
-   */
-  private royaleSquadSpawn(team: number, member: number): { x: number; z: number; angle: number } {
-    const slots = this.royaleSquadSize === 1
-      ? [[0, 0]]
-      : this.royaleSquadSize === 2
-        ? [[-3.2, 0], [3.2, 0]]
-        : [[-3.2, -2.8], [3.2, -2.8], [-3.2, 2.8], [3.2, 2.8]];
-    const slot = slots[Math.min(member, slots.length - 1)];
-    const total = spawnCount(this.mapId);
-    const firstAnchor = Math.floor((team * total) / ROYALE_SQUAD_COUNT);
-
-    // Ищем ближайший к своему сектору якорь, вокруг которого вся формация
-    // помещается на свободном физическом месте. Это сохраняет совместимость
-    // с картами, где рядом с одной из точек позже появятся новые здания.
-    for (let offset = 0; offset < total; offset++) {
-      const anchor = spawnPoint(firstAnchor + offset, this.mapId);
-      const length = Math.hypot(anchor.x, anchor.z) || 1;
-      const inwardX = -anchor.x / length;
-      const inwardZ = -anchor.z / length;
-      const tangentX = -inwardZ;
-      const tangentZ = inwardX;
-      const formation = slots.map(([lateral, depth]) => ({
-        x: anchor.x + tangentX * lateral + inwardX * depth,
-        z: anchor.z + tangentZ * lateral + inwardZ * depth,
-      }));
-      if (formation.every((point) => this.royaleSpawnIsFree(point.x, point.z))) {
-        return { x: formation[Math.min(member, formation.length - 1)].x, z: formation[Math.min(member, formation.length - 1)].z, angle: anchor.angle };
-      }
-    }
-
-    // Точки BR заранее расставлены на свободном кольце, поэтому сюда можно
-    // попасть только при необычной пользовательской карте. Даже тогда
-    // сохраняем группировку, вместо возврата к раздельным botSpawn-точкам.
-    const anchor = spawnPoint(firstAnchor, this.mapId);
-    const length = Math.hypot(anchor.x, anchor.z) || 1;
-    const inwardX = -anchor.x / length;
-    const inwardZ = -anchor.z / length;
-    const tangentX = -inwardZ;
-    const tangentZ = inwardX;
-    return {
-      x: anchor.x + tangentX * slot[0] + inwardX * slot[1],
-      z: anchor.z + tangentZ * slot[0] + inwardZ * slot[1],
-      angle: anchor.angle,
-    };
-  }
-
-  /** Проверяет, не заводит ли формация танк в физический блок или за край. */
-  private royaleSpawnIsFree(x: number, z: number): boolean {
-    if (Math.abs(x) > this.half - TANK_RADIUS || Math.abs(z) > this.half - TANK_RADIUS) return false;
-    return this.moveObstacles.every((box) => {
-      const tankRadius = box.collisionTankRadius ?? TANK_RADIUS;
-      if (box.collisionRadius !== undefined) {
-        return Math.hypot(x - box.x, z - box.z) > box.collisionRadius + tankRadius;
-      }
-      const size = boxCollisionSize(box);
-      return Math.abs(x - box.x) > size.w / 2 + tankRadius &&
-        Math.abs(z - box.z) > size.d / 2 + tankRadius;
-    });
   }
 
   private countTeam(team: number): number {
@@ -1450,6 +1394,14 @@ export class Room {
       if (Math.abs(candidate.x) > this.half - 8 || Math.abs(candidate.z) > this.half - 8) continue;
       if (this.obstacles.some((box) => {
         const tankRadius = box.collisionTankRadius ?? TANK_RADIUS;
+        if (box.collisionPolygon && box.collisionPolygon.length >= 3) {
+          return circleIntersectsPolygon(
+            candidate.x,
+            candidate.z,
+            tankRadius + BONUS_RADIUS,
+            worldCollisionPolygon(box),
+          );
+        }
         if (box.collisionRadius !== undefined) {
           return Math.hypot(candidate.x - box.x, candidate.z - box.z) < box.collisionRadius + tankRadius + BONUS_RADIUS;
         }
@@ -1485,6 +1437,13 @@ export class Room {
       let taken = false;
       for (const box of this.obstacles) {
         const tankRadius = box.collisionTankRadius ?? TANK_RADIUS;
+        if (box.collisionPolygon && box.collisionPolygon.length >= 3) {
+          if (circleIntersectsPolygon(x, z, tankRadius + BONUS_RADIUS, worldCollisionPolygon(box))) {
+            taken = true;
+            break;
+          }
+          continue;
+        }
         if (box.collisionRadius !== undefined) {
           if (Math.hypot(x - box.x, z - box.z) < box.collisionRadius + tankRadius + BONUS_RADIUS) {
             taken = true;

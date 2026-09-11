@@ -300,8 +300,18 @@ export type RoyaleSquadSize = (typeof ROYALE_SQUAD_SIZES)[number];
 export function isRoyaleSquadSize(v: unknown): v is RoyaleSquadSize {
   return v === 1 || v === 2 || v === 4;
 }
-/** Сколько команд всего заполняем ботами, если людей в комнате мало. */
-export const ROYALE_SQUAD_COUNT = 4;
+/**
+ * Сколько танков всего выходит в BR, независимо от формата: заполняем
+ * ботами столько сквадов, сколько нужно, чтобы дойти ровно до этого числа.
+ * 40 делится без остатка на все форматы (1, 2, 4), так что при полном
+ * скваде это 10 команд, при дуо — 20, при соло — все 40 поодиночке.
+ */
+export const ROYALE_TOTAL_PLAYERS = 40;
+
+/** Сколько команд заполняем при данном размере сквада, чтобы выйти на ROYALE_TOTAL_PLAYERS. */
+export function royaleSquadCount(size: RoyaleSquadSize): number {
+  return ROYALE_TOTAL_PLAYERS / size;
+}
 /** Короткий предстартовый отсчёт после заполнения состава BR. */
 export const ROYALE_START_COUNTDOWN_S = 5;
 export const ROYALE_ZONE_START_WAIT_S = 45;

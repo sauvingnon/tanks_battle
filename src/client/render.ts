@@ -91,7 +91,6 @@ const BONUS_HOVER = 1.7;
  * Сколько метров занимает одна клетка текстуры. У земли крупнее: она видна
  * с высоты и почти в профиль, и мелкий рисунок на ней превращается в рябь.
  */
-const GROUND_TILE = 9;
 const BLOCK_TILE = 4;
 
 /**
@@ -501,6 +500,13 @@ const MUZZLE_PRESET: EffectPreset = {
   glow: GLOW_MUZZLE,
 };
 
+/** Единственный настоящий свет — локальная вспышка у пушки игрока. */
+const LOCAL_MUZZLE_LIGHT = {
+  intensity: 68,
+  distance: 21,
+  decay: 2,
+};
+
 /**
  * Дым от выстрела: всплывает и расплывается. Держим его редким и небольшим —
  * своя пушка стоит прямо на линии взгляда, и плотное облако закрывало бы цель
@@ -655,16 +661,27 @@ export interface TankHandle {
   everSeen: boolean;
   /** Когда остов выбросит следующий клуб дыма, в секундах от начала гибели. */
   smokeAt: number;
-  label: HTMLElement;
-  hpFill: HTMLElement;
-  /** Размеры подписи в пикселях, замеряются один раз — текст не меняется. */
+  /**
+   * Подпись строится лениво (см. ensureLabel): подписан только товарищ, а
+   * на BR-матч это obычно 1-3 танка из 40 — остальным 3-4 десяткам DOM-узел
+   * и вынужденный offsetWidth (форсированная раскладка) не нужны вовсе.
+   */
+  label: HTMLElement | null;
+  hpFill: HTMLElement | null;
+  /** Размеры подписи в пикселях, замеряются один раз при постройке — текст не меняется. */
   labelHalfWidth: number;
   labelHeight: number;
   labelVisible: boolean;
+  /** Данные для отложенной постройки подписи, когда она наконец понадобится. */
+  name: string;
+  isSelf: boolean;
+  isBot: boolean;
+  /** Текущая командная раскраска — нужна, чтобы применить класс сразу при отложенной постройке. */
+  faction: TankFaction;
   /**
-   * Разрешает ли подпись сам режим боя. В аркаде подписаны все, в реалистичных
-   * правилах — только товарищи. Флаг ставит main.ts, потому что «товарищ» —
-   * это про команды и режим комнаты, а рендер про них ничего не знает.
+   * Разрешает ли подпись сам режим боя: подписан только товарищ. Флаг ставит
+   * main.ts, потому что «товарищ» — это про команды и режим комнаты, а рендер
+   * про них ничего не знает.
    */
   plated: boolean;
   /** Подбитый танк не рисуется и не подписывается. */
@@ -677,6 +694,7 @@ export interface TankHandle {
   /** Фары видны у всех танков ночью; настоящие источники света есть только у своего. */
   headlights: THREE.Group;
   headlightSpots: THREE.SpotLight[];
+  rearLightSpots: THREE.SpotLight[];
 }
 
 interface ContactMarkerHandle {
@@ -812,6 +830,16 @@ export class Scene3D {
   private readonly shellPool: THREE.Group[] = [];
   private readonly effects: Effect[] = [];
   private readonly effectPool: Effect[] = [];
+  private effectsWarmed = false;
+  /** Не создаём PointLight для чужих танков: один локальный источник заметно
+   * дешевле и не меняет освещение всей сцены от каждого выстрела. */
+  private readonly localMuzzleLight = new THREE.PointLight(
+    0xfff3d0,
+    0,
+    LOCAL_MUZZLE_LIGHT.distance,
+    LOCAL_MUZZLE_LIGHT.decay,
+  );
+  private localMuzzleLightLife = 0;
 
   /** Переиспользуемые буферы — чтобы не мусорить в куче каждый кадр. */
   private readonly projected = new THREE.Vector3();
@@ -917,7 +945,22 @@ export class Scene3D {
     roughness: 0.28,
     metalness: 0.05,
   });
+  private readonly rearLightMaterial = new THREE.MeshStandardMaterial({
+    color: 0x8f2424,
+    emissive: 0xff1f1f,
+    emissiveIntensity: 2.6,
+    roughness: 0.3,
+    metalness: 0.05,
+  });
+  private readonly rearLightFrameMaterial = new THREE.MeshStandardMaterial({
+    color: 0x24272b,
+    roughness: 0.72,
+    metalness: 0.38,
+    flatShading: true,
+  });
   private readonly headlightGeometry = new THREE.SphereGeometry(0.16, 8, 6);
+  private readonly rearLightGeometry = new RoundedBoxGeometry(0.42, 0.2, 0.08, 0.035, 1);
+  private readonly rearLightFrameGeometry = new RoundedBoxGeometry(0.58, 0.34, 0.08, 0.04, 1);
 
   /**
    * Цепочка постобработки для свечения. Держится собранной всегда, но при
@@ -1011,6 +1054,12 @@ export class Scene3D {
     this.composer.addPass(new OutputPass());
 
     this.scene.add(this.world);
+    this.localMuzzleLight.castShadow = false;
+    // Источник всегда входит в вариант шейдера освещения, но до выстрела
+    // ничего не добавляет к картинке. Если переключать visible в бою, three.js
+    // пересобирает материалы сцены ровно на первом выстреле.
+    this.localMuzzleLight.visible = true;
+    this.scene.add(this.localMuzzleLight);
     const weatherGeometry = new THREE.BufferGeometry();
     this.weatherAttribute = new THREE.BufferAttribute(this.weatherPositions, 3);
     weatherGeometry.setAttribute('position', this.weatherAttribute);
@@ -1098,9 +1147,9 @@ export class Scene3D {
     this.debris.clear();
 
     const groundSize = half * 6;
-    // Текстура повторяется клеткой в GROUND_TILE метров: у плоскости развёртка
-    // одна на всю ширину, и без повтора крупа растянулась бы на 840 м в пятно.
-    this.groundMap.repeat.set(groundSize / GROUND_TILE, groundSize / GROUND_TILE);
+    // Одна текстура покрывает всё поле. Повтор маленькой клетки давал заметные
+    // квадратные швы на земле, особенно при взгляде почти параллельно плоскости.
+    this.groundMap.repeat.set(1, 1);
     const ground = new THREE.Mesh(
       new THREE.PlaneGeometry(groundSize, groundSize),
       new THREE.MeshStandardMaterial({
@@ -1114,12 +1163,6 @@ export class Scene3D {
     this.world.add(ground);
     this.buildGroundPatches(half, mapId);
     this.buildGrass(half, obstacles, mapId);
-
-    const grid = new THREE.GridHelper(half * 2, half / 2.5, 0x5c6b52, 0x475040);
-    grid.position.y = 0.02;
-    (grid.material as THREE.Material).transparent = true;
-    (grid.material as THREE.Material).opacity = 0.35;
-    this.world.add(grid);
 
     const wallMaterial = new THREE.MeshStandardMaterial({
       color: COLOR_WALL,
@@ -1369,6 +1412,7 @@ export class Scene3D {
       treeLeafMaterial,
       treeLeafAltMaterial,
     );
+    this.warmupEffects();
   }
 
   /**
@@ -2217,6 +2261,7 @@ export class Scene3D {
 
     const headlights = new THREE.Group();
     const headlightSpots: THREE.SpotLight[] = [];
+    const rearLightSpots: THREE.SpotLight[] = [];
     for (const side of [-1, 1]) {
       const lamp = new THREE.Mesh(this.headlightGeometry, this.headlightMaterial);
       lamp.position.set(side * 0.82, 1.12, 2.12);
@@ -2233,28 +2278,35 @@ export class Scene3D {
       spot.target = target;
       headlightSpots.push(spot);
     }
+    for (const side of [-1, 1]) {
+      // Кормовые огни не шарики: плафон и тёмная рамка повторяют плоскую
+      // заднюю броню и выглядят как встроенные габариты.
+      const frame = new THREE.Mesh(this.rearLightFrameGeometry, this.rearLightFrameMaterial);
+      frame.position.set(side * 0.82, 1.12, -1.925);
+      const lamp = new THREE.Mesh(this.rearLightGeometry, this.rearLightMaterial);
+      lamp.position.set(side * 0.82, 1.12, -1.985);
+      headlights.add(frame, lamp);
+      // Красные задние фонари у чужих танков тоже видны, но настоящий
+      // направленный свет создаём только у своего — как с передними фарами.
+      if (!isSelf) continue;
+      const spot = new THREE.SpotLight(0xff3030, 6, 24, Math.PI / 9, 0.8, 1.6);
+      spot.position.set(side * 0.82, 1.14, -1.99);
+      spot.castShadow = false;
+      const target = new THREE.Object3D();
+      target.position.set(side * 0.82, 0.2, -28);
+      headlights.add(spot, target);
+      spot.target = target;
+      rearLightSpots.push(spot);
+    }
     headlights.visible = this.nightLightsOn;
-    root.add(headlights);
+    // Фонари должны быть частью верхней брони, а не корня танка: body получает
+    // крен и клевок подвески, upperHull наследует их, и все четыре огня идут
+    // вместе с корпусом во время качения/наклона.
+    upperHull.add(headlights);
 
     this.scene.add(root);
 
-    const label = document.createElement('div');
-    label.className = isSelf ? 'nameplate is-self' : isBot ? 'nameplate is-bot' : 'nameplate';
-
-    const text = document.createElement('span');
-    text.textContent = name;
-    label.appendChild(text);
-
-    // Полоска здоровья фиксированной ширины: меняется только заливка, поэтому
-    // размеры подписи остаются постоянными и их можно замерить один раз.
-    const bar = document.createElement('i');
-    bar.className = 'np-hp';
-    const hpFill = document.createElement('b');
-    bar.appendChild(hpFill);
-    label.appendChild(bar);
-
-    this.labelContainer.appendChild(label);
-
+    // Подпись строится лениво — см. ensureLabel() и комментарий у TankHandle.label.
     const handle: TankHandle = {
       root,
       body,
@@ -2282,20 +2334,23 @@ export class Scene3D {
       dying: -1,
       smokeAt: 0,
       everSeen: false,
-      label,
-      hpFill,
-      // Читаем размеры один раз: offsetWidth каждый кадр заставлял бы браузер
-      // пересчитывать раскладку на все подписи сразу.
-      labelHalfWidth: Math.round(label.offsetWidth / 2),
-      labelHeight: label.offsetHeight,
-      labelVisible: true,
-      plated: true,
+      label: null,
+      hpFill: null,
+      labelHalfWidth: 0,
+      labelHeight: 0,
+      labelVisible: false,
+      name,
+      isSelf,
+      isBot,
+      faction: 'neutral',
+      plated: false,
       alive: true,
       cloaked: false,
       hp: MAX_HP,
       canopy,
       headlights,
       headlightSpots,
+      rearLightSpots,
     };
     this.tanks.set(id, handle);
     return handle;
@@ -2311,10 +2366,15 @@ export class Scene3D {
     handle.paint.color.setHex(paintColor);
     if (!handle.alive) handle.paint.color.multiplyScalar(WRECK_DARKEN);
 
-    for (const name of ['faction-self', 'faction-ally', 'faction-enemy']) {
-      handle.label.classList.remove(name);
+    handle.faction = faction;
+    // Подписи может ещё не быть (см. ensureLabel) — тогда класс применится сам,
+    // как только она наконец понадобится.
+    if (handle.label) {
+      for (const name of ['faction-self', 'faction-ally', 'faction-enemy']) {
+        handle.label.classList.remove(name);
+      }
+      if (faction !== 'neutral') handle.label.classList.add(`faction-${faction}`);
     }
-    if (faction !== 'neutral') handle.label.classList.add(`faction-${faction}`);
   }
 
   /** Создаёт одну сторону гусеницы и ставит звенья в исходную фазу. */
@@ -2356,10 +2416,12 @@ export class Scene3D {
 
     if (hp !== handle.hp) {
       handle.hp = hp;
-      const fraction = Math.max(0, Math.min(1, hp / max));
-      handle.hpFill.style.width = `${(fraction * 100).toFixed(0)}%`;
-      // Зелёный -> жёлтый -> красный по мере потери брони.
-      handle.hpFill.style.background = `hsl(${Math.round(fraction * 105)} 70% 48%)`;
+      if (handle.hpFill) {
+        const fraction = Math.max(0, Math.min(1, hp / max));
+        handle.hpFill.style.width = `${(fraction * 100).toFixed(0)}%`;
+        // Зелёный -> жёлтый -> красный по мере потери брони.
+        handle.hpFill.style.background = `hsl(${Math.round(fraction * 105)} 70% 48%)`;
+      }
     }
 
     if (alive !== handle.alive) {
@@ -2536,16 +2598,49 @@ export class Scene3D {
   }
 
   /**
-   * Разрешена ли танку подпись. В аркаде подписаны все, в реалистичных правилах
-   * — только товарищи, поэтому решение принимает main.ts: рендер не знает ни про
-   * команды, ни про режим комнаты.
+   * Разрешена ли танку подпись — подписан только товарищ, решение принимает
+   * main.ts: рендер не знает ни про команды, ни про режим комнаты.
    *
    * Гасить подпись руками не нужно — updateLabels каждый кадр решает это заново
-   * и снимет её сам, ровно как делает «Маскировка».
+   * и снимет её сам, ровно как делает «Маскировка». А вот построить саму
+   * DOM-подпись, если её ещё не было, нужно именно тут: до первого on=true
+   * она вообще не нужна — см. TankHandle.label.
    */
   setNameplate(id: number, on: boolean): void {
     const handle = this.tanks.get(id);
-    if (handle) handle.plated = on;
+    if (!handle) return;
+    handle.plated = on;
+    if (on) this.ensureLabel(handle);
+  }
+
+  /** Строит DOM-подпись танка по накопленным на handle данным — не раньше, чем понадобится. */
+  private ensureLabel(handle: TankHandle): void {
+    if (handle.label) return;
+
+    const label = document.createElement('div');
+    label.className = handle.isSelf ? 'nameplate is-self' : handle.isBot ? 'nameplate is-bot' : 'nameplate';
+    if (handle.faction !== 'neutral') label.classList.add(`faction-${handle.faction}`);
+
+    const text = document.createElement('span');
+    text.textContent = handle.name;
+    label.appendChild(text);
+
+    // Полоска здоровья фиксированной ширины: меняется только заливка, поэтому
+    // размеры подписи остаются постоянными и их можно замерить один раз.
+    const bar = document.createElement('i');
+    bar.className = 'np-hp';
+    const hpFill = document.createElement('b');
+    bar.appendChild(hpFill);
+    label.appendChild(bar);
+
+    this.labelContainer.appendChild(label);
+
+    handle.label = label;
+    handle.hpFill = hpFill;
+    // Читаем размеры один раз: offsetWidth заставляет браузер пересчитать
+    // раскладку — тем дороже, чем больше подписей уже висит на сцене.
+    handle.labelHalfWidth = Math.round(label.offsetWidth / 2);
+    handle.labelHeight = label.offsetHeight;
   }
 
   /**
@@ -2561,7 +2656,7 @@ export class Scene3D {
 
   /** Убрать танк со сцены совсем. */
   private dropTank(id: number, handle: TankHandle): void {
-    handle.label.remove();
+    handle.label?.remove();
     this.scene.remove(handle.root);
     this.tanks.delete(id);
   }
@@ -2985,7 +3080,7 @@ export class Scene3D {
    * Возвращает false, если танка на сцене нет, — вызывающему остаётся рисовать
    * вспышку по координатам снаряда.
    */
-  tankFired(id: number): boolean {
+  tankFired(id: number, local = false): boolean {
     const handle = this.tanks.get(id);
     if (!handle) return false;
     handle.recoil = 1;
@@ -3011,6 +3106,13 @@ export class Scene3D {
 
     this.spawnEffect(point.x, point.y, point.z, MUZZLE_PRESET, angle);
     this.spawnEffect(point.x, point.y, point.z, MUZZLE_SMOKE, angle);
+    if (local) {
+      this.localMuzzleLight.position.copy(point);
+      this.localMuzzleLight.intensity = LOCAL_MUZZLE_LIGHT.intensity;
+      this.localMuzzleLight.distance = LOCAL_MUZZLE_LIGHT.distance;
+      this.localMuzzleLight.decay = LOCAL_MUZZLE_LIGHT.decay;
+      this.localMuzzleLightLife = MUZZLE_PRESET.life;
+    }
     return true;
   }
 
@@ -3050,7 +3152,36 @@ export class Scene3D {
     this.effects.push(fx);
   }
 
-  private createEffect(): Effect {
+  /**
+   * Создаёт и компилирует базовые материалы эффектов до начала боя. Иначе
+   * первый выстрел одновременно создаёт вспышку/дым и просит GPU собрать их
+   * шейдеры, что особенно заметно на слабых видеокартах.
+   */
+  private warmupEffects(): void {
+    if (this.effectsWarmed) return;
+
+    const warmupScene = new THREE.Scene();
+    const warmupCamera = new THREE.PerspectiveCamera(60, 1, 0.1, 100);
+    warmupCamera.position.set(0, 0, 5);
+    warmupCamera.lookAt(0, 0, 0);
+    const warmups: Effect[] = [];
+    for (let i = 0; i < 2; i++) {
+      const fx = this.createEffect(warmupScene);
+      fx.group.visible = true;
+      warmups.push(fx);
+    }
+
+    this.renderer.compile(warmupScene, warmupCamera);
+    for (const fx of warmups) {
+      fx.group.visible = false;
+      warmupScene.remove(fx.group);
+      this.scene.add(fx.group);
+      this.effectPool.push(fx);
+    }
+    this.effectsWarmed = true;
+  }
+
+  private createEffect(scene = this.scene): Effect {
     const group = new THREE.Group();
     group.visible = false;
 
@@ -3086,11 +3217,22 @@ export class Scene3D {
     cone.rotation.x = -Math.PI / 2;
     group.add(cone);
 
-    this.scene.add(group);
+    scene.add(group);
     return { group, flash, ring, cone, life: 0, duration: 1, radius: 1, rise: 0, grow: 0.85, alpha: 0.9 };
   }
 
   private updateEffects(dt: number): void {
+    if (this.localMuzzleLightLife > 0) {
+      this.localMuzzleLightLife -= dt;
+      if (this.localMuzzleLightLife <= 0) {
+        this.localMuzzleLightLife = 0;
+        this.localMuzzleLight.intensity = 0;
+      } else {
+        const t = 1 - this.localMuzzleLightLife / MUZZLE_PRESET.life;
+        this.localMuzzleLight.intensity = LOCAL_MUZZLE_LIGHT.intensity * (1 - t) * (1 - t);
+      }
+    }
+
     for (let i = this.effects.length - 1; i >= 0; i--) {
       const fx = this.effects[i];
       fx.life -= dt;
@@ -3271,6 +3413,10 @@ export class Scene3D {
     this.camera.updateMatrixWorld();
 
     for (const handle of this.tanks.values()) {
+      // Не товарищ — подписи не было и не будет (см. ensureLabel): даже
+      // проекцию на экран считать незачем, а таких танков в BR — почти все.
+      if (!handle.plated && !handle.label) continue;
+
       this.projected.set(
         handle.root.position.x,
         LABEL_HEIGHT,
@@ -3289,6 +3435,7 @@ export class Scene3D {
         this.projected.z > -1 &&
         this.projected.z < 1;
 
+      if (!handle.label) continue;
       if (visible !== handle.labelVisible) {
         handle.label.style.display = visible ? '' : 'none';
         handle.labelVisible = visible;
