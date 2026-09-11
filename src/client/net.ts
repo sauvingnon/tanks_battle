@@ -1,5 +1,5 @@
 import type { GameMode, RoyaleSquadSize, Ruleset } from '../shared/constants.js';
-import { decode, encode, type ClientMessage, type ServerMessage } from '../shared/protocol.js';
+import { decode, decodeSnapshot, encode, type ClientMessage, type ServerMessage } from '../shared/protocol.js';
 import type { Input } from '../shared/types.js';
 
 export interface NetHandlers {
@@ -28,6 +28,8 @@ export class Net {
 
   connect(name: string): void {
     const ws = new WebSocket(socketUrl());
+    // Snapshot приходит бинарём; без этого браузер отдал бы его как Blob.
+    ws.binaryType = 'arraybuffer';
     this.ws = ws;
 
     ws.onopen = () => {
@@ -37,7 +39,8 @@ export class Net {
     };
 
     ws.onmessage = (event) => {
-      const msg = decode<ServerMessage>(String(event.data));
+      const msg: ServerMessage | null =
+        event.data instanceof ArrayBuffer ? decodeSnapshot(event.data) : decode<ServerMessage>(String(event.data));
       if (!msg) return;
       if (msg.t === 'pong' && msg.id === this.pingId) {
         // RTT замеряем по своему же таймстемпу — часы сервера не нужны.

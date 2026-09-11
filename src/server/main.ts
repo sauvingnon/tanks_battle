@@ -5,7 +5,14 @@ import { fileURLToPath } from 'node:url';
 import { WebSocketServer, type WebSocket } from 'ws';
 
 import { DT, MODE_ROYALE, SNAPSHOT_EVERY, TICK_HZ, isMode, isRuleset } from '../shared/constants.js';
-import { decode, encode, type ClientMessage, type ServerMessage } from '../shared/protocol.js';
+import {
+  decode,
+  encode,
+  encodeSnapshot,
+  type ClientMessage,
+  type ServerMessage,
+  type SnapshotPayload,
+} from '../shared/protocol.js';
 import * as leaderboard from './leaderboard.js';
 import { Room, type Player, type TeamRoundResult } from './room.js';
 
@@ -271,20 +278,23 @@ setInterval(() => {
 
   // В обычных режимах список танков можно было сериализовать один раз. В BR
   // список зависит от наблюдателя: сервер обязан не отправлять скрытые цели.
+  const zone = room.royaleZoneState();
   for (const player of room.players.values()) {
     if (player.brain) continue;
-    // Пустые массивы не шлём: снаряды и взрывы бывают в считаных процентах тиков.
-    const entries = room.snapshotEntries(player);
-    let tail = `,"tick":${room.tickCount},"players":${JSON.stringify(entries)}`;
-    if (room.shellCount > 0) tail += `,"shells":${JSON.stringify(room.snapshotShells(player))}`;
-    if (room.boomEvents.length > 0) tail += `,"booms":${JSON.stringify(room.boomEvents)}`;
-    if (room.hitEvents.length > 0) tail += `,"hits":${JSON.stringify(room.hitEvents)}`;
-    if (room.bonusCount > 0) tail += `,"bonuses":${JSON.stringify(room.snapshotBonuses())}`;
-    const zone = room.royaleZoneState();
-    if (zone) tail += `,"zone":${JSON.stringify(zone)}`;
-    if (room.mode === MODE_ROYALE) tail += `,"contacts":${JSON.stringify(room.snapshotContacts(player))}`;
-    // ack — целое из input.seq | 0, так что подстановка в строку безопасна.
-    player.send(`{"t":"snapshot","ack":${player.ack}${tail}}`);
+    // Поля-массивы опускаем, когда пусто: снаряды и взрывы бывают в считаных
+    // процентах тиков, а decodeSnapshot различает «пусто» и «отсутствует».
+    const payload: SnapshotPayload = {
+      tick: room.tickCount,
+      ack: player.ack,
+      players: room.snapshotEntries(player),
+    };
+    if (room.shellCount > 0) payload.shells = room.snapshotShells(player);
+    if (room.boomEvents.length > 0) payload.booms = room.boomEvents;
+    if (room.hitEvents.length > 0) payload.hits = room.hitEvents;
+    if (room.bonusCount > 0) payload.bonuses = room.snapshotBonuses();
+    if (zone) payload.zone = zone;
+    if (room.mode === MODE_ROYALE) payload.contacts = room.snapshotContacts(player);
+    player.send(encodeSnapshot(payload));
   }
 }, STEP_MS / 2);
 

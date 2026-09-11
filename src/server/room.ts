@@ -197,7 +197,8 @@ export interface Player {
   ack: number;
   /** Последний применённый инпут: если новых нет, повторяем его (клиент лагает). */
   last: Input;
-  send: (data: string) => void;
+  /** Бинарь — только snapshot; остальное шлётся текстовым JSON. */
+  send: (data: string | ArrayBuffer) => void;
 }
 
 export interface KillEvent {
@@ -398,7 +399,7 @@ export class Room {
   /** emit рассылает сообщение всем людям в комнате; в тестах его можно не давать. */
   constructor(private readonly emit: (msg: ServerMessage) => void = () => {}) {}
 
-  add(name: string, send: (data: string) => void): Player {
+  add(name: string, send: (data: string | ArrayBuffer) => void): Player {
     const spawn = spawnPoint(this.spawnCounter++, this.mapId);
     const player = this.create(sanitizeName(name), TEAM_PLAYERS, spawn, send);
     player.color = HUMAN_COLORS[this.humanCount % HUMAN_COLORS.length];
@@ -425,7 +426,7 @@ export class Room {
     name: string,
     team: number,
     spawn: { x: number; z: number; angle: number },
-    send: (data: string) => void,
+    send: (data: string | ArrayBuffer) => void,
   ): Player {
     return {
       id: this.nextId++,
