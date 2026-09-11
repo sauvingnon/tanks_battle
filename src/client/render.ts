@@ -798,6 +798,8 @@ export class Scene3D {
   private environmentChangeDone = false;
   private environmentFromIndex = 0;
   private environmentToIndex = 0;
+  /** Личная настройка: весь бой гонять погоду по случайному циклу или держать стартовый профиль карты. */
+  private dynamicWeatherOn = true;
   private readonly environmentScratch = new THREE.Color();
   private nightLightsOn = false;
   /** Часы сцены в секундах: по ним шейдеры считают возраст следов и пылинок. */
@@ -1389,19 +1391,61 @@ export class Scene3D {
     );
   }
 
-  /** Применяет стартовый профиль и заводит одноразовую смену погоды. */
+  /**
+   * Применяет стартовый профиль карты. Если динамическая погода включена,
+   * дальше заводит случайный цикл смен на весь бой (см. updateEnvironment) —
+   * он идёт, пока не сменится карта: она снова вызывает этот метод.
+   */
   private applyEnvironment(mapId: number): void {
     const index = ((mapId % ENVIRONMENT_PROFILES.length) + ENVIRONMENT_PROFILES.length) % ENVIRONMENT_PROFILES.length;
     const profile = ENVIRONMENT_PROFILES[index];
     this.environmentFromIndex = index;
-    this.environmentToIndex = (index + 1) % ENVIRONMENT_PROFILES.length;
+    this.environmentToIndex = index;
     this.environmentElapsed = 0;
     this.environmentTransitionElapsed = 0;
     this.environmentChanging = false;
-    this.environmentChangeDone = false;
+    this.environmentChangeDone = !this.dynamicWeatherOn;
+    if (this.dynamicWeatherOn) this.pickNextEnvironmentTarget();
     this.weatherKind = profile.weather;
     this.applyEnvironmentBlend(profile, profile, 0);
     this.resetWeatherParticles();
+  }
+
+  /**
+   * Динамическая погода — личная настройка, как bloom или вид сверху: на бой
+   * не влияет, в сеть не уходит, и у каждого в комнате может стоять по-своему.
+   * Включили — с текущего профиля стартует случайный цикл смен на весь матч.
+   * Выключили — цикл останавливается сразу на профиле, к которому шёл переход.
+   */
+  setDynamicWeather(on: boolean): void {
+    this.dynamicWeatherOn = on;
+    if (on) {
+      if (this.environmentChangeDone) {
+        this.environmentChangeDone = false;
+        this.environmentElapsed = 0;
+        this.environmentChanging = false;
+        this.pickNextEnvironmentTarget();
+      }
+      return;
+    }
+    if (this.environmentChanging) {
+      const to = ENVIRONMENT_PROFILES[this.environmentToIndex];
+      this.weatherKind = to.weather;
+      this.applyEnvironmentBlend(to, to, 1);
+      this.environmentFromIndex = this.environmentToIndex;
+    }
+    this.environmentChanging = false;
+    this.environmentChangeDone = true;
+  }
+
+  /** Следующий профиль цикла всегда отличается от текущего, иначе «случайный» иногда простаивал бы на месте. */
+  private pickNextEnvironmentTarget(): void {
+    if (ENVIRONMENT_PROFILES.length <= 1) return;
+    let next = this.environmentFromIndex;
+    while (next === this.environmentFromIndex) {
+      next = Math.floor(Math.random() * ENVIRONMENT_PROFILES.length);
+    }
+    this.environmentToIndex = next;
   }
 
   /** Смешивает два профиля без создания объектов на каждом кадре перехода. */
@@ -1440,7 +1484,11 @@ export class Scene3D {
     out.lerp(this.environmentScratch, progress);
   }
 
-  /** Одна смена начинается после разгона боя и больше не повторяется до новой карты. */
+  /**
+   * Пока включена динамическая погода, смены идут одна за другой весь бой:
+   * разгон, переход к случайно выбранному профилю, снова разгон — и так до
+   * смены карты (applyEnvironment). Выключенная — эта функция не делает ничего.
+   */
   private updateEnvironment(dt: number): void {
     if (this.environmentChangeDone) return;
 
@@ -1468,9 +1516,15 @@ export class Scene3D {
 
     if (rawProgress >= 1) {
       this.environmentChanging = false;
-      this.environmentChangeDone = true;
       this.weatherKind = to.weather;
       this.applyEnvironmentBlend(to, to, 1);
+      this.environmentFromIndex = this.environmentToIndex;
+      if (this.dynamicWeatherOn) {
+        this.environmentElapsed = 0;
+        this.pickNextEnvironmentTarget();
+      } else {
+        this.environmentChangeDone = true;
+      }
     }
   }
 

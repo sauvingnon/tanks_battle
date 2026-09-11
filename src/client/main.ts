@@ -1062,6 +1062,7 @@ const setupDiffs = el('setup-diffs');
 const setupStances = el('setup-stances');
 const setupBonuses = el<HTMLInputElement>('setup-bonuses');
 const setupBloom = el<HTMLInputElement>('setup-bloom');
+const setupWeather = el<HTMLInputElement>('setup-weather');
 const setupTop = el<HTMLInputElement>('setup-top');
 const setupFpv = el<HTMLInputElement>('setup-fpv');
 const setupReticles = el('setup-reticles');
@@ -1076,6 +1077,7 @@ const hintDiff = el('hint-diff');
 const hintStance = el('hint-stance');
 const hintBonuses = el('hint-bonuses');
 const hintBloom = el('hint-bloom');
+const hintWeather = el('hint-weather');
 const hintView = el('hint-view');
 const hintReticle = el('hint-reticle');
 const leaderboardToggle = el<HTMLButtonElement>('leaderboard-toggle');
@@ -1373,6 +1375,21 @@ setupBloom.addEventListener('change', () => {
 });
 
 /**
+ * Динамическая погода — тоже личная настройка: сервер о ней ничего не знает,
+ * это чисто визуальный цикл на клиенте. Включена — весь бой погода меняется
+ * случайным циклом и не останавливается, пока не сменится карта. Выключена —
+ * карта держит стартовый профиль без переходов.
+ */
+let weatherOn = localStorage.getItem('tanks:weather') !== 'off';
+scene.setDynamicWeather(weatherOn);
+setupWeather.addEventListener('change', () => {
+  weatherOn = setupWeather.checked;
+  localStorage.setItem('tanks:weather', weatherOn ? 'on' : 'off');
+  scene.setDynamicWeather(weatherOn);
+  renderSetup();
+});
+
+/**
  * Вид сверху — тоже личная настройка, и в сеть она не уходит: сервер шлёт всем
  * одни и те же снапшоты, а во что их превращать, каждый решает сам. Поэтому в
  * одной комнате спокойно уживаются телефон с видом сверху и ПК с видом сзади.
@@ -1493,6 +1510,11 @@ function renderSetup(): void {
   hintBloom.textContent = bloomOn
     ? 'Трассеры, вспышки и взрывы разгораются. Если кадры проседают — сними.'
     : 'Выключено: кадр рисуется одним проходом, без размытия по всему экрану.';
+
+  setupWeather.checked = weatherOn;
+  hintWeather.textContent = weatherOn
+    ? 'Погода весь бой идёт случайным циклом — от ясной до дождя, тумана и снега — и останавливается только со сменой карты.'
+    : 'Выключено: карта держит один стартовый профиль погоды без переходов.';
 
   for (const button of setupReticles.querySelectorAll('button')) {
     button.classList.toggle('is-on', button.dataset.reticle === reticleStyle);
