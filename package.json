@@ -18,6 +18,7 @@
     "check:smoothness": "tsx scripts/check-smoothness.ts",
     "check:combat": "tsx scripts/check-combat.ts",
     "check:bots": "tsx scripts/check-bots.ts",
+    "check:royale": "tsx scripts/check-royale-ai.ts",
     "check:effects": "tsx scripts/check-effects.ts",
     "check:expedition": "tsx scripts/check-expedition.ts",
     "check:team": "tsx scripts/check-team.ts",

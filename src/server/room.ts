@@ -126,7 +126,18 @@ import {
   type TankState,
   worldCollisionPolygon,
 } from '../shared/types.js';
-import { botName, botSpawn, createBrain, hasShot, think, type BotBrain, type BotZone } from './bot.js';
+import {
+  botName,
+  botSpawn,
+  createBrain,
+  hasShot,
+  think,
+  type BotBrain,
+  type BotSelf,
+  type BotWorld,
+  type BotZone,
+} from './bot.js';
+import { RoyaleIntel, RoyalePolicy, royaleThink } from './royaleBrain.js';
 import { RoyaleSpawner, type RoyaleDrop } from './royaleSpawn.js';
 
 /** Перезарядка и респавн считаются в тиках, чтобы жить в тех же часах, что и симуляция. */
@@ -371,6 +382,9 @@ export class Room {
   /** Цели, чья видимость изменилась без движения: выстрел, смерть, окончание засвета. */
   private readonly royaleVisionEvents = new Set<number>();
   private royaleVisionTick = -Infinity;
+  /** BR-слой ИИ (см. royaleBrain.ts): знание сквада и BR-тактика поверх общего think(). */
+  private readonly royaleIntel = new RoyaleIntel();
+  private readonly royalePolicy = new RoyalePolicy(this.royaleIntel);
 
   // --- Состояние командного боя ---
   private teamStarted = false;
@@ -667,6 +681,7 @@ export class Room {
     this.royaleSight.clear();
     this.royaleVisionEvents.clear();
     this.royaleVisionTick = -Infinity;
+    this.royaleIntel.clear();
 
     // Центр круга — случайная точка карты, и на каждом этапе сжатия она
     // новая: иначе разные районы «Рубежа» ничего не решают — маршрут разный,
@@ -850,6 +865,7 @@ export class Room {
       this.royaleSight.clear();
       this.royaleVisionEvents.clear();
       this.royaleVisionTick = -Infinity;
+      this.royaleIntel.clear();
       this.royaleStarted = false;
       this.royaleOver = false;
       this.royalePhase = 'countdown';
@@ -952,29 +968,33 @@ export class Room {
     // Труп не думает и не едет: иначе он рулил бы по инерции последнего инпута.
     if (bot.dead) return;
     if (this.mode === MODE_ROYALE && this.royalePhase !== 'fight') return;
-    bot.last = think(
-      {
-        id: bot.id,
-        team: bot.team,
-        dead: bot.dead,
-        stealth: bot.stealth,
-        state: bot.state,
-        hp: bot.hp,
-        brain: bot.brain!,
-        suppressed: this.tick < bot.suppressedUntil,
-      },
-      {
-        tick: this.tick,
-        obstacles: this.liveObstacles,
-        cover: this.liveCover,
-        bushes: this.bushes,
-        tanks: this.tanks,
-        shells: this.shells,
-        stance: this.stance,
-        half: this.half,
-        zone: this.mode === MODE_ROYALE ? this.botZoneState() : undefined,
-      },
-    );
+    const self: BotSelf = {
+      id: bot.id,
+      team: bot.team,
+      dead: bot.dead,
+      stealth: bot.stealth,
+      state: bot.state,
+      hp: bot.hp,
+      brain: bot.brain!,
+      suppressed: this.tick < bot.suppressedUntil,
+    };
+    const world: BotWorld = {
+      tick: this.tick,
+      obstacles: this.liveObstacles,
+      cover: this.liveCover,
+      bushes: this.bushes,
+      tanks: this.tanks,
+      shells: this.shells,
+      stance: this.stance,
+      half: this.half,
+      zone: this.mode === MODE_ROYALE ? this.botZoneState() : undefined,
+    };
+    // BR думает отдельным слоем (см. royaleBrain.ts) — играет на выживание, а
+    // не только на фраги; остальные режимы — тем же think(), что и раньше.
+    bot.last =
+      this.mode === MODE_ROYALE
+        ? royaleThink(self, world, this.royaleIntel, this.royalePolicy)
+        : think(self, world);
     stepTank(bot.state, bot.last, DT, this.liveObstacles, 1, this.half);
     if (bot.last.fire) {
       bot.last.fire = false;
@@ -1625,6 +1645,7 @@ export class Room {
     this.royaleSight.clear();
     this.royaleVisionEvents.clear();
     this.royaleVisionTick = -Infinity;
+    this.royaleIntel.clear();
     this.royaleZone.phase = 'safe';
     this.royaleZone.endsAt = 0;
     this.teamStarted = false;

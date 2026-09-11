@@ -336,17 +336,36 @@ const STUCK_TICKS = Math.round(TICK_HZ * 0.5);
 const UNSTICK_TICKS = Math.round(TICK_HZ * 0.8);
 
 /**
- * Один шаг мышления. Возвращает инпут, который комната скормит stepTank —
- * ровно как инпут живого игрока.
+ * Необязательная надстройка над think(): решает не «как ехать» (это остаётся
+ * в heading/search/patrol/avoid — моторике, общей для всех режимов), а «что
+ * предпочесть» — кого выбрать целью, когда отступать и куда. Не задана —
+ * think() ведёт себя ровно как сегодня, ни одна ветка ниже не выполняется.
+ * Реализация — только для BR, см. RoyalePolicy в royaleBrain.ts.
  */
-export function think(self: BotSelf, world: BotWorld): Input {
+export interface BotPolicy {
+  /** Ниже — предпочтительнее; без policy побеждает просто ближайший (см. retarget()). */
+  targetScore(self: BotSelf, candidate: BotTarget, dist: number, world: BotWorld): number;
+  /** Заменяет плоское tier.cover && hp <= BOT_HP*0.35. */
+  shouldRetreat(self: BotSelf, world: BotWorld): boolean;
+  /** Точка отхода — например, ближайший куст в безопасной зоне; null — как раньше, просто назад от цели. */
+  retreatTo(self: BotSelf, world: BotWorld): { x: number; z: number } | null;
+  /** Куда стягиваться, когда своей цели нет вовсе; null — как раньше, случайный патруль. */
+  regroupPoint(self: BotSelf, world: BotWorld): { x: number; z: number } | null;
+}
+
+/**
+ * Один шаг мышления. Возвращает инпут, который комната скормит stepTank —
+ * ровно как инпут живого игрока. policy не задана — поведение НЕ отличается
+ * от того, что было до её появления (см. BotPolicy).
+ */
+export function think(self: BotSelf, world: BotWorld, policy?: BotPolicy): Input {
   const brain = self.brain;
   const tier = BOT_TIERS[brain.tier];
   const me = self.state;
 
   if (world.tick >= brain.rethinkAt) {
     brain.rethinkAt = world.tick + RETHINK_TICKS;
-    retarget(self, world, tier);
+    retarget(self, world, tier, policy);
   }
 
   const zoneMove = zoneHeading(self, world);
@@ -359,7 +378,13 @@ export function think(self: BotSelf, world: BotWorld): Input {
     // ехал доразведать другую потерянную цель, доедет: searchUntil про это,
     // а не про то, что случилось с target прямо сейчас.
     if (zoneMove !== null) return driveTo(self, world, zoneMove, 1);
+    if (policy?.shouldRetreat(self, world)) {
+      const hidePoint = policy.retreatTo(self, world);
+      if (hidePoint) return hide(self, world, hidePoint.x, hidePoint.z);
+    }
     if (world.tick < brain.searchUntil) return search(self, world, brain.lastX, brain.lastZ);
+    const regroup = policy?.regroupPoint(self, world);
+    if (regroup) return search(self, world, regroup.x, regroup.z);
     return patrol(self, world);
   }
 
@@ -436,10 +461,14 @@ export function think(self: BotSelf, world: BotWorld): Input {
 
   // --- Ход ---
   // На низком HP разрывает дистанцию: подставляться под добивание невыгодно.
-  const retreat = tier.cover && self.hp <= BOT_HP * 0.35;
+  const retreat = policy ? policy.shouldRetreat(self, world) : tier.cover && self.hp <= BOT_HP * 0.35;
+  // Отступает не вслепую, а туда, где есть смысл — например, в куст; policy
+  // не задана или точки не нашла — работает старый heading() «просто назад».
+  const retreatPoint = retreat ? (policy?.retreatTo(self, world) ?? null) : null;
   const want =
     dodge(self, world) ??
     zoneMove ??
+    (retreatPoint ? pointHeading(self, world, retreatPoint) : null) ??
     heading(self, createTankState(trackX, trackZ), dist, tier, world, retreat, shot, bushOnly);
   const drive = unstick(brain, me, world.tick, steerTo(me, want, world.obstacles, world.half));
 
@@ -470,6 +499,14 @@ function zoneHeading(self: BotSelf, world: BotWorld): number | null {
   const targetX = zone.x + dx * scale;
   const targetZ = zone.z + dz * scale;
   const base = Math.atan2(targetX - me.x, targetZ - me.z);
+  const { vx, vz } = spread(self, world, Math.sin(base), Math.cos(base));
+  return avoid(me, Math.atan2(vx, vz), world.obstacles, world.half);
+}
+
+/** Угол на произвольную точку с тем же расталкиванием/объездом, что и zoneHeading(). */
+function pointHeading(self: BotSelf, world: BotWorld, point: { x: number; z: number }): number {
+  const me = self.state;
+  const base = Math.atan2(point.x - me.x, point.z - me.z);
   const { vx, vz } = spread(self, world, Math.sin(base), Math.cos(base));
   return avoid(me, Math.atan2(vx, vz), world.obstacles, world.half);
 }
@@ -520,12 +557,17 @@ function focusAllowed(
  * препятствий на линии огня. Потерянную из виду цель этот перебор не трогает —
  * когда её забыть, решает think() по tier.memory, а не рестарт раз в полсекунды.
  */
-function retarget(self: BotSelf, world: BotWorld, tier: BotTier): void {
+function retarget(self: BotSelf, world: BotWorld, tier: BotTier, policy?: BotPolicy): void {
   const brain = self.brain;
   const me = self.state;
 
   let spotted: BotTarget | null = null;
+  // Реальная дистанция до spotted — нужна ниже для слота наседающего, не
+  // должна подменяться policy-скором (см. bestScore).
   let spottedDist = Infinity;
+  // Только для сравнения кандидатов между собой; без policy равен d, и тогда
+  // это ровно тот же единственный счётчик, что был здесь раньше.
+  let bestScore = Infinity;
 
   for (const tank of world.tanks) {
     if (tank.dead || tank.team === self.team || tank.id === self.id) continue;
@@ -540,7 +582,9 @@ function retarget(self: BotSelf, world: BotWorld, tier: BotTier): void {
       !hasShot(me, tank.state, world.cover, world.bushes, world.half)
     )
       continue;
-    if (d < spottedDist) {
+    const score = policy ? policy.targetScore(self, tank, d, world) : d;
+    if (score < bestScore) {
+      bestScore = score;
       spottedDist = d;
       spotted = tank;
     }
@@ -748,6 +792,28 @@ function search(self: BotSelf, world: BotWorld, x: number, z: number): Input {
   const move = unstick(self.brain, me, world.tick, {
     throttle: drive.throttle * 0.75,
     steer: drive.steer,
+  });
+  return { seq: 0, throttle: move.throttle, steer: move.steer, turret: me.turret };
+}
+
+/**
+ * Едет к точке отхода и, добравшись, стоит там — в отличие от search(), не
+ * переключается на патруль: прятаться значит сидеть в кусте, а не бродить
+ * дальше от него на следующем тике. Исключение — летящий снаряд: под ним
+ * укрытие не спасает, поэтому уклонение снимает «стоянку» и бот всё-таки
+ * трогается с места.
+ */
+function hide(self: BotSelf, world: BotWorld, x: number, z: number): Input {
+  const me = self.state;
+  const evade = dodge(self, world);
+  const close = evade === null && Math.hypot(x - me.x, z - me.z) < 6;
+  const base = evade ?? (close ? me.angle : Math.atan2(x - me.x, z - me.z));
+  const { vx, vz } = spread(self, world, Math.sin(base), Math.cos(base));
+  const want = avoid(me, Math.atan2(vx, vz), world.obstacles, world.half);
+  const drive = steerTo(me, want, world.obstacles, world.half);
+  const move = unstick(self.brain, me, world.tick, {
+    throttle: close ? 0 : drive.throttle * 0.75,
+    steer: close ? 0 : drive.steer,
   });
   return { seq: 0, throttle: move.throttle, steer: move.steer, turret: me.turret };
 }

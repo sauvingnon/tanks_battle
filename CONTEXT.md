@@ -19,6 +19,7 @@ npm run typecheck
 npm run check:map          # геометрия карт, спавны, проходимость
 npm run check:combat       # урон, рикошеты, таран
 npm run check:bots         # волны, настройки комнаты, ИИ
+npm run check:royale       # BR-слой ИИ: отход в кусты, вызовы сквада, зона
 npm run check:effects      # шейдеры частиц
 npm run check:smoothness   # предсказание и сглаживание
 MAP=7 npm run bench:pve    # как «Холмы» играются против ботов
