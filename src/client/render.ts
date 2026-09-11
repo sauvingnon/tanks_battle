@@ -1520,6 +1520,11 @@ export class Scene3D {
 
   private setNightLights(enabled: boolean): void {
     for (const handle of this.tanks.values()) {
+      // Смена погоды не должна включать фары у уже уничтоженного танка.
+      if (handle.dying >= 0) {
+        handle.headlights.visible = false;
+        continue;
+      }
       handle.headlights.visible = enabled;
     }
   }
@@ -2349,11 +2354,15 @@ export class Scene3D {
       handle.roll = WRECK_ROLL;
       handle.pitch = WRECK_PITCH;
       this.setTankShadow(handle, false);
+      // Зашедший после гибели танк получает уже остывший остов без фар.
+      handle.headlights.visible = false;
       return;
     }
 
     handle.dying = 0;
     handle.smokeAt = 0;
+    // Фары гаснут сразу и не могут остаться включёнными на мёртвом танке.
+    handle.headlights.visible = false;
     handle.root.visible = !handle.cloaked;
 
     handle.paint.color.setHex(handle.paintColor).multiplyScalar(WRECK_DARKEN);
@@ -2405,6 +2414,7 @@ export class Scene3D {
     handle.pitch = 0;
     this.setTankShadow(handle, true);
     handle.root.visible = !handle.cloaked;
+    handle.headlights.visible = this.nightLightsOn;
   }
 
   /** На смерти ходовая снова следует за корпусом, чтобы остов не распался на части. */
@@ -2455,6 +2465,10 @@ export class Scene3D {
 
       this.setWreckPose(handle, wreckSink(Math.min(handle.dying, WRECK_S)));
       this.setWreckVisual(handle, Math.min(handle.dying / 0.55, 1));
+      // Защита от переключения погоды во время анимации: мёртвый танк всегда
+      // остаётся без фар.
+      handle.headlights.visible = false;
+
       if (handle.dying >= WRECK_S || handle.dying < handle.smokeAt) continue;
       handle.smokeAt += WRECK_SMOKE_EVERY;
       this.spawnEffect(
