@@ -293,6 +293,88 @@ function grassPatchColor(x: number, z: number, mapId: number): number {
   return GRASS_COLORS[idx];
 }
 
+const GRASS_WIND_STRENGTH = 0.16;
+const GRASS_WIND_SPEED = 1.7;
+// Локальные единицы геометрии пучка (не метры карты) — радиус и сила толчка
+// подобраны под масштаб самого лезвия, см. комментарий у localPlayer ниже.
+const GRASS_PUSH_RADIUS = 5.4;
+const GRASS_PUSH_STRENGTH = 1.45;
+/** Далеко за картой — толчок гасится smoothstep'ом сам, без доп. флага «нет танка». */
+const GRASS_PUSH_IDLE = 100000;
+
+interface GrassShaderHandles {
+  material: THREE.MeshStandardMaterial;
+  wind: { value: number };
+  /** Мировые x,z своего танка; когда его нет — GRASS_PUSH_IDLE, толчка не видно. */
+  playerPos: THREE.Vector2;
+}
+
+/**
+ * Покачивание травы и её смятие под своим танком — оба эффекта на GPU в
+ * вершинном шейдере, а не CPU-циклом по инстансам (тем более после урока с
+ * толчком кустов от танка — тот же подход на десятках тысяч пучков посадил
+ * бы кадр так же). Обновляются два uniform'а раз в кадр (O(1) по CPU),
+ * дальше видеокарта сама параллелит сдвиг по всем вершинам и инстансам
+ * разом — instance-матрицы вообще не трогаются, в отличие от кустов.
+ *
+ * Толчок — только для своего танка (один uniform вместо массива на 40 душ в
+ * BR, и один и тот же приём для любого числа игроков не стоит дороже).
+ * Наклоняется только кончик — у геометрии пучка ровно два уровня высоты
+ * (0 у земли, > 0 на остриё), этого достаточно, чтобы отличить базу от
+ * кончика без отдельного атрибута.
+ */
+function createGrassMaterial(): GrassShaderHandles {
+  const wind = { value: 0 };
+  const playerPos = new THREE.Vector2(GRASS_PUSH_IDLE, GRASS_PUSH_IDLE);
+  const material = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    roughness: 0.92,
+    flatShading: true,
+    vertexColors: true,
+    side: THREE.DoubleSide,
+  });
+  material.onBeforeCompile = (shader) => {
+    shader.uniforms.uWind = wind;
+    shader.uniforms.uPlayerPos = { value: playerPos };
+    shader.vertexShader = `uniform float uWind;\nuniform vec2 uPlayerPos;\n${shader.vertexShader}`.replace(
+      '#include <begin_vertex>',
+      `#include <begin_vertex>
+      {
+        float tip = position.y > 0.01 ? 1.0 : 0.0;
+        vec3 tuftPos = instanceMatrix[3].xyz;
+
+        // Ветер: наклон кончика, фаза от мировой позиции пучка — соседние
+        // тufts качаются синхронно, читается как порыв, идущий по полю.
+        float gust = sin(uWind * 0.55 + (tuftPos.x + tuftPos.z) * 0.07) * 0.5 + 0.5;
+        float phase = uWind * ${GRASS_WIND_SPEED.toFixed(2)} + tuftPos.x * 0.35 + tuftPos.z * 0.35;
+        float sway = ${GRASS_WIND_STRENGTH.toFixed(2)} * tip * (0.35 + gust * 0.85);
+        transformed.x += sin(phase) * sway;
+        transformed.z += cos(phase * 0.82) * sway * 0.7;
+
+        // Толчок от своего танка: сначала считаем расстояние в мировых
+        // координатах, затем переводим только направление в локальные оси
+        // инстанса. Обратная матрица здесь не нужна: она дорогая и на части
+        // WebGL-драйверов ломает компиляцию шейдера травы.
+        vec3 worldVertex = (instanceMatrix * vec4(transformed, 1.0)).xyz;
+        vec2 fromPlayer = worldVertex.xz - uPlayerPos;
+        float pushDist = length(fromPlayer);
+        float pressure = tip * (1.0 - smoothstep(0.0, ${GRASS_PUSH_RADIUS.toFixed(2)}, pushDist));
+        float push = pressure * ${GRASS_PUSH_STRENGTH.toFixed(2)};
+        vec2 worldPushDir = pushDist > 0.001 ? fromPlayer / pushDist : vec2(0.0, 1.0);
+        float instanceScale = max(length(instanceMatrix[0].xz), 0.001);
+        vec2 pushDir = vec2(
+          dot(worldPushDir, instanceMatrix[0].xz),
+          dot(worldPushDir, instanceMatrix[2].xz)
+        ) / instanceScale;
+        // Под гусеницей трава не только расходится, но и пригибается к земле.
+        transformed.y *= 1.0 - pressure * 0.88;
+        transformed.xz += pushDir * push;
+      }`,
+    );
+  };
+  return { material, wind, playerPos };
+}
+
 type WeatherKind = 'clear' | 'mist' | 'rain' | 'snow';
 
 interface EnvironmentProfile {
@@ -864,6 +946,10 @@ export class Scene3D {
   private nightLightsOn = false;
   /** Часы сцены в секундах: по ним шейдеры считают возраст следов и пылинок. */
   private clock = 0;
+  /** Uniform шейдера покачивания травы текущей карты; null, пока карта не построена. */
+  private grassWind: { value: number } | null = null;
+  /** Мировая позиция своего танка для смятия травы под ним; null без карты. */
+  private grassPlayerPos: THREE.Vector2 | null = null;
 
   /**
    * Текстуры рисуются один раз на всю игру, а не на карту: при смене карты
@@ -1708,19 +1794,12 @@ export class Scene3D {
     // Один InstancedMesh — один draw call вне зависимости от числа пучков,
     // поэтому плотность можно поднимать почти бесплатно по кадру.
     const count = half >= 400 ? 9600 : half >= 120 ? 4400 : 2900;
-    const mesh = new THREE.InstancedMesh(
-      grassTuftGeometry(),
-      new THREE.MeshStandardMaterial({
-        color: 0xffffff,
-        roughness: 0.92,
-        flatShading: true,
-        vertexColors: true,
-        side: THREE.DoubleSide,
-      }),
-      count,
-    );
+    const { material, wind, playerPos } = createGrassMaterial();
+    const mesh = new THREE.InstancedMesh(grassTuftGeometry(), material, count);
     mesh.castShadow = false;
     mesh.receiveShadow = false;
+    this.grassWind = wind;
+    this.grassPlayerPos = playerPos;
 
     const dummy = new THREE.Object3D();
     const color = new THREE.Color();
@@ -2260,6 +2339,8 @@ export class Scene3D {
     this.bushMeshes = [];
     this.bushHandles = [];
     this.activeBush = -1;
+    this.grassWind = null;
+    this.grassPlayerPos = null;
   }
 
   addTank(
@@ -3558,8 +3639,25 @@ export class Scene3D {
     }
   }
 
+  /** Только свой танк — толчок травы под остальными 39 в BR не стоит доп. uniform'ов. */
+  private updateGrassPlayer(): void {
+    if (!this.grassPlayerPos) return;
+    let found = false;
+    for (const tank of this.tanks.values()) {
+      if (!tank.isSelf) continue;
+      if (tank.alive && !tank.cloaked) {
+        this.grassPlayerPos.set(tank.root.position.x, tank.root.position.z);
+        found = true;
+      }
+      break;
+    }
+    if (!found) this.grassPlayerPos.set(GRASS_PUSH_IDLE, GRASS_PUSH_IDLE);
+  }
+
   render(dt: number): void {
     this.clock += dt;
+    if (this.grassWind) this.grassWind.value = this.clock;
+    this.updateGrassPlayer();
     this.updateEnvironment(dt);
     this.updateWeather(dt);
     this.updateEffects(dt);
