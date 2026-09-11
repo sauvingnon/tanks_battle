@@ -228,29 +228,62 @@ const GROUND_PATCH_PALETTES: number[][] = [
   [0x566044, 0x756547, 0x3a4636],
 ];
 
-/** Трава — один инстансированный low-poly пучок, без физики и теней. */
-const GRASS_COLORS = [0x536b38, 0x6f7b3e, 0x8a8147, 0x405c36];
+/**
+ * Трава — один инстансированный low-poly пучок, без физики и теней. Раньше
+ * пучок был тремя одинаковыми спицами строго через 120° — с земли это
+ * читалось как торчки, а не трава. Теперь у пучка пять разновысоких лезвий
+ * со своим наклоном и разбросом углов (запечено в геометрию один раз, у
+ * каждого инстанса вдобавок свой поворот/масштаб — одинаковых кустиков не
+ * видно), плюс вершинный градиент тёмный-у-земли/светлый-на-кончике даёт
+ * объём без лишних инстансов и без шейдеров.
+ */
+const GRASS_COLORS = [0x6d8f45, 0x87a355, 0x577a3c, 0x9aa15c, 0x4f6e39];
 const GRASS_PAD = 1.8;
+const GRASS_TIP_TINT: [number, number, number] = [1.22, 1.24, 0.92];
+const GRASS_BASE_TINT: [number, number, number] = [0.6, 0.62, 0.58];
 
 function grassTuftGeometry(): THREE.BufferGeometry {
   const vertices: number[] = [];
-  for (let i = 0; i < 3; i++) {
-    const angle = (i / 3) * Math.PI * 2;
-    const dirX = Math.cos(angle) * 0.32;
-    const dirZ = Math.sin(angle) * 0.32;
-    const sideX = -Math.sin(angle) * 0.16;
-    const sideZ = Math.cos(angle) * 0.16;
-    const height = 1;
+  const colors: number[] = [];
+  const bladeCount = 5;
+  for (let i = 0; i < bladeCount; i++) {
+    // Не идеальный веер: у каждого лезвия свой угол, длина, наклон и ширина —
+    // запечённая асимметрия, которая при случайном повороте инстанса не
+    // повторяется на глаз.
+    const jitter = Math.sin((i + 1) * 12.9898) * 43758.5453;
+    const angleJitter = (jitter - Math.floor(jitter) - 0.5) * 0.9;
+    const angle = (i / bladeCount) * Math.PI * 2 + angleJitter;
+    const lengthJitter = Math.abs(Math.sin((i + 1) * 7.233));
+    const height = 0.68 + lengthJitter * 0.5;
+    const lean = 0.16 + lengthJitter * 0.22; // общий наклон в сторону X — «ветер»
+    const width = 0.1 + Math.abs(Math.cos((i + 1) * 5.117)) * 0.07;
+    const dirX = Math.cos(angle) * (0.22 + lengthJitter * 0.16) + lean;
+    const dirZ = Math.sin(angle) * (0.22 + lengthJitter * 0.16);
+    const sideX = -Math.sin(angle) * width;
+    const sideZ = Math.cos(angle) * width;
     vertices.push(
       -sideX, 0, -sideZ,
       sideX, 0, sideZ,
       dirX, height, dirZ,
     );
+    colors.push(...GRASS_BASE_TINT, ...GRASS_BASE_TINT, ...GRASS_TIP_TINT);
   }
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+  geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
   geometry.computeVertexNormals();
   return geometry;
+}
+
+/**
+ * Индекс цвета из палитры по позиции, не по порядковому номеру попытки —
+ * низкочастотный шум даёт пятна одного оттенка (клочки суше/зеленее), а не
+ * равномерную рябь по всей карте, как было с круговым перебором.
+ */
+function grassPatchColor(x: number, z: number, mapId: number): number {
+  const n = Math.sin(x * 0.045 + mapId * 5.7) * Math.cos(z * 0.037 - mapId * 3.1);
+  const idx = Math.floor(((n + 1) / 2) * GRASS_COLORS.length) % GRASS_COLORS.length;
+  return GRASS_COLORS[idx];
 }
 
 type WeatherKind = 'clear' | 'mist' | 'rain' | 'snow';
@@ -1647,16 +1680,14 @@ export class Scene3D {
    * торчат сквозь укрытия и не создают новую физику.
    */
   private buildGrass(half: number, obstacles: Box[], mapId: number): void {
-    // Раньше трава была скорее редкой разметкой поля: на обычной карте её
-    // набиралось всего 650 пучков. Один InstancedMesh всё равно остаётся одним
-    // draw call, поэтому плотность можно поднять без пропорционального роста
-    // стоимости рендера. На больших картах сохраняем ту же визуальную частоту.
-    const count = half >= 400 ? 6600 : half >= 120 ? 3000 : 1950;
+    // Один InstancedMesh — один draw call вне зависимости от числа пучков,
+    // поэтому плотность можно поднимать почти бесплатно по кадру.
+    const count = half >= 400 ? 9600 : half >= 120 ? 4400 : 2900;
     const mesh = new THREE.InstancedMesh(
       grassTuftGeometry(),
       new THREE.MeshStandardMaterial({
         color: 0xffffff,
-        roughness: 1,
+        roughness: 0.92,
         flatShading: true,
         vertexColors: true,
         side: THREE.DoubleSide,
@@ -1675,18 +1706,25 @@ export class Scene3D {
       const seed = Math.abs(Math.sin((attempt + 1) * 17.731 + mapId * 41.17));
       const seed2 = Math.abs(Math.sin((attempt + 1) * 31.419 + mapId * 13.71));
       const seed3 = Math.abs(Math.sin((attempt + 1) * 47.293 + mapId * 7.31));
+      const seed4 = Math.abs(Math.sin((attempt + 1) * 59.871 + mapId * 21.42));
       const x = (seed * 2 - 1) * margin;
       const z = (seed2 * 2 - 1) * margin;
       if (!this.isGrassSpot(x, z, obstacles)) continue;
 
-      const height = 0.62 + seed3 * 0.78;
-      const width = 0.72 + seed2 * 0.42;
+      // Крупнее нижняя граница размера — не даём пучку сжаться до незаметной
+      // соринки на дистанции, из-за чего трава раньше выглядела «пустой».
+      const height = 0.95 + seed3 * 0.85;
+      const width = 0.95 + seed2 * 0.5;
       dummy.position.set(x, 0.025, z);
       dummy.rotation.y = seed * Math.PI * 2;
       dummy.scale.set(width, height, width);
       dummy.updateMatrix();
       mesh.setMatrixAt(placed, dummy.matrix);
-      color.set(GRASS_COLORS[(attempt + mapId) % GRASS_COLORS.length]);
+      // Оттенок берём по месту (пятна одного тона), яркость чуть дрожит на
+      // инстанс — без этого патч выглядит как один и тот же кустик, скопированный.
+      color.set(grassPatchColor(x, z, mapId));
+      const brightness = 0.85 + seed4 * 0.3;
+      color.multiplyScalar(brightness);
       mesh.setColorAt(placed, color);
       placed++;
     }
