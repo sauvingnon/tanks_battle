@@ -116,6 +116,7 @@ export const WRECK_HEIGHT = 2.5;
 /** Физический след остова совпадает с ходовой модели, а не с радиусом живого танка. */
 export const WRECK_COLLISION_W = 3.6;
 export const WRECK_COLLISION_D = 4.4;
+export const WRECK_TANK_COLLISION_RADIUS = 2.05;
 
 // --- Рикошет ---
 

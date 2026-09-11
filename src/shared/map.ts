@@ -1056,18 +1056,19 @@ function buildFrontier(): Box[] {
 interface TreeKind {
   w: number;
   d: number;
-  collisionW: number;
-  collisionD: number;
+  collisionRadius: number;
+  collisionTankRadius: number;
   h: number;
 }
 
+const TREE_TANK_RADIUS = 2.05;
 const TREE_KINDS: TreeKind[] = [
-  // w/d задают крону, collisionW/collisionD — нижнюю часть ствола. Раньше
-  // весь пустой объём кроны становился прямоугольной невидимой стеной.
-  { w: 2.8, d: 2.8, collisionW: 1.0, collisionD: 1.0, h: 3.8 },
-  { w: 3.6, d: 3.2, collisionW: 1.15, collisionD: 1.15, h: 5.4 },
-  { w: 4.8, d: 4.4, collisionW: 1.55, collisionD: 1.55, h: 7.2 },
-  { w: 5.8, d: 5.2, collisionW: 1.8, collisionD: 1.8, h: 9.4 },
+  // w/d задают крону, collisionRadius — круглый нижний ствол. Раньше весь
+  // пустой объём кроны становился прямоугольной невидимой стеной.
+  { w: 2.8, d: 2.8, collisionRadius: 0.48, collisionTankRadius: TREE_TANK_RADIUS, h: 3.8 },
+  { w: 3.6, d: 3.2, collisionRadius: 0.54, collisionTankRadius: TREE_TANK_RADIUS, h: 5.4 },
+  { w: 4.8, d: 4.4, collisionRadius: 0.75, collisionTankRadius: TREE_TANK_RADIUS, h: 7.2 },
+  { w: 5.8, d: 5.2, collisionRadius: 0.88, collisionTankRadius: TREE_TANK_RADIUS, h: 9.4 },
 ];
 
 /**

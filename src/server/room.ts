@@ -61,6 +61,7 @@
   WRECK_HEIGHT,
   WRECK_COLLISION_W,
   WRECK_COLLISION_D,
+  WRECK_TANK_COLLISION_RADIUS,
   ROYALE_SQUAD_COUNT,
   ROYALE_SQUAD_SIZE,
   ROYALE_START_COUNTDOWN_S,
@@ -757,10 +758,15 @@ export class Room {
   /** Проверяет, не заводит ли формация танк в физический блок или за край. */
   private royaleSpawnIsFree(x: number, z: number): boolean {
     if (Math.abs(x) > this.half - TANK_RADIUS || Math.abs(z) > this.half - TANK_RADIUS) return false;
-    return this.moveObstacles.every((box) =>
-      Math.abs(x - box.x) > boxCollisionSize(box).w / 2 + TANK_RADIUS &&
-      Math.abs(z - box.z) > boxCollisionSize(box).d / 2 + TANK_RADIUS,
-    );
+    return this.moveObstacles.every((box) => {
+      const tankRadius = box.collisionTankRadius ?? TANK_RADIUS;
+      if (box.collisionRadius !== undefined) {
+        return Math.hypot(x - box.x, z - box.z) > box.collisionRadius + tankRadius;
+      }
+      const size = boxCollisionSize(box);
+      return Math.abs(x - box.x) > size.w / 2 + tankRadius &&
+        Math.abs(z - box.z) > size.d / 2 + tankRadius;
+    });
   }
 
   private countTeam(team: number): number {
@@ -1104,6 +1110,7 @@ export class Room {
         z: p.state.z,
         w: WRECK_COLLISION_W,
         d: WRECK_COLLISION_D,
+        collisionTankRadius: WRECK_TANK_COLLISION_RADIUS,
         h: WRECK_HEIGHT,
       });
     }
@@ -1438,14 +1445,17 @@ export class Room {
         [radius, radius], [-radius, radius], [radius, -radius], [-radius, -radius],
       );
     }
-    const pad = BONUS_RADIUS + TANK_RADIUS;
     for (const [dx, dz] of attempts) {
       const candidate = { x: x + dx, z: z + dz };
       if (Math.abs(candidate.x) > this.half - 8 || Math.abs(candidate.z) > this.half - 8) continue;
       if (this.obstacles.some((box) => {
+        const tankRadius = box.collisionTankRadius ?? TANK_RADIUS;
+        if (box.collisionRadius !== undefined) {
+          return Math.hypot(candidate.x - box.x, candidate.z - box.z) < box.collisionRadius + tankRadius + BONUS_RADIUS;
+        }
         const size = boxCollisionSize(box);
-        return Math.abs(candidate.x - box.x) < size.w / 2 + pad &&
-          Math.abs(candidate.z - box.z) < size.d / 2 + pad;
+        return Math.abs(candidate.x - box.x) < size.w / 2 + tankRadius + BONUS_RADIUS &&
+          Math.abs(candidate.z - box.z) < size.d / 2 + tankRadius + BONUS_RADIUS;
       })) continue;
       if (this.bonuses.some((bonus) => Math.hypot(bonus.x - candidate.x, bonus.z - candidate.z) < 22)) continue;
       return candidate;
@@ -1468,16 +1478,23 @@ export class Room {
   /** Свободная точка под ящик: не в блоке, не у стены и не вплотную к другому ящику. */
   private freeSpot(): { x: number; z: number } | null {
     const limit = this.half - 8;
-    const pad = BONUS_RADIUS + TANK_RADIUS;
-
     for (let attempt = 0; attempt < 24; attempt++) {
       const x = (Math.random() * 2 - 1) * limit;
       const z = (Math.random() * 2 - 1) * limit;
 
       let taken = false;
       for (const box of this.obstacles) {
+        const tankRadius = box.collisionTankRadius ?? TANK_RADIUS;
+        if (box.collisionRadius !== undefined) {
+          if (Math.hypot(x - box.x, z - box.z) < box.collisionRadius + tankRadius + BONUS_RADIUS) {
+            taken = true;
+            break;
+          }
+          continue;
+        }
         const size = boxCollisionSize(box);
-        if (Math.abs(x - box.x) < size.w / 2 + pad && Math.abs(z - box.z) < size.d / 2 + pad) {
+        if (Math.abs(x - box.x) < size.w / 2 + tankRadius + BONUS_RADIUS &&
+          Math.abs(z - box.z) < size.d / 2 + tankRadius + BONUS_RADIUS) {
           taken = true;
           break;
         }

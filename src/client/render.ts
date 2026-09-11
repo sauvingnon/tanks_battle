@@ -298,7 +298,7 @@ function weatherColor(kind: WeatherKind): number {
 
 /**
  * Декоративная форма препятствия. Коллизии считают физические размеры Box
- * (collisionW/collisionD, если они заданы), поэтому фаски и крона не меняют
+ * (collisionW/collisionD или collisionRadius, если они заданы), поэтому фаски и крона не меняют
  * проезды и прострелы — это только более живой силуэт.
  */
 function obstacleGeometry(box: Box, look: BoxLook): THREE.BufferGeometry {

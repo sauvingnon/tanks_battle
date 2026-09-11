@@ -165,6 +165,30 @@ function resolveBounds(state: TankState, half: number): number {
 function resolveObstacles(state: TankState, obstacles: Box[]): number {
   let worst = 0;
   for (const box of obstacles) {
+    const tankRadius = box.collisionTankRadius ?? TANK_RADIUS;
+    if (box.collisionRadius !== undefined) {
+      const minDist = tankRadius + box.collisionRadius;
+      const dx = state.x - box.x;
+      const dz = state.z - box.z;
+      const dist2 = dx * dx + dz * dz;
+      if (dist2 >= minDist * minDist) continue;
+
+      if (dist2 > 1e-8) {
+        const dist = Math.sqrt(dist2);
+        const nx = dx / dist;
+        const nz = dz / dist;
+        state.x += nx * (minDist - dist);
+        state.z += nz * (minDist - dist);
+        worst = Math.max(worst, headOn(state, nx, nz));
+      } else {
+        // Два центра совпали: выбираем стабильное направление, чтобы не
+        // получить NaN и не оставить танк внутри круглого ствола.
+        state.x += minDist;
+        worst = 1;
+      }
+      continue;
+    }
+
     const { w, d } = boxCollisionSize(box);
     const hw = w / 2;
     const hd = d / 2;
@@ -176,11 +200,11 @@ function resolveObstacles(state: TankState, obstacles: Box[]): number {
     const dx = state.x - nearestX;
     const dz = state.z - nearestZ;
     const dist2 = dx * dx + dz * dz;
-    if (dist2 >= TANK_RADIUS * TANK_RADIUS) continue;
+    if (dist2 >= tankRadius * tankRadius) continue;
 
     if (dist2 > 1e-8) {
       const dist = Math.sqrt(dist2);
-      const push = (TANK_RADIUS - dist) / dist;
+      const push = (tankRadius - dist) / dist;
       state.x += dx * push;
       state.z += dz * push;
       worst = Math.max(worst, headOn(state, dx / dist, dz / dist));
@@ -191,10 +215,10 @@ function resolveObstacles(state: TankState, obstacles: Box[]): number {
       const toBack = state.z - (box.z - hd);
       const toFront = box.z + hd - state.z;
       const min = Math.min(toLeft, toRight, toBack, toFront);
-      if (min === toLeft) state.x = box.x - hw - TANK_RADIUS;
-      else if (min === toRight) state.x = box.x + hw + TANK_RADIUS;
-      else if (min === toBack) state.z = box.z - hd - TANK_RADIUS;
-      else state.z = box.z + hd + TANK_RADIUS;
+      if (min === toLeft) state.x = box.x - hw - tankRadius;
+      else if (min === toRight) state.x = box.x + hw + tankRadius;
+      else if (min === toBack) state.z = box.z - hd - tankRadius;
+      else state.z = box.z + hd + tankRadius;
       // Танк сидел внутри блока: это всегда упор, а не касание.
       worst = 1;
     }
@@ -256,10 +280,24 @@ export function sweepShell(
 
   let best = sweepBounds(shell.x, shell.z, dx, dz, half);
   for (const box of obstacles) {
-    const hit = sweepBox(shell.x, shell.z, dx, dz, box);
+    const hit = box.collisionRadius !== undefined
+      ? sweepCircleObstacle(shell, dt, box)
+      : sweepBox(shell.x, shell.z, dx, dz, box);
     if (hit && (best === null || hit.t < best.t)) best = hit;
   }
   return best;
+}
+
+/** Свип круглого ствола: крона остаётся декорацией, а форма коллизии не квадратная. */
+function sweepCircleObstacle(shell: ShellState, dt: number, box: Box): ShellHit | null {
+  const t = sweepCircle(shell, dt, box.x, box.z, (box.collisionRadius ?? 0) + SHELL_RADIUS);
+  if (t === null) return null;
+  if (t === 0) return { t, nx: 0, nz: 0, stuck: true };
+
+  const x = shell.x + shell.vx * dt * t - box.x;
+  const z = shell.z + shell.vz * dt * t - box.z;
+  const length = Math.hypot(x, z) || 1;
+  return { t, nx: x / length, nz: z / length, stuck: false };
 }
 
 /** Раздутый прямоугольник препятствия. */

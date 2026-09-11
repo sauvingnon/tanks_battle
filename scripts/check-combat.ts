@@ -256,8 +256,8 @@ const noop = () => {};
     z: 30,
     w: 6,
     d: 6,
-    collisionW: 1.8,
-    collisionD: 1.8,
+    collisionRadius: 0.88,
+    collisionTankRadius: 2.05,
     h: 9,
   };
   const treeShot = (x: number): ShellState => ({
@@ -272,6 +272,22 @@ const noop = () => {};
   });
   check('выстрел проходит рядом с кроной дерева', sweepShell(treeShot(2.2), 0.3, [tree]) === null);
   check('выстрел останавливается о ствол дерева', sweepShell(treeShot(0), 0.3, [tree]) !== null);
+  const angledTreeShot: ShellState = {
+    id: 3,
+    owner: 1,
+    x: -5,
+    z: 23.2,
+    vx: Math.SQRT1_2 * SHELL_SPEED,
+    vz: Math.SQRT1_2 * SHELL_SPEED,
+    life: SHELL_LIFETIME,
+    bounces: 0,
+  };
+  check('круглая коллизия дерева не цепляет угловую пустоту', sweepShell(angledTreeShot, 0.6, [tree]) === null);
+
+  const treeTank = createTankState(2.8, 30, Math.PI / 2);
+  treeTank.speed = 0;
+  stepTank(treeTank, { seq: 0, throttle: 0, steer: 0, turret: 0 }, DT, [tree]);
+  check('танк упирается в круглый ствол без квадратного угла', Math.abs(treeTank.x - 2.93) < 0.05);
 
   const wreck: Box = { x: 0, z: 30, w: WRECK_COLLISION_W, d: WRECK_COLLISION_D, h: 2.5 };
   check('выстрел проходит рядом с остовом', sweepShell(treeShot(2.2), 0.3, [wreck]) === null);
