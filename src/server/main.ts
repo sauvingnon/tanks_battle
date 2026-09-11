@@ -27,6 +27,10 @@ const SERVE_STATIC = existsSync(STATIC_DIR);
 // Комната сама рассылает то, что рождается внутри неё: появление и гибель ботов,
 // смену волны, смену настроек. Ботам слать нечего — у них нет сокета.
 const room = new Room((msg) => broadcast(msg));
+// Накопительные метрики игрового цикла. Нужны, чтобы отличить субъективный
+// сетевой лаг от реального случая, когда защитный лимит сбросил тики.
+let droppedTicks = 0;
+let maxLoopGapMs = 0;
 
 // --- HTTP ---
 
@@ -40,6 +44,10 @@ const http = createServer((req, res) => {
         bots: room.botCount,
         mode: room.mode,
         tick: room.tickCount,
+        tickLoop: {
+          droppedTicks,
+          maxGapMs: Math.round(maxLoopGapMs * 100) / 100,
+        },
       }),
     );
     return;
@@ -251,7 +259,9 @@ let accumulator = 0;
 
 setInterval(() => {
   const now = performance.now();
-  accumulator += now - previous;
+  const elapsed = now - previous;
+  maxLoopGapMs = Math.max(maxLoopGapMs, elapsed);
+  accumulator += elapsed;
   previous = now;
 
   // Догоняем пропущенные тики, но не больше 5 за раз: если сервер надолго завис,
@@ -262,7 +272,10 @@ setInterval(() => {
     accumulator -= STEP_MS;
     steps++;
   }
-  if (steps === 5) accumulator = 0;
+  if (steps === 5) {
+    droppedTicks += Math.floor(accumulator / STEP_MS);
+    accumulator = 0;
+  }
   if (steps === 0) return;
 
   // Фраги рассылаем всегда, даже если снапшот в этом тике пропускается.
@@ -276,8 +289,14 @@ setInterval(() => {
   if (room.tickCount % SNAPSHOT_EVERY !== 0) return;
   if (room.humanCount === 0) return;
 
-  // В обычных режимах список танков можно было сериализовать один раз. В BR
-  // список зависит от наблюдателя: сервер обязан не отправлять скрытые цели.
+  // В обычных режимах состояние мира одинаково для всех зрителей. Собираем
+  // массивы один раз на тик: раньше при 40 игроках это были 40 одинаковых
+  // проходов по всем танкам, снарядам и бонусам. В BR данные намеренно
+  // остаются персональными — нельзя отправлять скрытые цели наблюдателю.
+  const sharedWorld = room.mode !== MODE_ROYALE;
+  const sharedEntries = sharedWorld ? room.snapshotEntries() : undefined;
+  const sharedShells = sharedWorld && room.shellCount > 0 ? room.snapshotShells() : undefined;
+  const sharedBonuses = sharedWorld && room.bonusCount > 0 ? room.snapshotBonuses() : undefined;
   const zone = room.royaleZoneState();
   for (const player of room.players.values()) {
     if (player.brain) continue;
@@ -286,13 +305,15 @@ setInterval(() => {
     const payload: SnapshotPayload = {
       tick: room.tickCount,
       ack: player.ack,
-      players: room.snapshotEntries(player),
+      players: sharedEntries ?? room.snapshotEntries(player),
     };
-    if (room.shellCount > 0) payload.shells = room.snapshotShells(player);
+    if (sharedShells) payload.shells = sharedShells;
+    else if (room.shellCount > 0) payload.shells = room.snapshotShells(player);
     if (room.boomEvents.length > 0) payload.booms = room.boomEvents;
     const hits = room.snapshotHits(player);
     if (hits.length > 0) payload.hits = hits;
-    if (room.bonusCount > 0) payload.bonuses = room.snapshotBonuses();
+    if (sharedBonuses) payload.bonuses = sharedBonuses;
+    else if (room.bonusCount > 0) payload.bonuses = room.snapshotBonuses();
     if (zone) payload.zone = zone;
     if (room.mode === MODE_ROYALE) payload.contacts = room.snapshotContacts(player);
     player.send(encodeSnapshot(payload));

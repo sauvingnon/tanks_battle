@@ -24,6 +24,7 @@
     "check:team": "tsx scripts/check-team.ts",
     "bench:pve": "tsx scripts/bench-pve.ts",
     "bench:server": "tsx scripts/bench-server.ts",
+    "bench:combat": "tsx scripts/bench-combat-storm.ts",
     "bench:snapshots": "tsx scripts/bench-snapshots.ts",
     "smoke": "node scripts/smoke.mjs"
   },

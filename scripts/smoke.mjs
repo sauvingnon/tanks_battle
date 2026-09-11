@@ -16,6 +16,50 @@ const HTTP_URL = process.env.SMOKE_HTTP ?? 'http://127.0.0.1:8080';
 const WS_URL = process.env.SMOKE_WS ?? 'ws://127.0.0.1:8080/ws';
 const DURATION_MS = Number(process.argv[2] ?? 3000);
 const SEND_INTERVAL_MS = 1000 / 30;
+const TWO_PI = Math.PI * 2;
+const F_SHELLS = 1 << 0;
+const FULL_HP = 1000;
+
+/** Декодируем только поля снапшота, которые проверяет smoke-тест. */
+function decodeSnapshot(buf) {
+  const view = new DataView(buf);
+  let offset = 0;
+  const flags = view.getUint8(offset);
+  offset += 1;
+  offset += 4; // tick
+  const ack = view.getUint32(offset, true);
+  offset += 4;
+  const count = view.getUint16(offset, true);
+  offset += 2;
+  const players = [];
+  for (let index = 0; index < count; index++) {
+    const i = view.getUint32(offset, true);
+    offset += 4;
+    const x = view.getInt16(offset, true) / 10;
+    offset += 2;
+    const z = view.getInt16(offset, true) / 10;
+    offset += 2;
+    const a = (view.getUint16(offset, true) * TWO_PI) / 65536;
+    offset += 2;
+    offset += 2; // turret
+    const s = view.getInt16(offset, true) / 100;
+    offset += 2;
+    const h = view.getUint16(offset, true) / 10;
+    offset += 2;
+    offset += 2 + 2 + 1 + 4; // max HP, effects, dead, score
+    players.push({ i, x, z, a, s, h });
+  }
+  const shells = flags & F_SHELLS ? new Array(view.getUint16(offset, true)) : undefined;
+  return { t: 'snapshot', ack, players, shells };
+}
+
+async function decodeServerMessage(data) {
+  if (typeof data === 'string') return JSON.parse(data);
+  if (data instanceof Blob) return decodeSnapshot(await data.arrayBuffer());
+  if (data instanceof ArrayBuffer) return decodeSnapshot(data);
+  if (ArrayBuffer.isView(data)) return decodeSnapshot(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
+  return null;
+}
 
 function drive(name, throttle, steer) {
   return new Promise((resolve, reject) => {
@@ -48,8 +92,9 @@ function drive(name, throttle, steer) {
       }, SEND_INTERVAL_MS);
     });
 
-    ws.addEventListener('message', (event) => {
-      const msg = JSON.parse(event.data);
+    ws.addEventListener('message', async (event) => {
+      const msg = await decodeServerMessage(event.data);
+      if (!msg) return;
       if (msg.t === 'welcome') id = msg.id;
       if (msg.t !== 'snapshot') return;
       snapshots++;
@@ -90,7 +135,7 @@ for (const p of [straight, turning]) {
   checks.push([`${p.name}: видит обоих игроков`, p.last.visible === 2]);
   // Путь, а не смещение: танк с рулём едет по кругу и возвращается почти в точку старта.
   checks.push([`${p.name}: танк проехал дистанцию`, p.travelled > 5]);
-  checks.push([`${p.name}: сервер прислал полное здоровье`, p.last.hp === 100]);
+  checks.push([`${p.name}: сервер прислал полное здоровье`, p.last.hp === FULL_HP]);
   // Единственная проверка, что флаг огня доживает до сервера через JSON и nginx.
   checks.push([`${p.name}: выстрел долетел до сервера`, p.shellsSeen > 0]);
 }

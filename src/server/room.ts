@@ -151,6 +151,9 @@ const ROYALE_SHOT_REVEAL_TICKS = 2 * TICK_HZ;
 
 /** Насколько дальше настоящего радиуса попадания снаряд ещё считается «прошёл рядом», м. */
 const NEAR_MISS_MARGIN = 2.2;
+// Больше диаметра танка, но достаточно мелко, чтобы в перестрелке выбирать
+// лишь соседние цели, а не весь список игроков.
+const TANK_CELL_SIZE = 16;
 /** Подавление после близкого разрыва (или уцелевшего попадания), с. */
 const SUPPRESS_S = 1.6;
 const SUPPRESS_TICKS = Math.round(SUPPRESS_S * TICK_HZ);
@@ -416,6 +419,13 @@ export class Room {
   };
 
   private readonly shells: ShellState[] = [];
+  /**
+   * Динамическая широкая фаза для снарядов. Перестраивается после движения
+   * танков и хранит только их центры: точную sweep-проверку по кругу всё равно
+   * выполняем ниже. Так залп не делает два полных прохода по всем игрокам на
+   * каждый снаряд.
+   */
+  private readonly tankCells = new Map<string, Player[]>();
   /** Имена ушедших стрелков, чьи снаряды ещё в воздухе. Чистится в updateShells. */
   private readonly ghosts = new Map<number, string>();
   /** Ящики на карте. Публичны по той же причине, что и players: их гоняют проверки. */
@@ -621,6 +631,7 @@ export class Room {
         DT,
       ),
     );
+    this.refreshTankCells();
     this.updateShells();
     if (royalePositions) this.refreshRoyaleVisionAfterMovement(royalePositions);
   }
@@ -1132,16 +1143,19 @@ export class Room {
     for (let segment = 0; segment < MAX_SEGMENTS; segment++) {
       // Именно cover: низкое укрытие снаряд проходит насквозь.
       const wall = sweepShell(shell, dt, this.liveCover, this.half);
+      // Один список кандидатов годится и для попадания, и для near-miss:
+      // второму нужен чуть больший радиус, поэтому он и задаёт padding.
+      const targets = this.tankCandidates(shell, dt, wall ? wall.t : 1);
 
       // Танк на отрезке важнее стены за ним, поэтому ищем его только до касания.
-      const victim = this.firstVictim(shell, dt, wall ? wall.t : 1);
+      const victim = this.firstVictim(shell, dt, wall ? wall.t : 1, targets);
       if (victim) {
         stepShell(shell, dt * victim.t);
         this.damage(victim.player, shell);
         return true;
       }
 
-      const grazed = this.grazed(shell, dt, wall ? wall.t : 1);
+      const grazed = this.grazed(shell, dt, wall ? wall.t : 1, targets);
       if (grazed.length > 0) {
         const shooter = this.players.get(shell.owner);
         for (const near of grazed) {
@@ -1179,10 +1193,11 @@ export class Room {
     shell: ShellState,
     dt: number,
     limit: number,
+    targets: Player[],
   ): { player: Player; t: number } | null {
     let best: { player: Player; t: number } | null = null;
     const shooter = this.players.get(shell.owner);
-    for (const target of this.players.values()) {
+    for (const target of targets) {
       if (target.dead) continue;
       // В себя можно попасть только рикошетом: иначе снаряд убивал бы стрелка на вылете.
       if (target.id === shell.owner && shell.bounces === 0) continue;
@@ -1200,10 +1215,10 @@ export class Room {
    * тот же перебор, что firstVictim, увеличенным радиусом. Своего стрелка не считаю
    * никогда (не пугаться собственного дула), даже на рикошете.
    */
-  private grazed(shell: ShellState, dt: number, limit: number): Player[] {
+  private grazed(shell: ShellState, dt: number, limit: number, targets: Player[]): Player[] {
     const r = TANK_RADIUS + SHELL_RADIUS + NEAR_MISS_MARGIN;
     const near: Player[] = [];
-    for (const target of this.players.values()) {
+    for (const target of targets) {
       if (target.dead || target.id === shell.owner) continue;
       const t = sweepCircle(shell, dt, target.state.x, target.state.z, r);
       if (t === null || t > limit) continue;
@@ -1213,6 +1228,45 @@ export class Room {
       near.push(target);
     }
     return near;
+  }
+
+  /** Один танк попадает ровно в одну ячейку; перестройка стоит O(живых танков). */
+  private refreshTankCells(): void {
+    this.tankCells.clear();
+    for (const player of this.players.values()) {
+      if (player.dead) continue;
+      const key = this.tankCellKey(player.state.x, player.state.z);
+      const cell = this.tankCells.get(key);
+      if (cell) cell.push(player);
+      else this.tankCells.set(key, [player]);
+    }
+  }
+
+  /**
+   * Все ячейки, до которых снаряд может дотянуться на текущем отрезке, с
+   * запасом под радиус near-miss. Центр танка из такой области не теряется на
+   * границе ячейки, а лишние кандидаты отсекает точный sweepCircle.
+   */
+  private tankCandidates(shell: ShellState, dt: number, limit: number): Player[] {
+    const padding = TANK_RADIUS + SHELL_RADIUS + NEAR_MISS_MARGIN;
+    const endX = shell.x + shell.vx * dt * limit;
+    const endZ = shell.z + shell.vz * dt * limit;
+    const minX = Math.floor((Math.min(shell.x, endX) - padding) / TANK_CELL_SIZE);
+    const maxX = Math.floor((Math.max(shell.x, endX) + padding) / TANK_CELL_SIZE);
+    const minZ = Math.floor((Math.min(shell.z, endZ) - padding) / TANK_CELL_SIZE);
+    const maxZ = Math.floor((Math.max(shell.z, endZ) + padding) / TANK_CELL_SIZE);
+    const candidates: Player[] = [];
+    for (let x = minX; x <= maxX; x++) {
+      for (let z = minZ; z <= maxZ; z++) {
+        const cell = this.tankCells.get(`${x}:${z}`);
+        if (cell) candidates.push(...cell);
+      }
+    }
+    return candidates;
+  }
+
+  private tankCellKey(x: number, z: number): string {
+    return `${Math.floor(x / TANK_CELL_SIZE)}:${Math.floor(z / TANK_CELL_SIZE)}`;
   }
 
   /** Уцелевшее попадание на время сбивает точность. */
