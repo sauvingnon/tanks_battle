@@ -53,6 +53,8 @@ Measured result: `bench:snapshots` total p95 was 0.073/0.112/0.228/0.244 ms for 
 
 ### 5. Worker threads — только после замеров
 
+Status: not justified by current measurements; the accepted broad-phase leaves the 33.3 ms tick budget with wide margin, while moving mutable combat state to workers would add synchronization and copying cost.
+
 Рассматривать вынос только чистых, независимых расчётов (например, пакетного AI-планирования). Состояние боя, физика и порядок событий остаются в одном потоке для детерминизма.
 
 Критерий: worker даёт измеримое снижение p95/p99 с учётом стоимости копирования данных и не создаёт рассинхронизаций.
