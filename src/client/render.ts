@@ -111,10 +111,23 @@ const OBSTACLE_BEVEL_SEGMENTS = 1;
  * где танк проезжает целиком, она даже не участвует в столкновении — см.
  * passableObstacles в map.ts), а кластер всегда поднимается заметно выше танка.
  */
-const LEAF_CUBE = 1.4; // м, шаг посадки листовых комков
-const BUSH_HEIGHT = 3.2; // м, высота кластера
+const LEAF_CUBE = 1.55; // м, шаг посадки листовых комков
 const BUSH_LAYERS = 3;
 const LEAF_PALETTE = LEAF_COLORS.map((c) => new THREE.Color(c));
+
+/** Визуальные профили не меняют физику куста — только его силуэт. */
+const BUSH_PROFILES = [
+  // Широкий округлый куст: плотный низ и мягкая редкая верхушка.
+  { height: 3.05, width: 1.12, depth: 1.04, topDrop: 0.1, topSparse: 0.16 },
+  // Высокий куст: лучше читается как укрытие и ломает горизонтальную линию.
+  { height: 4.0, width: 0.94, depth: 0.96, topDrop: 0.24, topSparse: 0.34 },
+  // Низкий раскидистый куст: остаётся заметным, но не выглядит стеной.
+  { height: 2.7, width: 1.24, depth: 1.16, topDrop: 0.04, topSparse: 0.08 },
+] as const;
+
+function bushSeed(box: Box): number {
+  return Math.abs(Math.sin(box.x * 12.9898 + box.z * 78.233 + box.w * 37.719 + box.d * 19.193) * 43758.5453) % 1;
+}
 
 type BoxLook =
   | 'wall'
@@ -1551,7 +1564,11 @@ export class Scene3D {
    * торчат сквозь укрытия и не создают новую физику.
    */
   private buildGrass(half: number, obstacles: Box[], mapId: number): void {
-    const count = half >= 400 ? 2200 : half >= 120 ? 1000 : 650;
+    // Раньше трава была скорее редкой разметкой поля: на обычной карте её
+    // набиралось всего 650 пучков. Один InstancedMesh всё равно остаётся одним
+    // draw call, поэтому плотность можно поднять без пропорционального роста
+    // стоимости рендера. На больших картах сохраняем ту же визуальную частоту.
+    const count = half >= 400 ? 6600 : half >= 120 ? 3000 : 1950;
     const mesh = new THREE.InstancedMesh(
       grassTuftGeometry(),
       new THREE.MeshStandardMaterial({
@@ -2003,11 +2020,12 @@ export class Scene3D {
    * десятков, обычный Mesh на каждый обошёлся бы куда дороже по кадру.
    */
   private buildBush(box: Box, geometry: THREE.BufferGeometry, material: THREE.MeshStandardMaterial): void {
+    const profile = BUSH_PROFILES[Math.floor(bushSeed(box) * BUSH_PROFILES.length)];
     const cols = Math.max(2, Math.round(box.w / LEAF_CUBE));
     const rows = Math.max(2, Math.round(box.d / LEAF_CUBE));
     const stepX = box.w / cols;
     const stepZ = box.d / rows;
-    const stepY = BUSH_HEIGHT / BUSH_LAYERS;
+    const stepY = profile.height / BUSH_LAYERS;
 
     const mesh = new THREE.InstancedMesh(geometry, material, cols * rows * BUSH_LAYERS);
     mesh.castShadow = true;
@@ -2021,19 +2039,30 @@ export class Scene3D {
           const nz = rows === 1 ? 0 : (cz / (rows - 1)) * 2 - 1;
           const edge = Math.min(1, Math.hypot(nx, nz) * 0.72);
           const layerT = layer / (BUSH_LAYERS - 1);
-          const x = box.x - box.w / 2 + stepX * (cx + 0.5) + (Math.random() - 0.5) * stepX * 0.34;
-          const z = box.z - box.d / 2 + stepZ * (cz + 0.5) + (Math.random() - 0.5) * stepZ * 0.34;
-          const y = stepY * (layer + 0.5) + (Math.random() - 0.5) * stepY * 0.5;
+          // Верхний ярус не заполняем по сетке целиком: редкие пропуски и
+          // детерминированный шум ломают силуэт живой изгороди.
+          const sample = Math.abs(Math.sin((cx + 1) * 17.13 + (cz + 1) * 31.71 + (layer + 1) * 47.11 + box.x * 0.17 + box.z * 0.23));
+          if (layer === BUSH_LAYERS - 1 && edge > 0.5 && sample < profile.topSparse) continue;
+          const jitterX = Math.abs(Math.sin((cx + 1) * 23.17 + (cz + 1) * 11.39 + box.x * 0.11));
+          const jitterZ = Math.abs(Math.sin((cx + 1) * 13.71 + (cz + 1) * 29.53 + box.z * 0.19));
+          const x = box.x - box.w / 2 + stepX * (cx + 0.5) + (jitterX - 0.5) * stepX * 0.46;
+          const z = box.z - box.d / 2 + stepZ * (cz + 0.5) + (jitterZ - 0.5) * stepZ * 0.46;
+          const yJitter = Math.abs(Math.sin((cx + 1) * 7.91 + (cz + 1) * 19.37 + layer * 3.17 + box.x * 0.07));
+          const y = stepY * (layer + 0.5) + (yJitter - 0.5) * stepY * 0.42;
           dummy.position.set(x, y, z);
-          dummy.rotation.set(0, Math.random() * Math.PI * 2, 0);
-          // Верх и края чуть компактнее: силуэт получается мягким и кустовым,
-          // но сетка и число экземпляров остаются прежними.
-          const fullness = 0.82 + (1 - edge) * 0.2 - layerT * 0.1;
-          const size = fullness * (0.92 + Math.random() * 0.16);
-          dummy.scale.set(size * (0.94 + Math.random() * 0.12), size * (0.82 + Math.random() * 0.18), size * (0.94 + Math.random() * 0.12));
+          dummy.rotation.set(0, sample * Math.PI * 2, 0);
+          // Верх и края компактнее, но профиль добавляет кусту собственную
+          // «породу»: широкий, высокий или низкий раскидистый силуэт.
+          const fullness = 0.86 + (1 - edge) * 0.28 - layerT * profile.topDrop;
+          const size = fullness * (0.9 + sample * 0.18);
+          dummy.scale.set(
+            size * profile.width * (0.9 + jitterX * 0.18),
+            size * (0.84 + jitterZ * 0.2),
+            size * profile.depth * (0.9 + jitterX * 0.18),
+          );
           dummy.updateMatrix();
           mesh.setMatrixAt(i, dummy.matrix);
-          mesh.setColorAt(i, LEAF_PALETTE[(Math.random() * LEAF_PALETTE.length) | 0]);
+          mesh.setColorAt(i, LEAF_PALETTE[Math.floor(sample * LEAF_PALETTE.length) % LEAF_PALETTE.length]);
           i++;
         }
       }
