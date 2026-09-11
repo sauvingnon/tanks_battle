@@ -134,6 +134,8 @@ const RELOAD_TICKS = Math.round(RELOAD_S * TICK_HZ);
 const RESPAWN_TICKS = Math.round(RESPAWN_S * TICK_HZ);
 const RAM_COOLDOWN_TICKS = Math.round(RAM_COOLDOWN_S * TICK_HZ);
 const ROYALE_VISION_REFRESH_TICKS = Math.round(5 * TICK_HZ);
+/** Выстрел ненадолго выдаёт танк даже из куста. */
+const ROYALE_SHOT_REVEAL_TICKS = 2 * TICK_HZ;
 
 /** Насколько дальше настоящего радиуса попадания снаряд ещё считается «прошёл рядом», м. */
 const NEAR_MISS_MARGIN = 2.2;
@@ -364,6 +366,10 @@ export class Room {
   private readonly royaleContacts = new Map<number, Map<number, { x: number; z: number; until: number }>>();
   /** Общий засвет сквада: команда -> враги, которых видит хотя бы один союзник. */
   private readonly royaleVision = new Map<number, Set<number>>();
+  /** Личная видимость каждого живого наблюдателя; из неё собирается royaleVision сквада. */
+  private readonly royaleSight = new Map<number, Set<number>>();
+  /** Цели, чья видимость изменилась без движения: выстрел, смерть, окончание засвета. */
+  private readonly royaleVisionEvents = new Set<number>();
   private royaleVisionTick = -Infinity;
 
   // --- Состояние командного боя ---
@@ -469,6 +475,10 @@ export class Room {
     const player = this.players.get(id);
     if (player) this.forget(player);
     this.players.delete(id);
+    // Ушедший мог быть единственным, кто держал врага в засвете для сквада.
+    this.royaleSight.delete(id);
+    this.royaleVisionEvents.delete(id);
+    this.invalidateRoyaleVision();
     if (id !== this.hostId) return;
 
     // Хост ушёл — передаём следующему по времени входа.
@@ -516,6 +526,11 @@ export class Room {
     if (this.mode === MODE_TEAM) this.updateTeamBattle();
     if (this.bonusesOn) this.updateBonuses();
     this.refreshWrecks();
+    // Снимок нужен до движения, включая разворот бота и расталкивание корпусов:
+    // в конце тика по нему определяем, кто действительно сдвинулся.
+    const royalePositions = this.mode === MODE_ROYALE
+      ? new Map([...this.players.values()].map((player) => [player.id, { x: player.state.x, z: player.state.z }]))
+      : null;
 
     for (const player of this.players.values()) {
       if (player.brain) {
@@ -587,6 +602,7 @@ export class Room {
       ),
     );
     this.updateShells();
+    if (royalePositions) this.refreshRoyaleVisionAfterMovement(royalePositions);
   }
 
   /**
@@ -648,6 +664,8 @@ export class Room {
     this.royalePhase = 'countdown';
     this.royalePhaseUntil = this.tick + Math.round(ROYALE_START_COUNTDOWN_S * TICK_HZ);
     this.royaleVision.clear();
+    this.royaleSight.clear();
+    this.royaleVisionEvents.clear();
     this.royaleVisionTick = -Infinity;
 
     // Центр круга — случайная точка карты, и на каждом этапе сжатия она
@@ -829,6 +847,8 @@ export class Room {
       if (this.royaleStarted) this.clearBots();
       this.royaleContacts.clear();
       this.royaleVision.clear();
+      this.royaleSight.clear();
+      this.royaleVisionEvents.clear();
       this.royaleVisionTick = -Infinity;
       this.royaleStarted = false;
       this.royaleOver = false;
@@ -985,6 +1005,7 @@ export class Room {
     const shell = spawnShell(this.nextShellId++, player.id, player.state);
     player.shots++;
     player.lastShotAt = this.tick;
+    if (this.mode === MODE_ROYALE) this.royaleVisionEvents.add(player.id);
     // Урон считаем здесь, а не при попадании: снаряд после выстрела живёт сам по себе.
     const power =
       (this.mode === MODE_ROYALE
@@ -1220,6 +1241,7 @@ export class Room {
 
     victim.hp = 0;
     victim.dead = true;
+    if (this.mode === MODE_ROYALE) this.royaleVisionEvents.add(victim.id);
     victim.deaths++;
     victim.respawnAt = this.tick + RESPAWN_TICKS;
     victim.queue.length = 0;
@@ -1600,6 +1622,8 @@ export class Room {
     this.royalePhaseUntil = 0;
     this.royaleContacts.clear();
     this.royaleVision.clear();
+    this.royaleSight.clear();
+    this.royaleVisionEvents.clear();
     this.royaleVisionTick = -Infinity;
     this.royaleZone.phase = 'safe';
     this.royaleZone.endsAt = 0;
@@ -1968,29 +1992,131 @@ export class Room {
     return this.royaleVision.get(viewer.team)?.has(target.id) ?? false;
   }
 
-  /** Пересчитывает лучи обзора только раз в 5 секунд и делит результат со сквадом. */
+  /**
+   * Полная сверка видимости: это страховка раз в пять секунд, а не основной
+   * путь подсвета. Обычное движение обновляется адресно в
+   * refreshRoyaleVisionAfterMovement(), поэтому быстрый таран не ждёт кэша.
+   */
   private refreshRoyaleVision(): void {
     if (this.mode !== MODE_ROYALE || !this.royaleStarted) return;
     if (this.tick - this.royaleVisionTick < ROYALE_VISION_REFRESH_TICKS) return;
 
-    const observers = new Map<number, Player[]>();
+    const teams = new Set<number>();
+    this.royaleVision.clear();
+    this.royaleSight.clear();
     for (const player of this.players.values()) {
       if (player.dead) continue;
-      const allies = observers.get(player.team);
-      if (allies) allies.push(player);
-      else observers.set(player.team, [player]);
-    }
-
-    this.royaleVision.clear();
-    for (const [team, allies] of observers) {
       const visible = new Set<number>();
       for (const target of this.players.values()) {
-        if (target.dead || target.team === team) continue;
-        if (allies.some((ally) => this.royaleVisibleFrom(ally, target))) visible.add(target.id);
+        if (target.dead || target.team === player.team) continue;
+        if (this.royaleVisibleFrom(player, target)) visible.add(target.id);
       }
-      this.royaleVision.set(team, visible);
+      this.royaleSight.set(player.id, visible);
+      teams.add(player.team);
     }
+    for (const team of teams) this.rebuildRoyaleVision(team);
     this.royaleVisionTick = this.tick;
+  }
+
+  /** Собирает засвет сквада из личных линий обзора его живых участников. */
+  private rebuildRoyaleVision(team: number): void {
+    const visible = new Set<number>();
+    for (const player of this.players.values()) {
+      if (player.dead || player.team !== team) continue;
+      const sight = this.royaleSight.get(player.id);
+      if (!sight) continue;
+      for (const targetId of sight) visible.add(targetId);
+    }
+    this.royaleVision.set(team, visible);
+  }
+
+  /** Полностью обновляет только то, что видит один сдвинувшийся наблюдатель. */
+  private refreshRoyaleSight(viewer: Player): boolean {
+    if (viewer.dead) return this.royaleSight.delete(viewer.id);
+    const next = new Set<number>();
+    for (const target of this.players.values()) {
+      if (target.dead || target.team === viewer.team) continue;
+      if (this.royaleVisibleFrom(viewer, target)) next.add(target.id);
+    }
+    const previous = this.royaleSight.get(viewer.id);
+    if (previous && previous.size === next.size && [...next].every((id) => previous.has(id))) return false;
+    this.royaleSight.set(viewer.id, next);
+    return true;
+  }
+
+  /** Обновляет одну линию «наблюдатель → цель», когда сдвинулась сама цель. */
+  private refreshRoyaleSightTarget(viewer: Player, target: Player): boolean {
+    const sight = this.royaleSight.get(viewer.id) ?? new Set<number>();
+    const wasVisible = sight.has(target.id);
+    const visible = !viewer.dead && !target.dead && viewer.team !== target.team && this.royaleVisibleFrom(viewer, target);
+    if (visible) sight.add(target.id);
+    else sight.delete(target.id);
+    this.royaleSight.set(viewer.id, sight);
+    return wasVisible !== visible;
+  }
+
+  /**
+   * Быстрый путь подсвета BR. Движущийся танк пересчитывает свой обзор после
+   * шага физики; стоящие враги одновременно проверяют только его. Поэтому
+   * неподвижный наблюдатель замечает въехавшую в его луч цель без ожидания
+   * пятисекундного полного кэша, а сервер не делает полный N²-пересчёт для
+   * каждого, кто вообще не сдвинулся.
+   */
+  private refreshRoyaleVisionAfterMovement(previous: Map<number, { x: number; z: number }>): void {
+    if (this.mode !== MODE_ROYALE || !this.royaleStarted || this.royalePhase !== 'fight') {
+      this.royaleVisionEvents.clear();
+      return;
+    }
+
+    const movers: Player[] = [];
+    const moverIds = new Set<number>();
+    for (const player of this.players.values()) {
+      const before = previous.get(player.id);
+      if (!player.dead && before && Math.hypot(player.state.x - before.x, player.state.z - before.z) > 0.001) {
+        movers.push(player);
+        moverIds.add(player.id);
+      }
+      // Ровно на следующем тике после двух секунд выстрел перестаёт выдавать
+      // цель: без этой точки стоящий в кусте танк остался бы в засвете до
+      // фоновой полной сверки.
+      if (player.lastShotAt === this.tick - ROYALE_SHOT_REVEAL_TICKS - 1) {
+        this.royaleVisionEvents.add(player.id);
+      }
+    }
+
+    const changedTeams = new Set<number>();
+    // У идущего танка обзор догоняет его новое положение после симуляции.
+    for (const mover of movers) {
+      if (this.refreshRoyaleSight(mover)) changedTeams.add(mover.team);
+    }
+    // Стоящие наблюдатели не ждут своего движения: проверяем только цель,
+    // которая въехала в их уже существующую линию обзора.
+    for (const target of movers) {
+      for (const viewer of this.players.values()) {
+        if (viewer.dead || viewer.id === target.id || viewer.team === target.team || moverIds.has(viewer.id)) continue;
+        if (this.refreshRoyaleSightTarget(viewer, target)) changedTeams.add(viewer.team);
+      }
+    }
+
+    // Выстрел и смерть меняют видимость без обязательного перемещения.
+    for (const targetId of this.royaleVisionEvents) {
+      const target = this.players.get(targetId);
+      if (!target || target.dead) {
+        if (target && this.royaleSight.delete(target.id)) changedTeams.add(target.team);
+        for (const [viewerId, sight] of this.royaleSight) {
+          if (!sight.delete(targetId)) continue;
+          const viewer = this.players.get(viewerId);
+          if (viewer) changedTeams.add(viewer.team);
+        }
+        continue;
+      }
+      for (const viewer of this.players.values()) {
+        if (viewer.dead || viewer.team === target.team) continue;
+        if (this.refreshRoyaleSightTarget(viewer, target)) changedTeams.add(viewer.team);
+      }
+    }
+    this.royaleVisionEvents.clear();
+    for (const team of changedTeams) this.rebuildRoyaleVision(team);
   }
 
   /** Принудительный сброс для смены состояния мира и детерминированных проверок. */
@@ -2003,7 +2129,7 @@ export class Room {
     if (target.dead) return false;
     const distance = Math.hypot(target.state.x - viewer.state.x, target.state.z - viewer.state.z);
     if (distance <= 22) return true;
-    const recentShot = this.tick - target.lastShotAt <= 2 * TICK_HZ;
+    const recentShot = this.tick - target.lastShotAt <= ROYALE_SHOT_REVEAL_TICKS;
     if (target.stealth && distance > 22) return recentShot && distance <= ROYALE_SHOT_REVEAL_RANGE;
 
     const targetBush = bushIndexAt(this.bushes, target.state.x, target.state.z);
