@@ -467,8 +467,9 @@ export const MODULE_SLOT_GUN = 1;
 export const MODULE_SLOT_LOADER = 2;
 export const MODULE_SLOT_ENGINE = 3;
 export const MODULE_SLOT_UTILITY = 4;
-export const MODULE_SLOT_COUNT = 5;
-export const MODULE_SLOT_NAMES = ['Броня', 'Орудие', 'Заряжание', 'Двигатель', 'Система'] as const;
+export const MODULE_SLOT_CAMO = 5;
+export const MODULE_SLOT_COUNT = 6;
+export const MODULE_SLOT_NAMES = ['Броня', 'Орудие', 'Заряжание', 'Двигатель', 'Система', 'Камуфляж'] as const;
 export const MODULE_MAX_INVENTORY = 8;
 
 export interface RoyaleModule {
@@ -489,6 +490,8 @@ export interface RoyaleModule {
   resist?: number;
   /** Мгновенное восстановление здоровья при подборе; такие модули не занимают слот. */
   heal?: number;
+  /** Динамическая окраска по окружению; занимает отдельный слот камуфляжа. */
+  camouflage?: boolean;
 }
 
 const module = (entry: Omit<RoyaleModule, 'id'>, offset: number): RoyaleModule => ({
@@ -516,6 +519,9 @@ export const ROYALE_MODULES: readonly RoyaleModule[] = [
   module({ slot: -1, tier: 1, name: 'Медкапсула', short: '+280 HP сразу', heal: 280 }, 15),
   module({ slot: -1, tier: 2, name: 'Ремонтный инжектор', short: '+520 HP сразу', heal: 520 }, 16),
   module({ slot: -1, tier: 3, name: 'Наноремонт', short: '+820 HP сразу', heal: 820 }, 17),
+  module({ slot: MODULE_SLOT_CAMO, tier: 1, name: 'Маскировочная сетка', short: 'цвет среды · 5 с', camouflage: true }, 18),
+  module({ slot: MODULE_SLOT_CAMO, tier: 2, name: 'Адаптивный камуфляж', short: 'точный цвет среды · 5 с', camouflage: true }, 19),
+  module({ slot: MODULE_SLOT_CAMO, tier: 3, name: 'Хамелеон-поле', short: 'глубокая маскировка · 5 с', camouflage: true }, 20),
 ];
 
 export const ROYALE_MODULE_BY_ID = new Map(ROYALE_MODULES.map((entry) => [entry.id, entry]));

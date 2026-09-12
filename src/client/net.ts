@@ -91,7 +91,7 @@ export class Net {
     this.send({ t: 'upgrade', id });
   }
 
-  manageLoadout(op: 'equip' | 'drop', index: number): void {
+  manageLoadout(op: 'equip' | 'drop' | 'drop-equipped', index: number): void {
     this.send({ t: 'loadout', op, index });
   }
 

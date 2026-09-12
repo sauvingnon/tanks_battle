@@ -115,7 +115,7 @@ export type ClientMessage =
   | { t: 'ping'; id: number }
   | { t: 'upgrade'; id: number }
   /** Операция со своим BR-рюкзаком; сервер сам проверяет слот и владение. */
-  | { t: 'loadout'; op: 'equip' | 'drop'; index: number }
+  | { t: 'loadout'; op: 'equip' | 'drop' | 'drop-equipped'; index: number }
   /** Настройка комнаты; принимается только от хоста. */
   | {
       t: 'setup';
@@ -230,7 +230,7 @@ const F_CONTACTS = 1 << 5;
 const F_LOADOUT = 1 << 6;
 
 const HEADER_SIZE = 11; // flags:u8 + tick:u32 + ack:u32 + playerCount:u16
-const PLAYER_SIZE = 25; // i:u32 x:i16 z:i16 a:u16 t:u16 s:i16 h:u16 m:u16 f:u16 d:u8 q:u32
+const PLAYER_SIZE = 26; // i:u32 x:i16 z:i16 a:u16 t:u16 s:i16 h:u16 m:u16 f:u16 d:u8 c:u8 q:u32
 const SHELL_SIZE = 15; // i:u32 o:u32 x:i16 z:i16 a:u16 b:u8
 const BOOM_SIZE = 9; // x:i16 z:i16 k:u8 o:u32
 const HIT_SIZE = 6; // x:i16 z:i16 amount:u16
@@ -388,6 +388,7 @@ export function encodeSnapshot(p: SnapshotPayload): ArrayBuffer {
     w.u16(packHp(e.m ?? 0));
     w.u16(e.f ?? 0);
     w.u8(e.d);
+    w.u8(e.c ?? 0);
     w.u32((e.q ?? 0) >>> 0);
   }
   if (p.shells) {
@@ -475,6 +476,7 @@ export function decodeSnapshot(buf: ArrayBuffer): SnapshotMessage {
       m: unpackHp(r.u16()),
       f: r.u16(),
       d: r.u8() as 0 | 1,
+      c: r.u8() as 0 | 1 | 2,
       q: r.u32(),
     });
   }

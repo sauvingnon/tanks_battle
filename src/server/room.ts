@@ -188,6 +188,10 @@ export interface Player {
   equipped: number[];
   /** Кэш эффекта «Маскировка» на этот тик: его читает ИИ каждого бота. */
   stealth: boolean;
+  /** Стиль окраски модуля-камуфляжа: 0 — обычный, 1 — кусты, 2 — грунт. */
+  camouflageStyle: 0 | 1 | 2;
+  /** Следующий анализ окружения камуфляжем. */
+  camouflageNextAt: number;
   state: TankState;
   hp: number;
   dead: boolean;
@@ -470,6 +474,8 @@ export class Room {
       inventory: [],
       equipped: new Array<number>(MODULE_SLOT_COUNT).fill(0),
       stealth: false,
+      camouflageStyle: 0,
+      camouflageNextAt: 0,
       state: this.spawnState(spawn),
       hp: MAX_HP,
       dead: false,
@@ -610,6 +616,8 @@ export class Room {
         }
       }
     }
+
+    if (this.mode === MODE_ROYALE) this.updateRoyaleCamouflage();
 
     const alive: Player[] = [];
     for (const p of this.players.values()) if (!p.dead) alive.push(p);
@@ -1535,6 +1543,21 @@ export class Room {
     return value;
   }
 
+  /** Камуфляж раз в пять секунд снимает новую пробу окружения. */
+  private updateRoyaleCamouflage(): void {
+    for (const player of this.players.values()) {
+      if (player.dead) continue;
+      const camo = player.equipped.some((id) => royaleModule(id)?.camouflage === true);
+      if (!camo) {
+        player.camouflageStyle = 0;
+        continue;
+      }
+      if (this.tick < player.camouflageNextAt) continue;
+      player.camouflageStyle = bushIndexAt(this.bushes, player.state.x, player.state.z) >= 0 ? 1 : 2;
+      player.camouflageNextAt = this.tick + 5 * TICK_HZ;
+    }
+  }
+
   private equipBotRoyaleModules(bot: Player, difficulty: number): void {
     const count = Math.min(MODULE_SLOT_COUNT, 2 + Math.max(0, difficulty));
     const start = Math.floor(Math.random() * MODULE_SLOT_COUNT);
@@ -1562,8 +1585,17 @@ export class Room {
   }
 
   /** Серверная команда с UI: индекс указывает на предмет в текущем рюкзаке. */
-  manageRoyaleLoadout(player: Player, op: 'equip' | 'drop', index: number): void {
+  manageRoyaleLoadout(player: Player, op: 'equip' | 'drop' | 'drop-equipped', index: number): void {
     if (this.mode !== MODE_ROYALE || player.dead || !Number.isInteger(index)) return;
+    if (op === 'drop-equipped') {
+      if (index < 0 || index >= MODULE_SLOT_COUNT) return;
+      const equipped = player.equipped[index];
+      if (!royaleModule(equipped)) return;
+      player.equipped[index] = 0;
+      player.hp = Math.min(player.hp, this.maxHealth(player));
+      this.dropRoyaleItem(player, equipped);
+      return;
+    }
     const kind = player.inventory[index];
     const item = royaleModule(kind);
     if (!item || item.slot < 0 || item.heal !== undefined) return;
@@ -1578,18 +1610,43 @@ export class Room {
     }
     if (op === 'drop') {
       player.inventory.splice(index, 1);
-      // Не даём тут же подобрать предмет в следующем тике, пока танк ещё стоит
-      // над ним. Двух секунд достаточно отъехать; другим игрокам лут доступен сразу.
-      this.bonuses.push({
-        id: this.nextBonusId++,
-        kind,
-        x: player.state.x,
-        z: player.state.z,
-        until: Number.MAX_SAFE_INTEGER,
-        pickupBlockedFor: player.id,
-        pickupBlockedUntil: this.tick + 2 * TICK_HZ,
-      });
+      this.dropRoyaleItem(player, kind);
     }
+  }
+
+  /** Бросает модуль перед танком и на короткое время блокирует его владельцу. */
+  private dropRoyaleItem(player: Player, kind: number): void {
+    // Бросок летит перед корпусом, чтобы предмет не оказался под гусеницами и
+    // не выглядел как мгновенный повторный подбор. Если впереди занято, ищем
+    // свободную точку по бокам; минимальная дистанция больше радиуса подбора.
+    const minDistance = TANK_RADIUS + BONUS_RADIUS + 1;
+    let spot: { x: number; z: number } | null = null;
+    const directions = [player.state.angle, player.state.angle + Math.PI / 2, player.state.angle - Math.PI / 2, player.state.angle + Math.PI];
+    for (const distance of [8, 12, 16]) {
+      for (const direction of directions) {
+        const candidate = this.royaleLootSpot(
+          player.state.x + Math.sin(direction) * distance,
+          player.state.z + Math.cos(direction) * distance,
+        );
+        if (candidate && Math.hypot(candidate.x - player.state.x, candidate.z - player.state.z) >= minDistance) {
+          spot = candidate;
+          break;
+        }
+      }
+      if (spot) break;
+    }
+    // Крайний вариант — любая свободная точка карты, но никогда не центр танка.
+    spot ??= this.freeSpot();
+    if (!spot) return;
+    this.bonuses.push({
+      id: this.nextBonusId++,
+      kind,
+      x: spot.x,
+      z: spot.z,
+      until: Number.MAX_SAFE_INTEGER,
+      pickupBlockedFor: player.id,
+      pickupBlockedUntil: this.tick + 2 * TICK_HZ,
+    });
   }
 
   /** Сдвигает задуманный контейнер к ближайшему свободному месту в том же POI. */
@@ -1690,6 +1747,8 @@ export class Room {
       player.inventory.length = 0;
       player.equipped.fill(0);
       player.stealth = false;
+      player.camouflageStyle = 0;
+      player.camouflageNextAt = this.tick;
       player.zoneDamageRemainder = 0;
     }
   }
@@ -2129,6 +2188,7 @@ export class Room {
         m: this.maxHealth(p),
         // Поле есть только у тех, у кого эффект реально висит — экономия трафика.
         ...(mask === 0 ? {} : { f: mask }),
+        ...(p.camouflageStyle === 0 ? {} : { c: p.camouflageStyle }),
         // Счётчик нужен клиенту, чтобы отдача и вспышка означали именно
         // подтверждённый сервером выстрел, а не ранний запрос во время отката.
         q: p.shots,

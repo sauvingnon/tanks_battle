@@ -6,7 +6,7 @@ import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 
-import { MAX_HP, MODULE_SLOT_ARMOR, MODULE_SLOT_ENGINE, MODULE_SLOT_GUN, MODULE_SLOT_LOADER, ROYALE_MODULE_TIER_COLORS, royaleModule, SHELL_HEIGHT } from '../shared/constants.js';
+import { MAX_HP, MODULE_SLOT_ARMOR, MODULE_SLOT_CAMO, MODULE_SLOT_ENGINE, MODULE_SLOT_GUN, MODULE_SLOT_LOADER, ROYALE_MODULE_TIER_COLORS, royaleModule, SHELL_HEIGHT } from '../shared/constants.js';
 import { isBush } from '../shared/map.js';
 import { wrapAngle } from '../shared/sim.js';
 import {
@@ -773,6 +773,9 @@ export interface TankHandle {
   paintColor: number;
   /** Палитра до командной окраски BR: в обычных режимах сохраняем её как есть. */
   basePaintColor: number;
+  /** Текущая окраска среды: 0 — штатная, 1 — кусты, 2 — грунт. */
+  camouflageStyle: 0 | 1 | 2;
+  camouflageColor?: number;
   /** Сколько секунд идёт гибель; -1 — танк не подбит. */
   dying: number;
   /**
@@ -833,6 +836,7 @@ const FACTION_PAINT: Record<Exclude<TankFaction, 'neutral'>, number> = {
   ally: 0x36a9bd,
   enemy: 0xd6534d,
 };
+const CAMO_BUSH_PAINT = 0x4f8f4e;
 
 /** Одна всплывающая цифра урона: DOM-узел плюс мировая точка, от которой он растёт. */
 interface DamageNumberHandle {
@@ -2524,6 +2528,8 @@ export class Scene3D {
       paint: bodyMaterial,
       paintColor,
       basePaintColor: paintColor,
+      camouflageStyle: 0,
+      camouflageColor: undefined,
       dying: -1,
       smokeAt: 0,
       everSeen: false,
@@ -2556,7 +2562,7 @@ export class Scene3D {
 
     const paintColor = faction === 'neutral' ? handle.basePaintColor : FACTION_PAINT[faction];
     handle.paintColor = paintColor;
-    handle.paint.color.setHex(paintColor);
+    handle.paint.color.setHex(handle.camouflageColor ?? paintColor);
     if (!handle.alive) handle.paint.color.multiplyScalar(WRECK_DARKEN);
 
     handle.faction = faction;
@@ -2568,6 +2574,16 @@ export class Scene3D {
       }
       if (faction !== 'neutral') handle.label.classList.add(`faction-${faction}`);
     }
+  }
+
+  /** Применяет окраску окружения от серверного анализа камуфляжа. */
+  setTankCamouflage(id: number, style: 0 | 1 | 2, mapId = 0): void {
+    const handle = this.tanks.get(id);
+    if (!handle || handle.camouflageStyle === style && (style !== 2 || handle.camouflageColor === groundColor(mapId))) return;
+    handle.camouflageStyle = style;
+    handle.camouflageColor = style === 1 ? CAMO_BUSH_PAINT : style === 2 ? groundColor(mapId) : undefined;
+    handle.paint.color.setHex(handle.camouflageColor ?? handle.paintColor);
+    if (!handle.alive) handle.paint.color.multiplyScalar(WRECK_DARKEN);
   }
 
   /** Создаёт одну сторону гусеницы и ставит звенья в исходную фазу. */
@@ -2636,7 +2652,7 @@ export class Scene3D {
       handle.dying = WRECK_S;
       handle.smokeAt = Infinity;
       handle.root.visible = !handle.cloaked;
-      handle.paint.color.setHex(handle.paintColor).multiplyScalar(WRECK_DARKEN);
+      handle.paint.color.setHex(handle.camouflageColor ?? handle.paintColor).multiplyScalar(WRECK_DARKEN);
       handle.body.rotation.set(WRECK_PITCH, 0, WRECK_ROLL);
       this.setWreckPose(handle, wreckSink(WRECK_S));
       this.setWreckVisual(handle, 1);
@@ -2654,7 +2670,7 @@ export class Scene3D {
     handle.headlights.visible = false;
     handle.root.visible = !handle.cloaked;
 
-    handle.paint.color.setHex(handle.paintColor).multiplyScalar(WRECK_DARKEN);
+    handle.paint.color.setHex(handle.camouflageColor ?? handle.paintColor).multiplyScalar(WRECK_DARKEN);
     handle.body.rotation.set(WRECK_PITCH, 0, WRECK_ROLL);
     this.setWreckPose(handle, 0);
     this.setWreckVisual(handle, 0);
@@ -2686,7 +2702,7 @@ export class Scene3D {
   /** Возрождение: краска, тени и осанка возвращаются к исходным. */
   private reviveTank(handle: TankHandle): void {
     handle.dying = -1;
-    handle.paint.color.setHex(handle.paintColor);
+    handle.paint.color.setHex(handle.camouflageColor ?? handle.paintColor);
     handle.body.position.y = SUSPENSION_PIVOT_Y;
     handle.body.rotation.set(0, 0, 0);
     handle.turret.rotation.set(0, 0, 0);
@@ -3156,6 +3172,14 @@ export class Scene3D {
     } else if (module?.slot === MODULE_SLOT_ENGINE) {
       core.rotation.x = Math.PI / 2;
       core.scale.set(1.45, 0.9, 1.45);
+    } else if (module?.slot === MODULE_SLOT_CAMO) {
+      const left = new THREE.Mesh(this.geo.lootWing, accent);
+      const right = new THREE.Mesh(this.geo.lootWing, accent);
+      left.position.set(-0.5, 1.25, 0);
+      right.position.set(0.5, 1.25, 0);
+      left.rotation.set(0.35, 0.45, 0.2);
+      right.rotation.set(-0.35, -0.45, -0.2);
+      group.add(left, right);
     } else if (module) {
       const mast = new THREE.Mesh(this.geo.lootWing, accent);
       mast.position.set(0, 2.2, 0);

@@ -960,6 +960,7 @@ function drawOthers(renderTime: number): void {
 
   for (const [id, target] of to.entries) {
     if (!players.has(id)) continue; // снапшот обогнал сообщение joined
+    scene.setTankCamouflage(id, target.c ?? 0, mapId);
     // Здоровье и «жив ли» берём и для себя тоже: свой танк рисуется предсказанием,
     // но его полоска и видимость живут по тем же данным, что и у остальных.
     scene.setTankHealth(
@@ -1307,7 +1308,8 @@ function moduleColor(id: number): string {
 function moduleCard(id: number, emptyLabel?: string): HTMLElement {
   const item = ROYALE_MODULE_BY_ID.get(id);
   const card = document.createElement('div');
-  card.className = `module-card${item ? '' : ' is-empty'}`;
+  const role = item?.heal !== undefined ? 'is-heal' : item?.camouflage ? 'is-camo' : item ? 'is-upgrade' : 'is-empty';
+  card.className = `module-card ${role}`;
   card.style.setProperty('--module', item ? moduleColor(id) : '#65747b');
   if (item) card.innerHTML = `<b>T${item.tier} · ${item.name}</b><small>${item.short}</small>`;
   else card.innerHTML = `<b>${emptyLabel ?? 'Пусто'}</b><small>Нет модуля</small>`;
@@ -1326,7 +1328,21 @@ function renderRoyaleLoadout(): void {
   inventoryBag.replaceChildren();
   for (let slot = 0; slot < MODULE_SLOT_COUNT; slot++) {
     const card = moduleCard(royaleLoadout.equipped[slot] ?? 0, MODULE_SLOT_NAMES[slot]);
-    inventorySlots.appendChild(card);
+    const wrapper = document.createElement('div');
+    wrapper.className = 'module-item equipped-item';
+    const equipped = ROYALE_MODULE_BY_ID.get(royaleLoadout.equipped[slot] ?? 0);
+    wrapper.style.setProperty('--module', equipped ? moduleColor(equipped.id) : '#65747b');
+    wrapper.appendChild(card);
+    if (equipped) {
+      const drop = document.createElement('button');
+      drop.type = 'button';
+      drop.className = 'module-action';
+      drop.textContent = 'Выбросить';
+      drop.title = 'Снять модуль и выбросить его на землю';
+      drop.addEventListener('click', () => net.manageLoadout('drop-equipped', slot));
+      wrapper.appendChild(drop);
+    }
+    inventorySlots.appendChild(wrapper);
   }
   royaleLoadout.inventory.forEach((id, index) => {
     const item = ROYALE_MODULE_BY_ID.get(id);

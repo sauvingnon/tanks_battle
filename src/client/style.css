@@ -837,6 +837,7 @@ body {
 .module-card.is-interactive { cursor: pointer; }
 .module-card.is-interactive:hover { background: color-mix(in srgb, var(--module) 22%, transparent); }
 .module-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; margin-top: 5px; }
+.equipped-item > .module-action { width: 100%; margin-top: 5px; }
 .module-action {
   min-height: 26px;
   padding: 3px 5px;
@@ -856,6 +857,10 @@ body {
 .module-card b { font-size: 12px; }
 .module-card small { margin-top: 3px; color: var(--muted); font-size: 11px; }
 .module-card.is-empty { border-style: dashed; --module: #65747b; color: var(--muted); }
+.module-card.is-heal { --module: #52e6a3; }
+.module-card.is-camo { --module: #8bcf77; }
+.module-card.is-heal b::before { content: '✚ '; color: #52e6a3; }
+.module-card.is-camo b::before { content: '◈ '; color: #8bcf77; }
 .inventory-bag:empty::after { content: 'Рюкзак пуст'; color: var(--muted); font-size: 12px; padding: 8px 0; }
 
 #leaderboard {
