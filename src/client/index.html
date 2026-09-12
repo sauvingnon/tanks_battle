@@ -23,6 +23,11 @@
       </div>
       <div id="kill-feed"></div>
 
+      <div id="minimap" hidden aria-label="Миникарта">
+        <canvas id="minimap-canvas"></canvas>
+        <span id="minimap-status"></span>
+      </div>
+
       <div id="death" hidden>
         <div class="death-card">
           <b>Танк уничтожен</b>
@@ -116,6 +121,7 @@
         <div class="hud-left">
           <div class="hud-row">
             <span class="hud-chip"><b id="hud-online">0</b> в бою</span>
+            <span class="hud-chip" id="hud-alive" hidden><b id="hud-alive-value">0</b> живых</span>
             <span class="hud-chip"><b id="hud-ping">—</b> мс</span>
             <span class="hud-chip" id="hud-mode">Все против всех</span>
           </div>

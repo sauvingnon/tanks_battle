@@ -82,6 +82,9 @@ const el = <T extends HTMLElement>(id: string): T => {
 };
 
 const canvas = el<HTMLCanvasElement>('scene');
+const minimap = el('minimap');
+const minimapCanvas = el<HTMLCanvasElement>('minimap-canvas');
+const minimapStatus = el('minimap-status');
 const overlay = el('overlay');
 const form = el<HTMLFormElement>('join-form');
 const nameInput = el<HTMLInputElement>('name-input');
@@ -131,6 +134,8 @@ const self = new SelfPrediction();
 let cover: Box[] = [];
 /** Кусты карты — только чтобы просветлить листву вокруг камеры от первого лица (см. drawSelf), больше ни на что на клиенте не влияют. */
 let bushes: Box[] = [];
+/** Полная геометрия карты для упрощённого вида сверху. */
+let minimapObstacles: Box[] = [];
 /** Половина стороны текущей карты, м: метка прицела упирается в ту же стену, что снаряд. */
 let mapHalf = MAP_HALF;
 
@@ -317,6 +322,7 @@ function handleMessage(msg: ServerMessage): void {
       self.obstacles = passableObstacles(msg.map.obstacles);
       self.half = msg.map.half;
       mapHalf = msg.map.half;
+      minimapObstacles = msg.map.obstacles;
       cover = coverBoxes(msg.map.obstacles);
       bushes = bushBoxes(msg.map.obstacles);
       if (!worldBuilt) {
@@ -337,6 +343,7 @@ function handleMessage(msg: ServerMessage): void {
       self.obstacles = passableObstacles(msg.obstacles);
       self.half = msg.half;
       mapHalf = msg.half;
+      minimapObstacles = msg.obstacles;
       cover = coverBoxes(msg.obstacles);
       bushes = bushBoxes(msg.obstacles);
       scene.buildWorld(msg.half, msg.obstacles, msg.id);
@@ -528,6 +535,7 @@ function applyConfig(next: RoomConfig): void {
 
   renderSetup();
   updateModeChip();
+  updateHud();
   renderExpeditionChoices();
 }
 
@@ -568,6 +576,7 @@ function applyWave(next: WaveState): void {
   waveUntilAt = performance.now() + (next.royaleUntil ?? next.until) * 1000;
   if (started) bannerHideAt = performance.now() + 3000;
   updateModeChip();
+  updateHud();
   // В подписи настроек стоит номер следующей волны — он только что изменился.
   if (!setupPanel.hidden) renderSetup();
 }
@@ -740,6 +749,7 @@ function frame(now: number): void {
   updateRoyaleDrop(now);
   drawSelf(dt, renderTime);
   drawOthers(renderTime);
+  drawMinimap(renderTime);
   playBooms(now);
   playHits(now);
   scene.render(dt);
@@ -971,6 +981,133 @@ function drawOthers(renderTime: number): void {
   drawShells(from, to, t);
 }
 
+/** Лёгкая карта сверху: рисуется только поверх HUD и не зависит от Three.js-сцены. */
+function drawMinimap(renderTime: number): void {
+  if (minimap.hidden || mapHalf <= 0) return;
+  const cssSize = minimapCanvas.clientWidth;
+  if (cssSize <= 0) return;
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const pixelSize = Math.round(cssSize * dpr);
+  if (minimapCanvas.width !== pixelSize || minimapCanvas.height !== pixelSize) {
+    minimapCanvas.width = pixelSize;
+    minimapCanvas.height = pixelSize;
+  }
+  const ctx = minimapCanvas.getContext('2d');
+  if (!ctx) return;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssSize, cssSize);
+
+  const pad = 2;
+  const size = cssSize - pad * 2;
+  const worldToMap = (x: number, z: number): [number, number] => [
+    pad + ((x + mapHalf) / (mapHalf * 2)) * size,
+    pad + ((z + mapHalf) / (mapHalf * 2)) * size,
+  ];
+  const radiusToMap = (radius: number): number => (radius / (mapHalf * 2)) * size;
+
+  ctx.fillStyle = 'rgba(27, 43, 42, 0.95)';
+  ctx.fillRect(pad, pad, size, size);
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(pad, pad, size, size);
+  ctx.clip();
+  for (const box of minimapObstacles) {
+    const [x, z] = worldToMap(box.x - box.w / 2, box.z - box.d / 2);
+    const w = Math.max(1, (box.w / (mapHalf * 2)) * size);
+    const h = Math.max(1, (box.d / (mapHalf * 2)) * size);
+    ctx.fillStyle = box.style === 'road' || box.style === 'sidewalk'
+      ? 'rgba(128, 141, 135, 0.28)'
+      : box.style === 'tree'
+        ? 'rgba(47, 99, 67, 0.52)'
+        : 'rgba(112, 119, 111, 0.68)';
+    ctx.fillRect(x, z, w, h);
+  }
+
+  const zone = royaleZone;
+  if (mode === MODE_ROYALE && zone && zone.r > 0) {
+    // Затемнение опасной части карты: даже огромный стартовый круг корректно обрежется рамкой.
+    ctx.fillStyle = 'rgba(224, 69, 67, 0.22)';
+    ctx.beginPath();
+    ctx.rect(pad, pad, size, size);
+    const [cx, cz] = worldToMap(zone.x, zone.z);
+    ctx.moveTo(cx + radiusToMap(zone.r), cz);
+    ctx.arc(cx, cz, radiusToMap(zone.r), 0, Math.PI * 2);
+    ctx.fill('evenodd');
+
+    if (zone.phase !== 'over' && zone.nextR > 0) {
+      const [nx, nz] = worldToMap(zone.nextX, zone.nextZ);
+      ctx.setLineDash([4, 3]);
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = zone.phase === 'final' ? '#ff6473' : '#8fe6ff';
+      ctx.beginPath();
+      ctx.arc(nx, nz, radiusToMap(zone.nextR), 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      if (Math.hypot(nx - cx, nz - cz) > 3) {
+        ctx.globalAlpha = 0.7;
+        ctx.strokeStyle = '#d8f5ff';
+        ctx.beginPath();
+        ctx.moveTo(cx, cz);
+        ctx.lineTo(nx, nz);
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
+    }
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = zone.phase === 'final' ? '#ff6473' : zone.phase === 'shrinking' ? '#ffad6d' : '#8fe6ff';
+    ctx.beginPath();
+    ctx.arc(cx, cz, radiusToMap(zone.r), 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  const frame = interpFrame(renderTime);
+  const me = players.get(selfId);
+  if (frame && me) {
+    for (const [id, target] of frame.to.entries) {
+      if (target.d !== 0 || id === selfId) continue;
+      const info = players.get(id);
+      if (!info) continue;
+      const start = frame.from.entries.get(id) ?? target;
+      const x = start.x + (target.x - start.x) * frame.t;
+      const z = start.z + (target.z - start.z) * frame.t;
+      const [mx, mz] = worldToMap(x, z);
+      if (!alliedTeams(mode, me.team, info.team)) continue;
+      ctx.fillStyle = '#76d9ff';
+      ctx.beginPath();
+      ctx.arc(mx, mz, 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  const [selfMapX, selfMapZ] = worldToMap(selfX, selfZ);
+  const selfState = self.sample(stepAccumulator / DT);
+  const selfAngle = selfState?.angle ?? 0;
+  ctx.save();
+  ctx.translate(selfMapX, selfMapZ);
+  // Canvas Y направлен вниз, поэтому для совпадения с Three.js вращаем в обратную сторону.
+  ctx.rotate(-selfAngle);
+  ctx.fillStyle = '#ffffff';
+  ctx.strokeStyle = '#102021';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  // В мире угол 0 смотрит в +Z, а +Z на миникарте направлен вниз.
+  ctx.moveTo(0, 5);
+  ctx.lineTo(3.5, -4);
+  ctx.lineTo(0, -2.5);
+  ctx.lineTo(-3.5, -4);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+  ctx.restore();
+  ctx.restore();
+
+  minimapStatus.textContent = mode === MODE_ROYALE && zone
+    ? zone.phase === 'shrinking' ? `сжатие · ${Math.ceil(zone.until)}с`
+      : zone.phase === 'final' ? 'финал'
+        : zone.phase === 'over' ? 'матч завершён' : `следующая зона · ${Math.ceil(zone.until)}с`
+    : '';
+}
+
 /**
  * Снаряды интерполируются вместе с танками — тем же t по тем же снапшотам,
  * иначе снаряд и цель жили бы в разных моментах времени.
@@ -1047,6 +1184,8 @@ function drawShells(from: BufferedSnapshot, to: BufferedSnapshot, t: number): vo
 // --- Интерфейс ---
 
 const hudOnline = el('hud-online');
+const hudAlive = el('hud-alive');
+const hudAliveValue = el('hud-alive-value');
 const hudPing = el('hud-ping');
 const hudSpeed = el('hud-speed');
 const hudHpFill = el('hud-hp-fill');
@@ -1140,6 +1279,8 @@ function updateHud(): void {
   let humans = 0;
   for (const info of players.values()) if (info.bot !== 1) humans++;
   hudOnline.textContent = String(humans);
+  hudAlive.hidden = mode !== MODE_ROYALE;
+  hudAliveValue.textContent = String(wave.royaleAlive ?? 0);
 }
 
 // --- Волны ---
@@ -1782,6 +1923,7 @@ function setStatus(text: string, isError = false): void {
 function hideOverlay(): void {
   overlay.classList.add('is-hidden');
   hud.hidden = false;
+  minimap.hidden = false;
   // Прицел покажется сам, как только появится своё состояние: его место
   // считается от ствола, а не от центра экрана.
   setupToggle.hidden = false;
@@ -1802,6 +1944,7 @@ function hideOverlay(): void {
 function showOverlay(message: string, isError = false): void {
   overlay.classList.remove('is-hidden');
   hud.hidden = true;
+  minimap.hidden = true;
   crosshair.hidden = true;
   hint.hidden = true;
   touchLayer.hidden = true;
@@ -1822,6 +1965,7 @@ function resetWorld(): void {
   scene.clearTanks();
   players.clear();
   snapshots.length = 0;
+  minimapObstacles = [];
   pendingBooms.length = 0;
   pendingHits.length = 0;
   knownShells.clear();
