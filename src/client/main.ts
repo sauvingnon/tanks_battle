@@ -134,6 +134,14 @@ let cover: Box[] = [];
 let bushes: Box[] = [];
 /** Полная геометрия карты для упрощённого вида сверху. */
 let minimapObstacles: Box[] = [];
+/**
+ * Статичная застройка миникарты, отрисованная один раз в офскрин-канвас.
+ * Без кэша цикл по сотням боксов карты гонялся бы на каждом кадре и рвал
+ * шаг rAF: дрожание корпуса и башни на ходу — это как раз он, потому что
+ * крен подвески в render.ts считается из dt между кадрами (updateChassis).
+ */
+let minimapBackground: HTMLCanvasElement | null = null;
+let minimapBackgroundDirty = true;
 /** Половина стороны текущей карты, м: метка прицела упирается в ту же стену, что снаряд. */
 let mapHalf = MAP_HALF;
 
@@ -327,6 +335,7 @@ function handleMessage(msg: ServerMessage): void {
       self.half = msg.map.half;
       mapHalf = msg.map.half;
       minimapObstacles = msg.map.obstacles;
+      minimapBackgroundDirty = true;
       cover = coverBoxes(msg.map.obstacles);
       bushes = bushBoxes(msg.map.obstacles);
       if (!worldBuilt) {
@@ -348,6 +357,7 @@ function handleMessage(msg: ServerMessage): void {
       self.half = msg.half;
       mapHalf = msg.half;
       minimapObstacles = msg.obstacles;
+      minimapBackgroundDirty = true;
       cover = coverBoxes(msg.obstacles);
       bushes = bushBoxes(msg.obstacles);
       scene.buildWorld(msg.half, msg.obstacles, msg.id);
@@ -999,6 +1009,46 @@ function drawOthers(renderTime: number): void {
   drawShells(from, to, t);
 }
 
+/**
+ * Перерисовывает статичную застройку миникарты в офскрин-канвас. Дорого —
+ * цикл по всей геометрии карты (сотни боксов на BR-картах) — и не нужно
+ * чаще, чем меняется сама карта или размер холста, поэтому вызывается
+ * только когда minimapBackgroundDirty.
+ */
+function renderMinimapBackground(pixelSize: number, cssSize: number, dpr: number, pad: number, size: number): void {
+  if (!minimapBackground) minimapBackground = document.createElement('canvas');
+  minimapBackground.width = pixelSize;
+  minimapBackground.height = pixelSize;
+  const bctx = minimapBackground.getContext('2d');
+  if (!bctx) return;
+  bctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  bctx.clearRect(0, 0, cssSize, cssSize);
+
+  const worldToMap = (x: number, z: number): [number, number] => [
+    pad + ((x + mapHalf) / (mapHalf * 2)) * size,
+    pad + ((z + mapHalf) / (mapHalf * 2)) * size,
+  ];
+
+  bctx.fillStyle = 'rgba(27, 43, 42, 0.95)';
+  bctx.fillRect(pad, pad, size, size);
+  bctx.save();
+  bctx.beginPath();
+  bctx.rect(pad, pad, size, size);
+  bctx.clip();
+  for (const box of minimapObstacles) {
+    const [x, z] = worldToMap(box.x - box.w / 2, box.z - box.d / 2);
+    const w = Math.max(1, (box.w / (mapHalf * 2)) * size);
+    const h = Math.max(1, (box.d / (mapHalf * 2)) * size);
+    bctx.fillStyle = box.style === 'road' || box.style === 'sidewalk'
+      ? 'rgba(128, 141, 135, 0.28)'
+      : box.style === 'tree'
+        ? 'rgba(47, 99, 67, 0.52)'
+        : 'rgba(112, 119, 111, 0.68)';
+    bctx.fillRect(x, z, w, h);
+  }
+  bctx.restore();
+}
+
 /** Лёгкая карта сверху: рисуется только поверх HUD и не зависит от Three.js-сцены. */
 function drawMinimap(renderTime: number): void {
   if (minimap.hidden || mapHalf <= 0) return;
@@ -1009,11 +1059,10 @@ function drawMinimap(renderTime: number): void {
   if (minimapCanvas.width !== pixelSize || minimapCanvas.height !== pixelSize) {
     minimapCanvas.width = pixelSize;
     minimapCanvas.height = pixelSize;
+    minimapBackgroundDirty = true;
   }
   const ctx = minimapCanvas.getContext('2d');
   if (!ctx) return;
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.clearRect(0, 0, cssSize, cssSize);
 
   const pad = 2;
   const size = cssSize - pad * 2;
@@ -1023,23 +1072,18 @@ function drawMinimap(renderTime: number): void {
   ];
   const radiusToMap = (radius: number): number => (radius / (mapHalf * 2)) * size;
 
-  ctx.fillStyle = 'rgba(27, 43, 42, 0.95)';
-  ctx.fillRect(pad, pad, size, size);
+  if (minimapBackgroundDirty) {
+    renderMinimapBackground(pixelSize, cssSize, dpr, pad, size);
+    minimapBackgroundDirty = false;
+  }
+
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssSize, cssSize);
+  if (minimapBackground) ctx.drawImage(minimapBackground, 0, 0, cssSize, cssSize);
   ctx.save();
   ctx.beginPath();
   ctx.rect(pad, pad, size, size);
   ctx.clip();
-  for (const box of minimapObstacles) {
-    const [x, z] = worldToMap(box.x - box.w / 2, box.z - box.d / 2);
-    const w = Math.max(1, (box.w / (mapHalf * 2)) * size);
-    const h = Math.max(1, (box.d / (mapHalf * 2)) * size);
-    ctx.fillStyle = box.style === 'road' || box.style === 'sidewalk'
-      ? 'rgba(128, 141, 135, 0.28)'
-      : box.style === 'tree'
-        ? 'rgba(47, 99, 67, 0.52)'
-        : 'rgba(112, 119, 111, 0.68)';
-    ctx.fillRect(x, z, w, h);
-  }
 
   const zone = royaleZone;
   if (mode === MODE_ROYALE && zone && zone.r > 0) {
@@ -2106,6 +2150,7 @@ function resetWorld(): void {
   players.clear();
   snapshots.length = 0;
   minimapObstacles = [];
+  minimapBackgroundDirty = true;
   pendingBooms.length = 0;
   pendingHits.length = 0;
   knownShells.clear();
