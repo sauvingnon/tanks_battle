@@ -214,6 +214,9 @@ const GROUND_COLORS = [
   0x3d4441, // Промзона — холодный техногенный грунт
   0x4b4d3b, // Рубеж — выцветшая полевая трава
   0x35383a, // Мегаполис — холодный асфальт сплошной застройки
+  0x5b5038, // Перевал — сухой каменистый грунт
+  0x4a4840, // Руины — пыль и старый бетон
+  0x62523b, // Карьер — охристая порода
 ];
 
 function groundColor(mapId: number): number {
@@ -233,7 +236,16 @@ const GROUND_PATCH_PALETTES: number[][] = [
   [0x4f603b, 0x6f7045, 0x3b4b34],
   [0x4d5550, 0x76604a, 0x35403d],
   [0x566044, 0x756547, 0x3a4636],
+  [0x76613c, 0x4e4634, 0x8a6c43],
+  [0x625b4d, 0x413f39, 0x7b6b55],
+  [0x785f3e, 0x4b4132, 0x956f42],
 ];
+
+/** Дробная часть синусоидального хеша — стабильное число от 0 до 1. */
+function patchNoise(value: number): number {
+  const noise = Math.sin(value) * 43758.5453;
+  return noise - Math.floor(noise);
+}
 
 /**
  * Трава — один инстансированный low-poly пучок, без физики и теней. Раньше
@@ -1772,8 +1784,11 @@ export class Scene3D {
     const count = half >= 400 ? 18 : half >= 120 ? 9 : 6;
     const margin = Math.min(half - 12, half * 0.92);
     for (let i = 0; i < count; i++) {
-      const seed = Math.abs(Math.sin((i + 1) * 91.731 + (mapId + 3) * 17.117) * 43758.5453);
-      const seed2 = Math.abs(Math.sin((i + 1) * 37.419 + (mapId + 11) * 29.713) * 19341.173);
+      // Раньше здесь забывали взять дробную часть: размеры и координаты
+      // улетали в миллионы метров, а огромные полупрозрачные полигоны начинали
+      // мерцать о базовую землю при косом взгляде камеры.
+      const seed = patchNoise((i + 1) * 91.731 + (mapId + 3) * 17.117);
+      const seed2 = patchNoise((i + 1) * 37.419 + (mapId + 11) * 29.713);
       const x = (seed - 0.5) * margin * 1.7;
       const z = (seed2 - 0.5) * margin * 1.7;
       const radiusX = (half >= 400 ? 25 : 10) + seed * (half >= 400 ? 48 : 18);
@@ -1786,9 +1801,14 @@ export class Scene3D {
         transparent: true,
         opacity: half >= 400 ? 0.16 : 0.13,
         depthWrite: false,
+        // Дополнительный сдвиг глубины стабилизирует прозрачный слой на
+        // горизонте: одной высоты недостаточно на слабых depth-буферах.
+        polygonOffset: true,
+        polygonOffsetFactor: -1,
+        polygonOffsetUnits: -1,
       });
       const patch = new THREE.Mesh(shape, material);
-      patch.position.set(x, 0.012, z);
+      patch.position.set(x, 0.04, z);
       patch.scale.set(radiusX, 1, radiusZ);
       patch.rotation.y = seed2 * Math.PI * 2;
       patch.receiveShadow = true;
