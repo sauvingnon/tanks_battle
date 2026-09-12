@@ -1370,14 +1370,15 @@ function mapWithTrees(
 
 /**
  * «Мегаполис»: тот же охват, что у «Рубежа» (900×900), но не разбит на
- * районы — сплошная сетка кварталов 12×12 с 12-метровыми улицами, без
- * единого просвета крупнее квартала. Не вариация «Города» на большом холсте
- * руками — цифрами там пришлось бы расставлять тысячи блоков, здесь тот же
- * приём, что и в buildCity, просто развёрнутый на домен вчетверо больше
- * стороны. Каждый шестой ряд и столбец — широкий проспект (целая полоса
- * кварталов снесена), иначе доехать по прямой через весь город было бы
- * нереально долго. Связность гарантирована самой сеткой, а не проверкой
- * постфактум: улица есть между любыми двумя соседними кварталами всегда.
+ * районы — сплошная сетка кварталов с 12-метровыми улицами, без единого
+ * просвета крупнее квартала. Не вариация «Города» на большом холсте руками —
+ * цифрами там пришлось бы расставлять тысячи блоков, здесь тот же приём, что
+ * и в buildCity, просто развёрнутый на домен вчетверо больше стороны. Каждый
+ * шестой ряд и столбец — широкий проспект (целая полоса кварталов снесена),
+ * иначе доехать по прямой через весь город было бы нереально долго. Связность
+ * гарантирована самой сеткой, а не проверкой постфактум: улица есть между
+ * любыми двумя соседними кварталами всегда — см. MEGA_MAX_HALF ниже, ровно
+ * он не даёт двум соседним домам съесть проезд у той же самой сетки.
  */
 const MEGA_HALF = ROYALE_HALF;
 const MEGA_BLOCK = 12;
@@ -1385,6 +1386,59 @@ const MEGA_STREET = 12;
 const MEGA_SPACING = MEGA_BLOCK + MEGA_STREET;
 const MEGA_BOULEVARD_EVERY = 6;
 const MEGA_PLAZA_RADIUS = 1;
+
+/**
+ * Идеальная решётка одинаковых кубов 12×12 читалась рендером как один и тот
+ * же архетип на весь горизонт: boxLook (см. render.ts) выбирает силуэт по
+ * пропорциям блока, а у квадрата 12×12 пропорции всегда одни и те же — ни
+ * склад, ни сторожка, ни башня появиться не могли, хотя рендер их прекрасно
+ * умеет рисовать (см. buildCity/buildDepot, где та же палитра уже в ходу).
+ * Периметр меняем по кварталам, а не подряд — так силуэт города не превращается
+ * в случайный шум, но и не остаётся строем одинаковых коробок.
+ */
+interface MegaKind {
+  w: number;
+  d: number;
+  hMin: number;
+  hMax: number;
+  /** Доля из 100 — сумма всех weight обязана быть 100, см. pickMegaKind. */
+  weight: number;
+}
+const MEGA_KINDS: MegaKind[] = [
+  { w: MEGA_BLOCK, d: MEGA_BLOCK, hMin: 3, hMax: 6, weight: 45 }, // обычный дом
+  { w: 16, d: 9, hMin: 3, hMax: 6, weight: 13 }, // склад, вытянут вдоль X
+  { w: 9, d: 16, hMin: 3, hMax: 6, weight: 13 }, // склад, вытянут вдоль Z
+  { w: 8, d: 8, hMin: 3, hMax: 5, weight: 16 }, // сторожка — заметно мельче дома
+  { w: 9, d: 9, hMin: 7, hMax: 10, weight: 13 }, // высотка-башня, редкий landmark
+];
+
+/**
+ * Максимальная половина стороны здания вдоль одной оси, включая джиттер.
+ * У соседних кварталов центры разнесены на MEGA_SPACING (24 м): если оба
+ * упрутся в этот предел одновременно, между ними останется MEGA_SPACING -
+ * 2·MEGA_MAX_HALF = 8 м — та же ширина проезда, что заявлена как минимум по
+ * всему файлу (см. правило в шапке файла). Проверять факт после раскладки не
+ * нужно: предел сам не даёт нарушить условие, каким бы ни выпал хеш.
+ */
+const MEGA_MAX_HALF = 8;
+
+function megaJitterCap(half: number): number {
+  return Math.max(0, MEGA_MAX_HALF - half);
+}
+
+/** Тот же приём хеширования, что у addTrees/filler ниже — детерминированный псевдослучай по индексам ячейки. */
+function megaHash(ix: number, iz: number, salt: number): number {
+  return Math.abs((ix * 92821 + iz * 68917 + salt * 31337) % 1000);
+}
+
+function pickMegaKind(roll: number): MegaKind {
+  let left = roll;
+  for (const kind of MEGA_KINDS) {
+    if (left < kind.weight) return kind;
+    left -= kind.weight;
+  }
+  return MEGA_KINDS[0];
+}
 
 /** Сетка кварталов — общие координаты для застройки и для точек спавна. */
 function megaGrid(): { centers: number[]; mid: number; isBoulevard: (i: number) => boolean } {
@@ -1406,11 +1460,47 @@ function buildMegapolis(): Box[] {
       if (Math.abs(ix - mid) <= MEGA_PLAZA_RADIUS && Math.abs(iz - mid) <= MEGA_PLAZA_RADIUS) continue;
       // Широкий проспект: вся полоса кварталов снесена, а не прорежена.
       if (isBoulevard(ix) || isBoulevard(iz)) continue;
-      const h = 3 + ((Math.abs(ix - mid) + Math.abs(iz - mid)) % 5);
-      boxes.push({ x: centers[ix], z: centers[iz], w: MEGA_BLOCK, d: MEGA_BLOCK, h });
+      const hash = megaHash(ix, iz, 41);
+      const kind = pickMegaKind(hash % 100);
+      const h = kind.hMin + ((kind.hMax - kind.hMin) * (Math.floor(hash / 7) % 100)) / 100;
+      // Смещение внутрь своей же клетки: сама решётка регулярна, но дом в ней
+      // больше не стоит идеально по центру. Не сталкивает соседей — см.
+      // MEGA_MAX_HALF — а вплотную встать может, и это нормально.
+      const jx = (((hash % 13) - 6) / 6) * megaJitterCap(kind.w / 2);
+      const jz = ((Math.floor(hash / 13) % 13 - 6) / 6) * megaJitterCap(kind.d / 2);
+      boxes.push({ x: centers[ix] + jx, z: centers[iz] + jz, w: kind.w, d: kind.d, h });
     }
   }
+  megaBushes(boxes);
   return boxes;
+}
+
+/**
+ * Кусты в перекрёстках улиц: кустам не нужен зазор под проезд (танк едет
+ * сквозь них не глядя — см. isBush/passableObstacles), поэтому единственное,
+ * от чего их надо отталкивать, — уже стоящие дома. Раньше на всей карте не
+ * было НИ ОДНОГО куста: addTrees добавляет только полноценные деревья, и в
+ * такой плотной сетке почти всегда проигрывает отбраковке по пересечению.
+ */
+function megaBushes(boxes: Box[]): void {
+  const { centers } = megaGrid();
+  const mids: number[] = [];
+  for (let i = 0; i < centers.length - 1; i++) mids.push((centers[i] + centers[i + 1]) / 2);
+  const overlaps = (x: number, z: number, w: number, d: number) =>
+    boxes.some((b) => Math.abs(x - b.x) < (w + b.w) / 2 + 1 && Math.abs(z - b.z) < (d + b.d) / 2 + 1);
+  for (let ix = 0; ix < mids.length; ix++) {
+    for (let iz = 0; iz < mids.length; iz++) {
+      const hash = megaHash(ix, iz, 79);
+      if (hash % 100 >= 32) continue; // не на каждом перекрёстке, иначе кусты сплошной стеной
+      const w = 6 + (hash % 4);
+      const d = 6 + (Math.floor(hash / 4) % 4);
+      const x = mids[ix] + (((Math.floor(hash / 17) % 9) - 4) / 4) * 2.5;
+      const z = mids[iz] + (((Math.floor(hash / 23) % 9) - 4) / 4) * 2.5;
+      if (MEGA_SPAWNS.some(([sx, sz]) => Math.hypot(x - sx, z - sz) < 12)) continue;
+      if (overlaps(x, z, w, d)) continue;
+      boxes.push({ x, z, w, d, h: LOW });
+    }
+  }
 }
 
 /**
