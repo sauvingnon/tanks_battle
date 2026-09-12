@@ -210,6 +210,8 @@ export interface Player {
   shots: number;
   /** Последний выстрел: в BR вспышка на короткое время раскрывает танк. */
   lastShotAt: number;
+  /** Дробный остаток урона зоны; здоровье остаётся целым, DPS — точным. */
+  zoneDamageRemainder: number;
   /** Очередь необработанных инпутов. */
   queue: Input[];
   /** seq последнего инпута, применённого сервером — клиент по нему делает реконсиляцию. */
@@ -494,6 +496,7 @@ export class Room {
       deaths: 0,
       shots: 0,
       lastShotAt: -Infinity,
+      zoneDamageRemainder: 0,
       queue: [],
       ack: 0,
       last: { seq: 0, throttle: 0, steer: 0, turret: spawn.angle },
@@ -505,6 +508,7 @@ export class Room {
     const player = this.players.get(id);
     if (player) this.forget(player);
     this.players.delete(id);
+    if (this.mode === MODE_ROYALE && this.royaleStarted) this.emitWave();
     // Ушедший мог быть единственным, кто держал врага в засвете для сквада.
     this.royaleSight.delete(id);
     this.royaleVisionEvents.delete(id);
@@ -675,17 +679,28 @@ export class Room {
     }
   }
 
-  /**
-   * Случайная точка на карте под очередной центр круга: без оглядки на стены
-   * и застройку — попасть в здание нормально, это осознанная случайность,
-   * а не курируемый список удачных мест. Вызывается на каждом этапе
-   * сжатия, поэтому и центр каждый раз новый, а не только один раз на матч.
-   */
-  private randomZoneCenter(): { x: number; z: number } {
-    const radius = this.half - 20;
-    const angle = Math.random() * Math.PI * 2;
-    const r = Math.sqrt(Math.random()) * radius; // равномерно по площади, не по радиусу
-    return { x: Math.cos(angle) * r, z: Math.sin(angle) * r };
+  /** Случайный центр вложенного круга; препятствия на карте здесь не учитываются. */
+  private randomZoneCenter(outerX: number, outerZ: number, outerR: number, innerR: number): { x: number; z: number } {
+    const maxShift = Math.max(0, outerR - innerR - 2);
+    const mapLimit = Math.max(0, this.half - innerR - 2);
+    for (let attempt = 0; attempt < 128; attempt++) {
+      const angle = Math.random() * Math.PI * 2;
+      const distance = Math.sqrt(Math.random()) * maxShift;
+      const x = outerX + Math.cos(angle) * distance;
+      const z = outerZ + Math.sin(angle) * distance;
+      if (Math.abs(x) <= mapLimit && Math.abs(z) <= mapLimit) return { x, z };
+    }
+    // Текущий центр уже находится в допустимом квадрате: новый радиус меньше,
+    // поэтому оставить центр на месте — безопасный fallback.
+    return { x: outerX, z: outerZ };
+  }
+
+  private planNextRoyaleZone(): void {
+    const zone = this.royaleZone;
+    zone.nextR = Math.max(ROYALE_ZONE_FINAL_RADIUS, zone.r * 0.58);
+    const next = this.randomZoneCenter(zone.x, zone.z, zone.r, zone.nextR);
+    zone.nextX = next.x;
+    zone.nextZ = next.z;
   }
 
   /** Подготовить сквады выбранного размера для первого запуска BR. Возрождений здесь нет. */
@@ -700,15 +715,12 @@ export class Room {
     this.royaleVisionTick = -Infinity;
     this.royaleIntel.clear();
 
-    // Центр круга — случайная точка карты, и на каждом этапе сжатия она
-    // новая: иначе разные районы «Рубежа» ничего не решают — маршрут разный,
-    // а финал всегда один. Может попасть в застройку — это честная
-    // случайность, а не курируемый список удачных мест.
-    const { x: centerX, z: centerZ } = this.randomZoneCenter();
-    // Зона в первой фазе матча — вся карта: круг с запасом накрывает даже
-    // углы квадратной карты, чтобы высадка была честно «где угодно», а не
-    // сразу отрезала четверти карты как недоступные. Сжиматься она начнёт
-    // только после ROYALE_ZONE_START_WAIT_S — см. updateRoyaleZone.
+    // Стартовый круг центрирован на карте, а каждый следующий получает новый
+    // случайный, но вложенный центр — маршрут остаётся непредсказуемым.
+    const centerX = 0;
+    const centerZ = 0;
+    // Круг с запасом накрывает даже углы квадратной карты; урон начинается
+    // только после предстартового отсчёта, а сжатие — после ожидания.
     const startRadius = Math.hypot(this.half, this.half) + 5;
     this.royaleZone = {
       x: centerX,
@@ -719,11 +731,12 @@ export class Room {
       fromR: startRadius,
       nextX: centerX,
       nextZ: centerZ,
-      nextR: Math.max(ROYALE_ZONE_FINAL_RADIUS, startRadius * 0.58),
+      nextR: startRadius,
       phase: 'safe',
       step: 0,
       endsAt: 0,
     };
+    this.planNextRoyaleZone();
     this.spawnRoyaleLoot();
 
     // Один спавнер на весь матч: он копит уже занятые точки по ходу расстановки,
@@ -902,12 +915,18 @@ export class Room {
 
     this.updateRoyaleZone();
     this.refreshRoyaleVision();
-    const damage = Math.max(1, Math.round(this.royaleZoneDamage() * DT));
     for (const player of this.players.values()) {
       if (player.dead) continue;
-      if (Math.hypot(player.state.x - this.royaleZone.x, player.state.z - this.royaleZone.z) > this.royaleZone.r) {
-        this.hurt(player, damage, -1, 'Зона');
+      const outside = Math.hypot(player.state.x - this.royaleZone.x, player.state.z - this.royaleZone.z) > this.royaleZone.r;
+      if (!outside) {
+        player.zoneDamageRemainder = 0;
+        continue;
       }
+      player.zoneDamageRemainder += this.royaleZoneDamage() * DT;
+      const damage = Math.floor(player.zoneDamageRemainder + 1e-9);
+      if (damage <= 0) continue;
+      player.zoneDamageRemainder -= damage;
+      this.hurt(player, damage, -1, 'Зона');
     }
 
     const aliveTeams = new Set<number>();
@@ -932,12 +951,6 @@ export class Room {
       zone.fromR = zone.r;
       zone.fromX = zone.x;
       zone.fromZ = zone.z;
-      zone.nextR = Math.max(ROYALE_ZONE_FINAL_RADIUS, zone.r * 0.58);
-      // Следующий центр — снова случайная точка карты, не привязанная к
-      // текущей: круг может дёрнуться в любую сторону на каждом этапе.
-      const next = this.randomZoneCenter();
-      zone.nextX = next.x;
-      zone.nextZ = next.z;
       zone.endsAt = this.tick + Math.round(ROYALE_ZONE_SHRINK_S * TICK_HZ);
     }
 
@@ -960,6 +973,7 @@ export class Room {
     } else {
       zone.phase = 'safe';
       zone.endsAt = this.tick + Math.round(ROYALE_ZONE_REST_S * TICK_HZ);
+      this.planNextRoyaleZone();
     }
   }
 
@@ -972,6 +986,8 @@ export class Room {
     return {
       x: round(this.royaleZone.x),
       z: round(this.royaleZone.z),
+      nextX: round(this.royaleZone.nextX),
+      nextZ: round(this.royaleZone.nextZ),
       r: round(this.royaleZone.r),
       nextR: round(this.royaleZone.nextR),
       until: this.royaleZone.endsAt > 0 ? Math.max(0, (this.royaleZone.endsAt - this.tick) / TICK_HZ) : 0,
@@ -1027,6 +1043,8 @@ export class Room {
     return {
       x: this.royaleZone.x,
       z: this.royaleZone.z,
+      nextX: this.royaleZone.nextX,
+      nextZ: this.royaleZone.nextZ,
       r: this.royaleZone.r,
       nextR: this.royaleZone.nextR,
       until: this.royaleZone.endsAt > 0 ? Math.max(0, (this.royaleZone.endsAt - this.tick) / TICK_HZ) : 0,
@@ -1338,6 +1356,7 @@ export class Room {
     // За смерть от собственного рикошета фраг не полагается — только запись в ленту.
     if (killer && killer !== victim) killer.kills++;
     this.kills.push({ killer: killerName, victim: victim.name });
+    if (this.mode === MODE_ROYALE) this.emitWave();
 
     // Бот из комнаты не уходит: его остов остаётся на карте препятствием до
     // конца волны (см. refreshWrecks), а из players его выметет clearBots.
@@ -1597,6 +1616,7 @@ export class Room {
       player.royaleLootMask = 0;
       player.royaleArmor = 0;
       player.stealth = false;
+      player.zoneDamageRemainder = 0;
     }
   }
 
@@ -1953,6 +1973,9 @@ export class Room {
               this.royaleStarted && this.royalePhaseUntil > 0
                 ? Math.max(0, (this.royalePhaseUntil - this.tick) / TICK_HZ)
                 : 0,
+            royaleAlive: this.royaleStarted
+              ? [...this.players.values()].filter((player) => !player.dead).length
+              : 0,
           }
         : {}),
     };

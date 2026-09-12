@@ -300,6 +300,8 @@ export interface BotZone {
   x: number;
   z: number;
   r: number;
+  nextX?: number;
+  nextZ?: number;
   nextR: number;
   until: number;
   phase: 'safe' | 'shrinking' | 'final' | 'over';
@@ -543,19 +545,27 @@ function zoneHeading(self: BotSelf, world: BotWorld): number | null {
   const dz = me.z - zone.z;
   const distance = Math.hypot(dx, dz);
   const outside = distance > zone.r - ZONE_MARGIN;
+  const nextX = Number.isFinite(zone.nextX) ? zone.nextX! : zone.x;
+  const nextZ = Number.isFinite(zone.nextZ) ? zone.nextZ! : zone.z;
+  const nextDistance = Math.hypot(me.x - nextX, me.z - nextZ);
+  const nextTargetRadius = Math.max(0, zone.nextR - ZONE_MARGIN);
+  const outsideNext = nextDistance > nextTargetRadius;
   const preparing =
     zone.phase === 'shrinking' ||
-    (zone.phase === 'safe' && zone.until <= ZONE_PREP_S);
+    (zone.phase === 'safe' && (zone.until <= ZONE_PREP_S || outsideNext));
   if (!outside && !preparing) return null;
 
   const targetRadius = preparing
-    ? Math.max(0, Math.min(zone.r, zone.nextR) - ZONE_MARGIN)
+    ? nextTargetRadius
     : Math.max(0, zone.r - ZONE_MARGIN);
-  if (distance <= targetRadius) return null;
+  const targetDistance = preparing ? nextDistance : distance;
+  if (targetDistance <= targetRadius) return null;
 
-  const scale = distance > 1e-3 ? targetRadius / distance : 0;
-  const targetX = zone.x + dx * scale;
-  const targetZ = zone.z + dz * scale;
+  const targetDx = preparing ? me.x - nextX : dx;
+  const targetDz = preparing ? me.z - nextZ : dz;
+  const scale = targetDistance > 1e-3 ? targetRadius / targetDistance : 0;
+  const targetX = (preparing ? nextX : zone.x) + targetDx * scale;
+  const targetZ = (preparing ? nextZ : zone.z) + targetDz * scale;
   const base = Math.atan2(targetX - me.x, targetZ - me.z);
   const { vx, vz } = spread(self, world, Math.sin(base), Math.cos(base));
   return avoid(me, Math.atan2(vx, vz), world.obstacles, world.half, world.obstacleIndex);

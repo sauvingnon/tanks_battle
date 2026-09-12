@@ -20,6 +20,9 @@ export type WavePhase = 'fight' | 'break' | 'upgrade' | 'over';
 export interface RoyaleZoneState {
   x: number;
   z: number;
+  /** Центр, к которому переместится зона на следующем этапе. */
+  nextX: number;
+  nextZ: number;
   /** Текущий радиус безопасной зоны. */
   r: number;
   /** Радиус, к которому идёт следующий этап сжатия. */
@@ -63,6 +66,8 @@ export interface WaveState {
   royalePhase?: 'countdown' | 'fight' | 'over';
   /** Секунд до перехода BR в следующую фазу. */
   royaleUntil?: number;
+  /** Общее число живых танков в BR, включая скрытых противников. */
+  royaleAlive?: number;
 }
 
 /** Одна строка доски лидеров. */
@@ -224,7 +229,7 @@ const SHELL_SIZE = 15; // i:u32 o:u32 x:i16 z:i16 a:u16 b:u8
 const BOOM_SIZE = 9; // x:i16 z:i16 k:u8 o:u32
 const HIT_SIZE = 6; // x:i16 z:i16 amount:u16
 const BONUS_SIZE = 9; // i:u32 k:u8 x:i16 z:i16
-const ZONE_SIZE = 12; // x:i16 z:i16 r:u16 nextR:u16 until:u16 phase:u8 damage:u8
+const ZONE_SIZE = 16; // x:i16 z:i16 nextX:i16 nextZ:i16 r:u16 nextR:u16 until:u16 phase:u8 damage:u8
 const CONTACT_SIZE = 10; // i:u32 x:i16 z:i16 u:u16
 
 function clampI16(v: number): number {
@@ -416,6 +421,8 @@ export function encodeSnapshot(p: SnapshotPayload): ArrayBuffer {
   if (p.zone) {
     w.i16(packPos(p.zone.x));
     w.i16(packPos(p.zone.z));
+    w.i16(packPos(p.zone.nextX));
+    w.i16(packPos(p.zone.nextZ));
     w.u16(clampU16(Math.round(p.zone.r * POS_SCALE)));
     w.u16(clampU16(Math.round(p.zone.nextR * POS_SCALE)));
     w.u16(packSec(p.zone.until));
@@ -507,12 +514,14 @@ export function decodeSnapshot(buf: ArrayBuffer): SnapshotMessage {
   if (flags & F_ZONE) {
     const x = unpackPos(r.i16());
     const z = unpackPos(r.i16());
+    const nextX = unpackPos(r.i16());
+    const nextZ = unpackPos(r.i16());
     const zr = r.u16() / POS_SCALE;
     const nextR = r.u16() / POS_SCALE;
     const until = unpackSec(r.u16());
     const phase = ZONE_PHASE_CODES[r.u8()] ?? 'safe';
     const damage = r.u8();
-    msg.zone = { x, z, r: zr, nextR, until, phase, damage };
+    msg.zone = { x, z, nextX, nextZ, r: zr, nextR, until, phase, damage };
   }
   if (flags & F_CONTACTS) {
     const n = r.u16();
