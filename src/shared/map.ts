@@ -601,6 +601,129 @@ function buildWorks(): Box[] {
 }
 
 /**
+ * Общие спавны для новых средних карт. Все стоят у внешнего контура: центр и
+ * ключевые объекты остаются местом, за которое надо доехать и побороться, а не
+ * точкой, в которой игрок появляется уже под огнём.
+ */
+const MIDLAND_SPAWNS: Array<[number, number]> = [
+  [0, 130], [130, 0], [0, -130], [-130, 0],
+  [72, 118], [118, 72], [72, -118], [118, -72],
+  [-72, 118], [-118, 72], [-72, -118], [-118, -72],
+];
+
+/**
+ * «Перевал»: три параллельные гряды режут прямой путь через карту, но у каждой
+ * есть широкий разрыв. Это не лабиринт: можно быстро уйти по краю, рискнуть
+ * центральным проходом или вести бой за один из перевалов.
+ */
+function buildPass(): Box[] {
+  const boxes: Box[] = [];
+  const rock = (x: number, z: number, w: number, d: number, h: number) => {
+    boxes.push({ x, z, w, d, h, collisionPolygon: rockFootprint(w, d) });
+  };
+
+  // Высокие скалы — ориентиры и надёжное укрытие. Сегменты намеренно не
+  // смыкаются: любой проход шире 12 м, в нём можно развернуться под огнём.
+  for (const [x, gaps] of [
+    [-48, [-38, 42]],
+    [0, [-4]],
+    [48, [-42, 38]],
+  ] as const) {
+    const edges = [-104, ...gaps.flatMap((gap) => [gap - 9, gap + 9]), 104];
+    for (let i = 0; i < edges.length; i += 2) {
+      const from = edges[i];
+      const to = edges[i + 1];
+      rock(x, (from + to) / 2, 15, to - from, 5.5);
+    }
+  }
+
+  // Низкие осыпи заставляют выбирать траекторию, но не ломают дальние линии.
+  for (const [sx, sz] of CORNERS) {
+    rock(sx * 86, sz * 40, 24, 9, LOW);
+    rock(sx * 86, sz * 82, 16, 26, LOW);
+    rock(sx * 24, sz * 82, 30, 8, LOW);
+    rock(sx * 22, sz * 24, 10, 10, 4.5);
+  }
+  rock(0, 66, 22, 10, 4.5);
+  rock(0, -66, 22, 10, 4.5);
+
+  return boxes;
+}
+
+/**
+ * «Руины»: крупный город не превращается в сетку одинаковых коридоров. Районы
+ * из посещаемых домов стоят островами, между ними остаются широкие улицы и
+ * центральная площадь — можно играть от углов, а можно быстро сменить фланг.
+ */
+function buildRuins(): Box[] {
+  const boxes: Box[] = [];
+  const districts = [-84, -42, 0, 42, 84];
+
+  for (let ix = 0; ix < districts.length; ix++) {
+    for (let iz = 0; iz < districts.length; iz++) {
+      const x = districts[ix];
+      const z = districts[iz];
+      // Центр — площадь; ещё четыре разрыва не дают кварталам стать стеной.
+      if ((x === 0 && z === 0) || (Math.abs(x) === 84 && Math.abs(z) === 84 && ix === iz)) continue;
+      const horizontal = (ix + iz) % 2 === 0;
+      const doors: BuildingDoor[] = horizontal ? ['north', 'south'] : ['east', 'west'];
+      addVisitableBuilding(boxes, x, z, 24, 22, 4 + ((ix * 5 + iz * 3) % 3), doors);
+      // Обломок возле части домов: он низкий, поэтому мешает корпусу, но не
+      // делает улицу непростреливаемой.
+      if ((ix + iz) % 3 === 0) {
+        boxes.push({ x: x + (horizontal ? 15 : -15), z: z + (horizontal ? -13 : 13), w: 8, d: 6, h: LOW });
+      }
+    }
+  }
+
+  // Четыре высоких остова на площади — укрытия без одной доминирующей башни.
+  for (const [sx, sz] of CORNERS) {
+    boxes.push({ x: sx * 16, z: sz * 16, w: 9, d: 9, h: 4.5 });
+  }
+  return boxes;
+}
+
+/**
+ * «Карьер»: центр — открытая выемка с низкими террасами, которые удобно
+ * простреливать сверху. Высокие каменные острова по углам дают укрытие для
+ * захода в карьер, но вокруг каждого есть несколько путей обхода.
+ */
+function buildQuarry(): Box[] {
+  const boxes: Box[] = [];
+  const rock = (x: number, z: number, w: number, d: number, h: number) => {
+    boxes.push({ x, z, w, d, h, collisionPolygon: rockFootprint(w, d) });
+  };
+
+  // Террасы образуют ломаное кольцо, но на каждой стороне оставляют въезд.
+  for (const [x, z, w, d] of [
+    [-46, -26, 38, 10], [46, -26, 38, 10],
+    [-46, 26, 38, 10], [46, 26, 38, 10],
+    [-26, -46, 10, 38], [-26, 46, 10, 38],
+    [26, -46, 10, 38], [26, 46, 10, 38],
+  ] as const) rock(x, z, w, d, LOW);
+
+  // Дно карьера: редкие высокие машины и скалы — есть от чего играть, но
+  // середина не становится безопасной крепостью.
+  rock(0, 0, 16, 12, 4.5);
+  rock(-18, 8, 9, 9, 4);
+  rock(19, -10, 9, 9, 4);
+
+  for (const [sx, sz] of CORNERS) {
+    rock(sx * 88, sz * 88, 24, 18, 6);
+    rock(sx * 104, sz * 58, 12, 30, 5);
+    rock(sx * 58, sz * 104, 30, 12, 5);
+    rock(sx * 74, sz * 48, 24, 8, LOW);
+    rock(sx * 48, sz * 74, 8, 24, LOW);
+  }
+  rock(0, 108, 32, 9, 4.5);
+  rock(0, -108, 32, 9, 4.5);
+  rock(108, 0, 9, 32, 4.5);
+  rock(-108, 0, 9, 32, 4.5);
+
+  return boxes;
+}
+
+/**
  * «Рубеж»: карта для королевской битвы, 900×900 м.
  *
  * Четыре самостоятельных района разнесены по углам, а между ними оставлены
@@ -1345,6 +1468,24 @@ export const MAPS: MapDef[] = [
     build: mapWithTrees(11, buildMegapolis, MEGA_SPAWNS, MEGA_HALF),
     spawns: MEGA_SPAWNS,
     half: MEGA_HALF,
+  },
+  {
+    name: 'Перевал',
+    build: mapWithTrees(12, buildPass, MIDLAND_SPAWNS, BIG_HALF),
+    spawns: MIDLAND_SPAWNS,
+    half: BIG_HALF,
+  },
+  {
+    name: 'Руины',
+    build: mapWithTrees(13, buildRuins, MIDLAND_SPAWNS, BIG_HALF),
+    spawns: MIDLAND_SPAWNS,
+    half: BIG_HALF,
+  },
+  {
+    name: 'Карьер',
+    build: mapWithTrees(14, buildQuarry, MIDLAND_SPAWNS, BIG_HALF),
+    spawns: MIDLAND_SPAWNS,
+    half: BIG_HALF,
   },
 ];
 

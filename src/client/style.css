@@ -988,6 +988,48 @@ body {
   gap: 6px;
 }
 
+/* Карты не смешиваются в один длинный список: выбор начинается с масштаба,
+ * а уже затем — с конкретной планировки. Группы строятся из mapHalf(), поэтому
+ * новая карта автоматически попадёт в правильный раздел. */
+#setup-maps {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.setup-map-group {
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.12);
+}
+
+.setup-map-group-title {
+  margin: 0 0 6px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.45px;
+  text-transform: uppercase;
+}
+
+.setup-map-group-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.setup-map-group-buttons button {
+  flex: 1 1 82px;
+}
+
+@media (max-width: 560px) {
+  #setup-maps {
+    grid-template-columns: 1fr;
+  }
+}
+
 .setup-row button {
   flex: 1 1 auto;
   padding: 7px 10px;

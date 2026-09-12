@@ -44,7 +44,7 @@ import {
   type RoyaleSquadSize,
   type Ruleset,
 } from '../shared/constants.js';
-import { bushBoxes, bushIndexAt, coverBoxes, passableObstacles, MAP_NAMES } from '../shared/map.js';
+import { bushBoxes, bushIndexAt, coverBoxes, mapHalf as mapRadius, passableObstacles, MAP_NAMES } from '../shared/map.js';
 import { clamp, lerpAngle, sweepShell } from '../shared/sim.js';
 import type { LeaderboardEntry, RoomConfig, RoyaleZoneState, ServerMessage, WaveState } from '../shared/protocol.js';
 import {
@@ -250,9 +250,14 @@ const MAP_HINTS = [
   'Срабатывает сразу: бой начинается заново. Брустверы простреливаются насквозь — ехать зигзагом, а видно тебя всегда.',
   'Срабатывает сразу: бой начинается заново. Контейнеры не укрывают: весь парк простреливается поверху.',
   'Срабатывает сразу: бой начинается заново. Открыто и далеко. Барханы держат колёса, но не снаряды.',
-  'Срабатывает сразу: бой начинается заново. Большая долина 280×280 с редкими укрытиями и длинными переходами.',
-  'Срабатывает сразу: бой начинается заново. Промышленный район 280×280 с цехами, дворами и воротами.',
+  'Срабатывает сразу: холмы и каменные гряды. Видеть через них можно, проехать — не всегда.',
+  'Срабатывает сразу: долина 280×280 с редкими укрытиями и длинными переходами.',
+  'Срабатывает сразу: промышленный район 280×280 с цехами, дворами и воротами.',
   'Срабатывает сразу: BR-карта 900×900. Районы, дальние переходы и 24 точки появления.',
+  'Срабатывает сразу: мегаполис 900×900 с кварталами, проспектами и центральной площадью.',
+  'Срабатывает сразу: средняя карта 280×280. Три гряды, широкие перевалы и бой за проходы.',
+  'Срабатывает сразу: средняя карта 280×280. Острова разрушенных домов, площадь и широкие улицы.',
+  'Срабатывает сразу: средняя карта 280×280. Террасы, каменные острова и открытое дно карьера.',
 ];
 
 /** Что делает манера боя — подпись под выбором. Порядок как в STANCE_NAMES. */
@@ -1534,14 +1539,38 @@ function updateTeamBanner(): void {
 
 // --- Панель настроек ---
 
+const mapGroups = new Map<number, Array<{ label: string; index: number }>>();
 MAP_NAMES.forEach((label, index) => {
-  const button = document.createElement('button');
-  button.type = 'button';
-  button.textContent = label;
-  button.dataset.map = String(index);
-  button.addEventListener('click', () => net.sendSetup({ map: index }));
-  setupMaps.appendChild(button);
+  const half = mapRadius(index);
+  const group = mapGroups.get(half) ?? [];
+  group.push({ label, index });
+  mapGroups.set(half, group);
 });
+
+for (const [half, maps] of [...mapGroups.entries()].sort(([a], [b]) => a - b)) {
+  const group = document.createElement('section');
+  group.className = 'setup-map-group';
+
+  const heading = document.createElement('div');
+  heading.className = 'setup-map-group-title';
+  const size = half * 2;
+  const sizeName = size <= 140 ? 'Малые карты' : size <= 280 ? 'Средние карты' : 'Большие карты';
+  heading.textContent = `${sizeName} · ${size}×${size} м`;
+  group.appendChild(heading);
+
+  const buttons = document.createElement('div');
+  buttons.className = 'setup-map-group-buttons';
+  for (const { label, index } of maps) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = label;
+    button.dataset.map = String(index);
+    button.addEventListener('click', () => net.sendSetup({ map: index }));
+    buttons.appendChild(button);
+  }
+  group.appendChild(buttons);
+  setupMaps.appendChild(group);
+}
 
 for (const [value, label] of [
   [MODE_DM, 'Все против всех'],

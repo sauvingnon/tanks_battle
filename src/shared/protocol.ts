@@ -1,4 +1,4 @@
-import type { ExpeditionUpgrade, GameMode, RoyaleSquadSize, Ruleset } from './constants.js';
+import { MODULE_SLOT_COUNT, type ExpeditionUpgrade, type GameMode, type RoyaleSquadSize, type Ruleset } from './constants.js';
 import type {
   Boom,
   Box,
@@ -237,7 +237,7 @@ const HIT_SIZE = 6; // x:i16 z:i16 amount:u16
 const BONUS_SIZE = 9; // i:u32 k:u8 x:i16 z:i16
 const ZONE_SIZE = 16; // x:i16 z:i16 nextX:i16 nextZ:i16 r:u16 nextR:u16 until:u16 phase:u8 damage:u8
 const CONTACT_SIZE = 10; // i:u32 x:i16 z:i16 u:u16
-const LOADOUT_SLOTS = 5;
+const LOADOUT_SLOTS = MODULE_SLOT_COUNT;
 
 function clampI16(v: number): number {
   return v < -32768 ? -32768 : v > 32767 ? 32767 : v;
