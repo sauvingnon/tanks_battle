@@ -35,6 +35,13 @@ function formationSlots(squadSize: number): Array<[number, number]> {
 
 const SQUAD_CLEARANCE = 6;
 const DROP_ATTEMPTS = 80;
+/**
+ * Доли от желаемой дистанции между сквадами, перебираемые по кругу: сперва
+ * пробуем полный разнос, и только если карта слишком тесна (соло на 40 команд
+ * на небольшой карте), ослабляем требование — вплоть до полного снятия, как
+ * было раньше, чтобы высадка не могла не найтись в принципе.
+ */
+const SEPARATION_FRACTIONS = [1, 0.6, 0.3, 0.12, 0];
 
 /**
  * Живёт ровно один матч: копит уже занятые точки по ходу расстановки, чтобы
@@ -43,6 +50,8 @@ const DROP_ATTEMPTS = 80;
  */
 export class RoyaleSpawner {
   private readonly placed: Array<{ x: number; z: number }> = [];
+  /** Центры уже высаженных сквадов — по ним меряем разнос между командами. */
+  private readonly squadCenters: Array<{ x: number; z: number }> = [];
 
   constructor(
     private readonly half: number,
@@ -80,36 +89,49 @@ export class RoyaleSpawner {
    * разворот формации, отбраковка занятых и заставленных мест. Возвращает
    * позицию на каждого члена сквада, включая ещё не созданных ботов —
    * вызывающий код сам решает, кому какой слот отдать.
+   *
+   * minSeparation — желаемая дистанция между центрами разных сквадов: без неё
+   * высадка была чисто случайной, и половина сквадов оказывалась в обзоре
+   * друг друга ещё до конца отсчёта (замерено: первая смерть — на 5-й
+   * секунде матча). Требование ослабляется по SEPARATION_FRACTIONS, если
+   * карта слишком тесна для полного разноса (соло-режим, 40 команд).
    */
-   squadDrop(zone: RoyaleZoneCircle, squadSize: number): RoyaleDrop[] {
+   squadDrop(zone: RoyaleZoneCircle, squadSize: number, minSeparation = 0): RoyaleDrop[] {
     const slots = formationSlots(squadSize);
-    for (let attempt = 0; attempt < DROP_ATTEMPTS; attempt++) {
-      const angle = Math.random() * Math.PI * 2;
-      // sqrt даёт равномерную плотность по площади круга, а не сгущение к центру.
-      const radius = Math.sqrt(Math.random()) * Math.max(0, zone.r - 15);
-      const cx = zone.x + Math.sin(angle) * radius;
-      const cz = zone.z + Math.cos(angle) * radius;
-      const facing = Math.random() * Math.PI * 2;
-      const tangentX = Math.cos(facing);
-      const tangentZ = -Math.sin(facing);
-      const alongX = Math.sin(facing);
-      const alongZ = Math.cos(facing);
-      const formation = slots.map(([lateral, depth]) => ({
-        x: cx + tangentX * lateral + alongX * depth,
-        z: cz + tangentZ * lateral + alongZ * depth,
-      }));
-      if (formation.every((point) => this.pointIsFree(point.x, point.z))) {
-        this.placed.push(...formation);
-        return formation.map((point) => ({ x: point.x, z: point.z, angle: facing }));
+    for (const fraction of SEPARATION_FRACTIONS) {
+      const separation = minSeparation * fraction;
+      for (let attempt = 0; attempt < DROP_ATTEMPTS; attempt++) {
+        const angle = Math.random() * Math.PI * 2;
+        // sqrt даёт равномерную плотность по площади круга, а не сгущение к центру.
+        const radius = Math.sqrt(Math.random()) * Math.max(0, zone.r - 15);
+        const cx = zone.x + Math.sin(angle) * radius;
+        const cz = zone.z + Math.cos(angle) * radius;
+        if (separation > 0 && this.squadCenters.some((c) => Math.hypot(cx - c.x, cz - c.z) < separation)) continue;
+        const facing = Math.random() * Math.PI * 2;
+        const tangentX = Math.cos(facing);
+        const tangentZ = -Math.sin(facing);
+        const alongX = Math.sin(facing);
+        const alongZ = Math.cos(facing);
+        const formation = slots.map(([lateral, depth]) => ({
+          x: cx + tangentX * lateral + alongX * depth,
+          z: cz + tangentZ * lateral + alongZ * depth,
+        }));
+        if (formation.every((point) => this.pointIsFree(point.x, point.z))) {
+          this.placed.push(...formation);
+          this.squadCenters.push({ x: cx, z: cz });
+          return formation.map((point) => ({ x: point.x, z: point.z, angle: facing }));
+        }
       }
     }
 
     // Крайний случай — переполненная или тесная карта, где отбраковка не
-    // находит места за разумное число попыток. Группировка важнее полной
-    // проверки на занятость: сквад всё равно высаживается вместе.
+    // находит места за разумное число попыток даже без требования разноса.
+    // Группировка важнее полной проверки на занятость: сквад всё равно
+    // высаживается вместе.
     const facing = Math.random() * Math.PI * 2;
     const tangentX = Math.cos(facing);
     const tangentZ = -Math.sin(facing);
+    this.squadCenters.push({ x: zone.x, z: zone.z });
     return slots.map(([lateral]) => ({
       x: zone.x + tangentX * lateral,
       z: zone.z + tangentZ * lateral,

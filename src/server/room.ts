@@ -737,11 +737,16 @@ export class Room {
     // случайная, где угодно внутри зоны (она пока и есть вся карта).
     const spawner = new RoyaleSpawner(this.half, this.moveObstacles);
     const squadCount = royaleSquadCount(this.royaleSquadSize);
+    // Цель — разнести сквады заметно дальше дальности обзора (ROYALE_SIGHT_RANGE),
+    // чтобы высадка не превращалась в бой на 5-й секунде матча (так было
+    // измерено при чисто случайной высадке). При большом числе команд (соло)
+    // столько места на карте физически нет — squadDrop сам ослабит требование.
+    const dropSeparation = clamp((1.8 * this.half) / Math.sqrt(squadCount), ROYALE_SIGHT_RANGE, 320);
     const drops = new Map<number, RoyaleDrop[]>();
     const dropFor = (team: number): RoyaleDrop[] => {
       let drop = drops.get(team);
       if (!drop) {
-        drop = spawner.squadDrop(this.royaleZone, this.royaleSquadSize);
+        drop = spawner.squadDrop(this.royaleZone, this.royaleSquadSize, dropSeparation);
         drops.set(team, drop);
       }
       return drop;
