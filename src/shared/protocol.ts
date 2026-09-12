@@ -7,6 +7,7 @@ import type {
   SnapshotBonus,
   SnapshotContact,
   SnapshotEntry,
+  SnapshotLoadout,
   SnapshotShell,
 } from './types.js';
 
@@ -113,6 +114,8 @@ export type ClientMessage =
   | { t: 'input'; seq: number; th: number; st: number; tu: number; f?: 1 }
   | { t: 'ping'; id: number }
   | { t: 'upgrade'; id: number }
+  /** Операция со своим BR-рюкзаком; сервер сам проверяет слот и владение. */
+  | { t: 'loadout'; op: 'equip' | 'drop'; index: number }
   /** Настройка комнаты; принимается только от хоста. */
   | {
       t: 'setup';
@@ -168,6 +171,8 @@ export type ServerMessage =
       zone?: RoyaleZoneState;
       /** Последние известные точки скрытых врагов — только в королевской битве. */
       contacts?: SnapshotContact[];
+      /** Личный инвентарь — никогда не отправляется соперникам. */
+      loadout?: SnapshotLoadout;
     }
   | { t: 'kill'; killer: string; victim: string }
   /** Доска лидеров обновилась — после каждого завершённого раунда командного боя. */
@@ -222,6 +227,7 @@ const F_HITS = 1 << 2;
 const F_BONUSES = 1 << 3;
 const F_ZONE = 1 << 4;
 const F_CONTACTS = 1 << 5;
+const F_LOADOUT = 1 << 6;
 
 const HEADER_SIZE = 11; // flags:u8 + tick:u32 + ack:u32 + playerCount:u16
 const PLAYER_SIZE = 25; // i:u32 x:i16 z:i16 a:u16 t:u16 s:i16 h:u16 m:u16 f:u16 d:u8 q:u32
@@ -231,6 +237,7 @@ const HIT_SIZE = 6; // x:i16 z:i16 amount:u16
 const BONUS_SIZE = 9; // i:u32 k:u8 x:i16 z:i16
 const ZONE_SIZE = 16; // x:i16 z:i16 nextX:i16 nextZ:i16 r:u16 nextR:u16 until:u16 phase:u8 damage:u8
 const CONTACT_SIZE = 10; // i:u32 x:i16 z:i16 u:u16
+const LOADOUT_SLOTS = 5;
 
 function clampI16(v: number): number {
   return v < -32768 ? -32768 : v > 32767 ? 32767 : v;
@@ -353,7 +360,8 @@ export function encodeSnapshot(p: SnapshotPayload): ArrayBuffer {
     (p.hits !== undefined ? F_HITS : 0) |
     (p.bonuses !== undefined ? F_BONUSES : 0) |
     (p.zone !== undefined ? F_ZONE : 0) |
-    (p.contacts !== undefined ? F_CONTACTS : 0);
+    (p.contacts !== undefined ? F_CONTACTS : 0) |
+    (p.loadout !== undefined ? F_LOADOUT : 0);
 
   let size = HEADER_SIZE + p.players.length * PLAYER_SIZE;
   if (p.shells) size += 2 + p.shells.length * SHELL_SIZE;
@@ -362,6 +370,7 @@ export function encodeSnapshot(p: SnapshotPayload): ArrayBuffer {
   if (p.bonuses) size += 2 + p.bonuses.length * BONUS_SIZE;
   if (p.zone) size += ZONE_SIZE;
   if (p.contacts) size += 2 + p.contacts.length * CONTACT_SIZE;
+  if (p.loadout) size += 1 + p.loadout.inventory.length + LOADOUT_SLOTS;
 
   const w = new Writer(size);
   w.u8(flags);
@@ -437,6 +446,11 @@ export function encodeSnapshot(p: SnapshotPayload): ArrayBuffer {
       w.i16(packPos(c.z));
       w.u16(packSec(c.u));
     }
+  }
+  if (p.loadout) {
+    w.u8(p.loadout.inventory.length);
+    for (const id of p.loadout.inventory) w.u8(id);
+    for (let slot = 0; slot < LOADOUT_SLOTS; slot++) w.u8(p.loadout.equipped[slot] ?? 0);
   }
   return w.buf;
 }
@@ -530,6 +544,14 @@ export function decodeSnapshot(buf: ArrayBuffer): SnapshotMessage {
       contacts.push({ i: r.u32(), x: unpackPos(r.i16()), z: unpackPos(r.i16()), u: unpackSec(r.u16()) });
     }
     msg.contacts = contacts;
+  }
+  if (flags & F_LOADOUT) {
+    const count = r.u8();
+    const inventory: number[] = [];
+    for (let i = 0; i < count; i++) inventory.push(r.u8());
+    const equipped: number[] = [];
+    for (let slot = 0; slot < LOADOUT_SLOTS; slot++) equipped.push(r.u8());
+    msg.loadout = { inventory, equipped };
   }
   return msg;
 }

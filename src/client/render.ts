@@ -6,7 +6,7 @@ import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 
-import { MAX_HP, SHELL_HEIGHT } from '../shared/constants.js';
+import { MAX_HP, MODULE_SLOT_ARMOR, MODULE_SLOT_ENGINE, MODULE_SLOT_GUN, MODULE_SLOT_LOADER, ROYALE_MODULE_TIER_COLORS, royaleModule, SHELL_HEIGHT } from '../shared/constants.js';
 import { isBush } from '../shared/map.js';
 import { wrapAngle } from '../shared/sim.js';
 import {
@@ -995,10 +995,13 @@ export class Scene3D {
     flash: new THREE.SphereGeometry(1, 12, 10),
     ring: new THREE.RingGeometry(0.72, 1, 28),
     bonus: new THREE.BoxGeometry(1.7, 1.7, 1.7),
-    lootBody: new RoundedBoxGeometry(4.8, 2.2, 3.4, 0.16, 2),
-    lootLid: new RoundedBoxGeometry(5.1, 0.26, 3.7, 0.08, 1),
-    lootBand: new THREE.BoxGeometry(0.18, 2.42, 3.5),
     lootPlate: new RoundedBoxGeometry(1.55, 0.62, 0.08, 0.04, 1),
+    lootCore: new THREE.CylinderGeometry(0.36, 0.5, 1.5, 10),
+    lootWing: new RoundedBoxGeometry(0.34, 0.34, 1.8, 0.06, 1),
+    lootBase: new THREE.CylinderGeometry(1.72, 1.96, 0.3, 6),
+    lootRing: new THREE.TorusGeometry(1.28, 0.075, 6, 18),
+    lootCrystal: new THREE.OctahedronGeometry(0.62, 0),
+    lootCross: new RoundedBoxGeometry(0.32, 0.32, 1.55, 0.05, 1),
     // Оба конуса единичной высоты и без донышка: длину задаёт масштаб, а крышка
     // светящегося конуса выглядела бы как приклеенный к снаряду диск.
     cone: new THREE.ConeGeometry(0.5, 1, 10, 1, true),
@@ -1019,26 +1022,31 @@ export class Scene3D {
       }),
   );
 
-  private readonly containerBaseMaterial = new THREE.MeshStandardMaterial({
-    color: 0x465158,
-    roughness: 0.82,
-    metalness: 0.72,
+  private readonly moduleShellMaterial = new THREE.MeshStandardMaterial({
+    color: 0xdce8e8,
+    roughness: 0.38,
+    metalness: 0.78,
     flatShading: true,
   });
-  private readonly containerBandMaterial = new THREE.MeshStandardMaterial({
-    color: 0x1e272b,
-    roughness: 0.9,
-    metalness: 0.58,
-    flatShading: true,
+  private readonly moduleGlassMaterial = new THREE.MeshStandardMaterial({
+    color: 0xc8fbff,
+    emissive: 0x6ee8ff,
+    emissiveIntensity: 0.55,
+    transparent: true,
+    opacity: 0.55,
+    roughness: 0.12,
+    metalness: 0.2,
   });
-  private readonly containerMarkMaterials = BONUS_COLORS.map(
-    (color) => new THREE.MeshStandardMaterial({
-      color,
-      roughness: 0.62,
-      metalness: 0.28,
-      flatShading: true,
-    }),
+  private readonly moduleTierMaterials = ROYALE_MODULE_TIER_COLORS.map(
+    (color) => new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 0.7, metalness: 0.5, roughness: 0.32 }),
   );
+  private readonly moduleHealMaterial = new THREE.MeshStandardMaterial({
+    color: 0x52e6a3,
+    emissive: 0x2bd889,
+    emissiveIntensity: 1.1,
+    metalness: 0.35,
+    roughness: 0.28,
+  });
   private readonly bonuses = new Map<number, { object: THREE.Object3D; seen: boolean }>();
   /** BR-контейнеры тяжёлые и стоят на земле; старые бонусы по-прежнему парят. */
   private royaleLootVisual = false;
@@ -3093,25 +3101,67 @@ export class Scene3D {
     this.clearBonuses();
   }
 
-  /** Собирает приземлённый металлический контейнер вместо светящегося куба. */
+  /** Собирает светлый техно-стенд; силуэт и цвет сразу показывают тип лута. */
   private createLootContainer(kind: number): THREE.Group {
+    const module = royaleModule(kind);
     const group = new THREE.Group();
-    const body = new THREE.Mesh(this.geo.lootBody, this.containerBaseMaterial);
-    const lid = new THREE.Mesh(this.geo.lootLid, this.containerBaseMaterial);
-    const leftBand = new THREE.Mesh(this.geo.lootBand, this.containerBandMaterial);
-    const rightBand = new THREE.Mesh(this.geo.lootBand, this.containerBandMaterial);
-    const plate = new THREE.Mesh(
-      this.geo.lootPlate,
-      this.containerMarkMaterials[kind % this.containerMarkMaterials.length],
-    );
+    const accent = module?.heal !== undefined ? this.moduleHealMaterial : this.moduleTierMaterials[module?.tier ?? 1];
+    const base = new THREE.Mesh(this.geo.lootBase, this.moduleShellMaterial);
+    const halo = new THREE.Mesh(this.geo.lootRing, accent);
+    const upperHalo = new THREE.Mesh(this.geo.lootRing, accent);
+    const crystal = new THREE.Mesh(this.geo.lootCrystal, this.moduleGlassMaterial);
+    const plate = new THREE.Mesh(this.geo.lootPlate, accent);
+    const core = new THREE.Mesh(this.geo.lootCore, accent);
 
-    body.position.y = 1.1;
-    lid.position.y = 2.28;
-    leftBand.position.set(-2.05, 1.1, 0);
-    rightBand.position.set(2.05, 1.1, 0);
     // Маркер цвета встроен во фронт контейнера, а не висит над ним значком.
-    plate.position.set(0, 0.75, -1.73);
-    group.add(body, lid, leftBand, rightBand, plate);
+    base.position.y = 0.15;
+    halo.rotation.x = Math.PI / 2;
+    halo.position.y = 0.38;
+    upperHalo.rotation.x = Math.PI / 2;
+    upperHalo.position.y = 1.85;
+    upperHalo.scale.setScalar(0.74);
+    crystal.position.y = 1.1;
+    crystal.scale.set(0.9, 1.25, 0.9);
+    plate.position.set(0, 0.35, -1.7);
+    core.position.y = 1.28;
+    group.add(base, halo, upperHalo, crystal, plate, core);
+    // Силуэт подсказывает класс ещё до того, как игрок подъедет к контейнеру.
+    if (module?.heal !== undefined) {
+      const vertical = new THREE.Mesh(this.geo.lootCross, this.moduleHealMaterial);
+      const horizontal = new THREE.Mesh(this.geo.lootCross, this.moduleHealMaterial);
+      vertical.position.y = 1.25;
+      horizontal.position.y = 1.25;
+      horizontal.rotation.y = Math.PI / 2;
+      vertical.scale.setScalar(0.7);
+      horizontal.scale.setScalar(0.7);
+      group.add(vertical, horizontal);
+    } else if (module?.slot === MODULE_SLOT_ARMOR) {
+      const left = new THREE.Mesh(this.geo.lootWing, accent);
+      const right = new THREE.Mesh(this.geo.lootWing, accent);
+      left.position.set(-0.82, 1.25, 0);
+      right.position.set(0.82, 1.25, 0);
+      left.rotation.y = 0.45;
+      right.rotation.y = -0.45;
+      group.add(left, right);
+    } else if (module?.slot === MODULE_SLOT_GUN) {
+      core.rotation.z = Math.PI / 2;
+      core.scale.set(1, 1.8, 1);
+    } else if (module?.slot === MODULE_SLOT_LOADER) {
+      for (const x of [-0.65, 0.65]) {
+        const round = new THREE.Mesh(this.geo.lootCore, accent);
+        round.position.set(x, 1.25, 0);
+        round.scale.setScalar(0.72);
+        group.add(round);
+      }
+    } else if (module?.slot === MODULE_SLOT_ENGINE) {
+      core.rotation.x = Math.PI / 2;
+      core.scale.set(1.45, 0.9, 1.45);
+    } else if (module) {
+      const mast = new THREE.Mesh(this.geo.lootWing, accent);
+      mast.position.set(0, 2.2, 0);
+      mast.rotation.z = Math.PI / 2;
+      group.add(mast);
+    }
     group.traverse((child) => {
       if (child instanceof THREE.Mesh) child.castShadow = true;
     });

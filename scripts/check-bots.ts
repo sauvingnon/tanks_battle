@@ -25,8 +25,8 @@ import {
   ROYALE_SQUAD_SIZES,
   ROYALE_SQUAD_SIZE,
   ROYALE_START_COUNTDOWN_S,
-  ROYALE_LOOT_ARMOR,
-  ROYALE_LOOT_ARMOR_HP,
+  MODULE_SLOT_ARMOR,
+  royaleModule,
   RESPAWN_S,
   RULES_ARCADE,
   RULES_REAL,
@@ -875,15 +875,36 @@ function holdDistance(stance: number): number {
   check('BR стартовая зона накрывает всю карту', zone !== undefined && zone.r >= room.half);
   check('BR контейнеры лута стоят по карте', room.bonuses.length >= 8);
   check('BR контейнеры не истекают сами', room.bonuses.every((loot) => loot.until === Number.MAX_SAFE_INTEGER));
-  const armorLoot = room.bonuses.find((loot) => loot.kind === ROYALE_LOOT_ARMOR);
+  const armorLoot = room.bonuses.find((loot) => royaleModule(loot.kind)?.slot === MODULE_SLOT_ARMOR);
   if (armorLoot) {
     player.state = createTankState(armorLoot.x, armorLoot.z, 0);
-    player.hp = MAX_HP / 2;
     run(room, 1);
   }
-  check('BR броня подбирается в контейнере', Boolean(armorLoot) && player.royaleArmor === ROYALE_LOOT_ARMOR_HP);
-  check('BR броня увеличивает запас здоровья', Boolean(armorLoot) && player.hp === MAX_HP / 2 + ROYALE_LOOT_ARMOR_HP);
-  check('BR ремонт остаётся отдельным расходником', room.bonuses.some((loot) => loot.kind === BONUS_HEAL));
+  const armorIndex = armorLoot ? player.inventory.indexOf(armorLoot.kind) : -1;
+  const armorModule = armorLoot ? royaleModule(armorLoot.kind) : undefined;
+  check('BR модуль попадает в рюкзак из контейнера', armorIndex >= 0);
+  if (armorIndex >= 0) room.manageRoyaleLoadout(player, 'equip', armorIndex);
+  check('BR модуль ставится в свой слот', armorModule !== undefined && player.equipped[MODULE_SLOT_ARMOR] === armorModule.id);
+  check('BR модуль брони увеличивает максимум здоровья', armorModule !== undefined && room.snapshotEntries().find((entry) => entry.i === player.id)?.m === MAX_HP + (armorModule.armor ?? 0));
+  check('BR контейнеры содержат только модули', room.bonuses.every((loot) => royaleModule(loot.kind) !== undefined));
+  const handDropLoot = room.bonuses[0];
+  player.state = createTankState(handDropLoot.x, handDropLoot.z, 0);
+  run(room, 1);
+  const handDropIndex = player.inventory.indexOf(handDropLoot.kind);
+  if (handDropIndex >= 0) room.manageRoyaleLoadout(player, 'drop', handDropIndex);
+  run(room, 1);
+  check('BR ручной сброс не подбирается сразу обратно', handDropIndex >= 0 && !player.inventory.includes(handDropLoot.kind) && room.bonuses.some((loot) => loot.kind === handDropLoot.kind));
+  const dropRoom = new Room();
+  const dropPlayer = dropRoom.add('Проверка дропа', noop);
+  dropRoom.setup(MODE_ROYALE, 1, true);
+  run(dropRoom, ROYALE_START_COUNTDOWN_S * TICK_HZ + 1);
+  const carrier = bots(dropRoom).find((bot) => bot.equipped.some(Boolean));
+  const carrierModule = carrier?.equipped.find(Boolean);
+  if (carrier) {
+    (dropRoom as unknown as { hurt: (victim: Player, amount: number, killerId: number) => boolean })
+      .hurt(carrier, 99_999, dropPlayer.id);
+  }
+  check('BR уничтоженный танк выбрасывает установленный модуль', carrierModule !== undefined && dropRoom.bonuses.some((loot) => loot.kind === carrierModule));
 
   for (const size of ROYALE_SQUAD_SIZES) {
     const formatRoom = new Room();

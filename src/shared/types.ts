@@ -249,6 +249,9 @@ export interface BonusState {
   z: number;
   /** Тик, на котором неподобранный ящик исчезнет. */
   until: number;
+  /** Кто временно не может подобрать этот предмет обратно после ручного сброса. */
+  pickupBlockedFor?: number;
+  pickupBlockedUntil?: number;
 }
 
 /** Ящик в снапшоте. */
@@ -257,6 +260,12 @@ export interface SnapshotBonus {
   k: number; // вид
   x: number;
   z: number;
+}
+
+/** Личный рюкзак и пять слотов экипировки; передаётся только владельцу в BR. */
+export interface SnapshotLoadout {
+  inventory: number[];
+  equipped: number[];
 }
 
 /** Снаряд в снапшоте. Угол нужен клиенту для разворота меша и меняется на отскоках. */

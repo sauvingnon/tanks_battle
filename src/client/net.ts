@@ -91,6 +91,10 @@ export class Net {
     this.send({ t: 'upgrade', id });
   }
 
+  manageLoadout(op: 'equip' | 'drop', index: number): void {
+    this.send({ t: 'loadout', op, index });
+  }
+
   private send(msg: ClientMessage): void {
     if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(encode(msg));
   }

@@ -171,6 +171,12 @@ wss.on('connection', (ws) => {
       return;
     }
 
+    if (msg.t === 'loadout') {
+      if (!session.player || !Number.isInteger(msg.index)) return;
+      room.manageRoyaleLoadout(session.player, msg.op, msg.index);
+      return;
+    }
+
     if (msg.t === 'input') {
       const player = session.player;
       if (!player) return;
@@ -316,6 +322,7 @@ setInterval(() => {
     else if (room.bonusCount > 0) payload.bonuses = room.snapshotBonuses();
     if (zone) payload.zone = zone;
     if (room.mode === MODE_ROYALE) payload.contacts = room.snapshotContacts(player);
+    if (room.mode === MODE_ROYALE) payload.loadout = room.snapshotLoadout(player);
     player.send(encodeSnapshot(payload));
   }
 }, STEP_MS / 2);

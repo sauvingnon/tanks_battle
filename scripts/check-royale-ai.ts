@@ -358,6 +358,8 @@ function withCallout(self: BotSelf, mate: BotSelf, target: Foe, extra: Partial<B
   const wounded = roomBots(room);
   const before = new Map<number, number>();
   for (const bot of wounded) {
+    // Проверяем поведение, а не случайный бонус скорости/защиты из системы лута.
+    bot.equipped.fill(0);
     bot.hp = 40; // ниже CRITICAL_HP — политика обязана увести всех в укрытие
     before.set(bot.id, nearestBushDist(royaleBushes, bot.state.x, bot.state.z));
   }

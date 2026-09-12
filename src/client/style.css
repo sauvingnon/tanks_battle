@@ -789,6 +789,75 @@ body {
   color: var(--text);
 }
 
+#inventory-toggle {
+  position: absolute;
+  top: calc(14px + env(safe-area-inset-top));
+  right: calc(106px + env(safe-area-inset-right));
+  width: 34px;
+  height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  color: var(--muted);
+  cursor: pointer;
+  z-index: 8;
+  pointer-events: auto;
+}
+
+#inventory-toggle:hover { color: var(--text); }
+
+#inventory {
+  position: absolute;
+  top: calc(60px + env(safe-area-inset-top));
+  right: calc(14px + env(safe-area-inset-right));
+  width: min(330px, calc(100vw - 28px));
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--panel) 94%, #080d0e);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+  z-index: 8;
+  pointer-events: auto;
+}
+
+.inventory-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; margin-bottom: 10px; }
+.inventory-head span { color: var(--muted); font-size: 11px; text-align: right; }
+.inventory-slots, .inventory-bag { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
+.inventory-bag { margin-top: 10px; }
+.module-item { min-width: 0; }
+.module-card {
+  min-height: 56px;
+  padding: 8px;
+  border: 1px solid color-mix(in srgb, var(--module) 54%, var(--line));
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--module) 10%, transparent);
+  color: var(--text);
+  text-align: left;
+}
+.module-card.is-interactive { cursor: pointer; }
+.module-card.is-interactive:hover { background: color-mix(in srgb, var(--module) 22%, transparent); }
+.module-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; margin-top: 5px; }
+.module-action {
+  min-height: 26px;
+  padding: 3px 5px;
+  border: 1px solid color-mix(in srgb, var(--module) 38%, var(--line));
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--muted);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  pointer-events: auto;
+}
+.module-action:hover:not(:disabled) { color: var(--text); background: color-mix(in srgb, var(--module) 18%, transparent); }
+.module-action.is-primary { color: var(--text); border-color: color-mix(in srgb, var(--module) 68%, var(--line)); }
+.module-action:disabled { opacity: 0.45; cursor: not-allowed; }
+.module-card b, .module-card small { display: block; }
+.module-card b { font-size: 12px; }
+.module-card small { margin-top: 3px; color: var(--muted); font-size: 11px; }
+.module-card.is-empty { border-style: dashed; --module: #65747b; color: var(--muted); }
+.inventory-bag:empty::after { content: 'Рюкзак пуст'; color: var(--muted); font-size: 12px; padding: 8px 0; }
+
 #leaderboard {
   position: absolute;
   top: calc(60px + env(safe-area-inset-top));

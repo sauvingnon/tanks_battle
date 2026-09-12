@@ -14,14 +14,10 @@
   BONUS_SPEED_MUL,
   BONUS_STEALTH,
   BONUS_DURATION_S,
-  ROYALE_LOOT_ARMOR,
-  ROYALE_LOOT_ARMOR_HP,
-  ROYALE_LOOT_DAMAGE,
-  ROYALE_LOOT_DAMAGE_MUL,
-  ROYALE_LOOT_RELOAD,
-  ROYALE_LOOT_RELOAD_MUL,
-  ROYALE_LOOT_SPEED,
-  ROYALE_LOOT_SPEED_MUL,
+  MODULE_MAX_INVENTORY,
+  MODULE_SLOT_COUNT,
+  ROYALE_MODULES,
+  royaleModule,
   DT,
   MAX_BOUNCES,
   BOT_HP,
@@ -187,10 +183,9 @@ export interface Player {
   waiting: boolean;
   /** Тик окончания каждого бонусного эффекта; 0 — эффекта нет. Индекс — вид бонуса. */
   fx: number[];
-  /** Постоянные модули BR: биты соответствуют ROYALE_LOOT_*; не таймеры. */
-  royaleLootMask: number;
-  /** Добавка к максимуму здоровья от бронепластин BR. */
-  royaleArmor: number;
+  /** Рюкзак и пять экипированных модулей BR. 0 означает пустой слот. */
+  inventory: number[];
+  equipped: number[];
   /** Кэш эффекта «Маскировка» на этот тик: его читает ИИ каждого бота. */
   stealth: boolean;
   state: TankState;
@@ -251,19 +246,9 @@ const NO_SEND = (): void => {};
  * при запуске на тестовой карте они масштабируются к её размеру и проверяются
  * на свободное место. Числа задают районы, а не случайную россыпь по полю.
  */
-const ROYALE_LOOT_LAYOUT: Array<[number, number, number]> = [
-  [0, 0, BONUS_HEAL],
-  [-160, 128, ROYALE_LOOT_ARMOR],
-  [160, 128, ROYALE_LOOT_DAMAGE],
-  [-160, -128, ROYALE_LOOT_RELOAD],
-  [160, -128, ROYALE_LOOT_SPEED],
-  [0, 240, BONUS_HEAL],
-  [0, -240, BONUS_HEAL],
-  [240, 0, ROYALE_LOOT_DAMAGE],
-  [-240, 0, ROYALE_LOOT_RELOAD],
-  [-112, 240, ROYALE_LOOT_ARMOR],
-  [128, -240, ROYALE_LOOT_SPEED],
-  [224, 176, BONUS_HEAL],
+const ROYALE_LOOT_LAYOUT: Array<[number, number]> = [
+  [0, 0], [-160, 128], [160, 128], [-160, -128], [160, -128],
+  [0, 240], [0, -240], [240, 0], [-240, 0], [-112, 240], [128, -240], [224, 176],
 ];
 
 /**
@@ -482,8 +467,8 @@ export class Room {
       brain: null,
       waiting: false,
       fx: new Array<number>(BONUS_KINDS).fill(0),
-      royaleLootMask: 0,
-      royaleArmor: 0,
+      inventory: [],
+      equipped: new Array<number>(MODULE_SLOT_COUNT).fill(0),
       stealth: false,
       state: this.spawnState(spawn),
       hp: MAX_HP,
@@ -780,7 +765,9 @@ export class Room {
     const bot = this.create(botName(index), team, spawn, NO_SEND);
     const tier = Math.min(MAX_TIER, this.difficulty + (team === TEAM_PLAYERS ? 0 : Math.random() < 0.25 ? 1 : 0));
     bot.brain = createBrain(tier, this.tick, index);
-    bot.hp = BOT_HP;
+    // Боты несут добычу: чем опаснее бот, тем вероятнее у него модуль высокого тира.
+    this.equipBotRoyaleModules(bot, tier);
+    bot.hp = this.maxHealth(bot);
     this.players.set(bot.id, bot);
     this.emit({ t: 'joined', player: this.info(bot) });
   }
@@ -1055,7 +1042,7 @@ export class Room {
   private tryFire(player: Player): void {
     if (this.tick < player.readyAt) return;
     const rush = this.mode === MODE_ROYALE
-      ? (player.royaleLootMask & (1 << ROYALE_LOOT_RELOAD) ? ROYALE_LOOT_RELOAD_MUL : 1)
+      ? this.moduleStat(player, 'reload')
       : player.fx[BONUS_RELOAD] > this.tick ? BONUS_RELOAD_MUL : 1;
     const expeditionReload = player.brain ? 1 : this.expeditionStats().reload;
     player.readyAt = this.tick + Math.max(1, Math.round(RELOAD_TICKS * rush * expeditionReload));
@@ -1067,7 +1054,7 @@ export class Room {
     // Урон считаем здесь, а не при попадании: снаряд после выстрела живёт сам по себе.
     const power =
       (this.mode === MODE_ROYALE
-        ? (player.royaleLootMask & (1 << ROYALE_LOOT_DAMAGE) ? ROYALE_LOOT_DAMAGE_MUL : 1)
+        ? this.moduleStat(player, 'damage')
         : player.fx[BONUS_DAMAGE] > this.tick ? BONUS_DAMAGE_MUL : 1) *
       (player.brain ? 1 : this.expeditionStats().damage);
     // Разброс берётся на выстреле, а не на попадании: снаряд после этого несёт
@@ -1324,15 +1311,16 @@ export class Room {
 
     // Цифра всплывает там, где сейчас стоит жертва, — не там, где снаряд взорвался
     // (у тарана взрыва вовсе нет), и одна точка годится и на выстрел, и на таран.
+    const dealt = this.mode === MODE_ROYALE ? Math.max(1, Math.round(amount * this.moduleStat(victim, 'resist'))) : amount;
     this.hits.push({
       x: victim.state.x,
       z: victim.state.z,
-      amount,
+      amount: dealt,
       victimId: victim.id,
       sourceId: killerId,
     });
 
-    victim.hp -= amount;
+    victim.hp -= dealt;
     if (victim.hp > 0) {
       // Выжил, но словил трассер: даже без визуального контакта бот понимает,
       // с чьей стороны прилетело, и вправе пойти проверить.
@@ -1348,6 +1336,7 @@ export class Room {
     victim.deaths++;
     victim.respawnAt = this.tick + RESPAWN_TICKS;
     victim.queue.length = 0;
+    if (this.mode === MODE_ROYALE) this.dropRoyaleLoadout(victim);
     // Бонусы сгорают вместе с танком: копить усиления через смерть нельзя.
     victim.fx.fill(0);
     victim.stealth = false;
@@ -1389,14 +1378,14 @@ export class Room {
   /** Множитель хода от бонуса «Ход»; клиент подставляет в предсказание то же число. */
   private boost(player: Player): number {
     const bonus = this.mode === MODE_ROYALE
-      ? (player.royaleLootMask & (1 << ROYALE_LOOT_SPEED) ? ROYALE_LOOT_SPEED_MUL : 1)
+      ? this.moduleStat(player, 'speed')
       : player.fx[BONUS_SPEED] > this.tick ? BONUS_SPEED_MUL : 1;
     return bonus * (player.brain || this.mode !== MODE_EXPEDITION ? 1 : this.expeditionStats().speed);
   }
 
   private maxHealth(player: Player): number {
     const base = player.brain ? BOT_HP : MAX_HP;
-    if (this.mode === MODE_ROYALE) return base + player.royaleArmor;
+    if (this.mode === MODE_ROYALE) return base + this.moduleStat(player, 'armor');
     if (player.brain) return BOT_HP;
     if (this.mode !== MODE_EXPEDITION) return MAX_HP;
     return Math.round(MAX_HP * this.expeditionStats().health);
@@ -1452,10 +1441,6 @@ export class Room {
   }
 
   private applyBonus(player: Player, kind: number): void {
-    if (this.mode === MODE_ROYALE) {
-      this.applyRoyaleLoot(player, kind);
-      return;
-    }
     if (kind === BONUS_HEAL) {
       // Потолок берётся по самому танку: у бота он свой, а в экспедиции у команды
       // может быть увеличен карточкой «Бронекапсула». Ящики боты не подбирают, но правило
@@ -1468,35 +1453,40 @@ export class Room {
     this.emit({ t: 'pickup', id: player.id, kind });
   }
 
-  /** BR-лут постоянен до конца матча; ремонт остаётся единственным расходником. */
-  private applyRoyaleLoot(player: Player, kind: number): void {
-    if (kind !== BONUS_HEAL && (player.royaleLootMask & (1 << kind)) !== 0) return;
-    if (kind === BONUS_HEAL) {
-      player.hp = Math.min(this.maxHealth(player), player.hp + BONUS_HEAL_HP);
-    } else if (kind === ROYALE_LOOT_ARMOR) {
-      player.royaleLootMask |= 1 << kind;
-      player.royaleArmor = ROYALE_LOOT_ARMOR_HP;
-      player.hp += ROYALE_LOOT_ARMOR_HP;
-    } else {
-      player.royaleLootMask |= 1 << kind;
+  /** Поднимает предмет в рюкзак. Экипировка — отдельное, осознанное действие. */
+  private pickRoyaleModule(player: Player, kind: number): boolean {
+    const item = royaleModule(kind);
+    if (!item) return false;
+    // Хилки — расходуемый лут: подбираются и срабатывают мгновенно, слот и
+    // место в рюкзаке не занимают. Потолок всегда считается с установленной
+    // бронёй, поэтому лечение одинаково корректно для любого билда.
+    if (item.heal !== undefined) {
+      const before = player.hp;
+      player.hp = Math.min(this.maxHealth(player), player.hp + item.heal);
+      if (player.hp === before) return false;
+      this.emit({ t: 'pickup', id: player.id, kind });
+      return true;
     }
+    if (player.inventory.length >= MODULE_MAX_INVENTORY) return false;
+    player.inventory.push(kind);
     this.emit({ t: 'pickup', id: player.id, kind });
+    return true;
   }
 
-  /**
-   * Контейнеры стоят весь матч и не респавнятся. Подбирать их могут и люди, и
-   * боты: спор идёт за конкретную точку, а не за случайный временный эффект.
-   */
+  /** В BR контейнеры содержат модули, а не мгновенные усиления. */
   private updateRoyaleLoot(): void {
     const reach = TANK_RADIUS + BONUS_RADIUS;
     for (const player of this.players.values()) {
-      if (player.dead) continue;
+      // Добычу забирают только реальные игроки. Боты уже получают стартовый
+      // набор модулей, а если дать им вычищать карту, человек может подъехать
+      // к контейнеру и обнаружить, что его забрали за соседним экраном.
+      if (player.brain || player.dead) continue;
       for (let i = this.bonuses.length - 1; i >= 0; i--) {
         const loot = this.bonuses[i];
+        if (loot.pickupBlockedFor === player.id && this.tick < (loot.pickupBlockedUntil ?? 0)) continue;
         if (Math.hypot(loot.x - player.state.x, loot.z - player.state.z) > reach) continue;
-        if (loot.kind !== BONUS_HEAL && (player.royaleLootMask & (1 << loot.kind)) !== 0) continue;
+        if (!this.pickRoyaleModule(player, loot.kind)) continue;
         this.bonuses.splice(i, 1);
-        this.applyRoyaleLoot(player, loot.kind);
       }
     }
   }
@@ -1504,18 +1494,102 @@ export class Room {
   private spawnRoyaleLoot(): void {
     this.bonuses.length = 0;
     const scale = this.half / 450;
-    for (const [baseX, baseZ, kind] of ROYALE_LOOT_LAYOUT) {
+    for (const [baseX, baseZ] of ROYALE_LOOT_LAYOUT) {
       const spot = this.royaleLootSpot(baseX * scale, baseZ * scale);
       if (!spot) continue;
       this.bonuses.push({
         id: this.nextBonusId++,
-        kind,
+        kind: this.randomRoyaleModule(),
         x: spot.x,
         z: spot.z,
         until: Number.MAX_SAFE_INTEGER,
       });
     }
     this.bonusAt = Number.MAX_SAFE_INTEGER;
+  }
+
+  private randomRoyaleModule(maxTier = 3): number {
+    const roll = Math.random();
+    const tier = maxTier <= 1 ? 1 : maxTier === 2 ? (roll < 0.68 ? 1 : 2) : (roll < 0.58 ? 1 : roll < 0.9 ? 2 : 3);
+    const candidates = ROYALE_MODULES.filter((entry) => entry.tier === tier);
+    // Хилки встречаются заметно, но не вытесняют постоянные улучшения:
+    // примерно каждый четвёртый контейнер — расходуемый ремонт.
+    const heals = candidates.filter((entry) => entry.heal !== undefined);
+    const upgrades = candidates.filter((entry) => entry.heal === undefined);
+    const pool = heals.length > 0 && upgrades.length > 0 && Math.random() < 0.22 ? heals : upgrades;
+    return pool[Math.floor(Math.random() * pool.length)].id;
+  }
+
+  /** Суммирует единственный предмет каждого слота в итоговую характеристику. */
+  private moduleStat(player: Player, stat: 'armor'): number;
+  private moduleStat(player: Player, stat: 'damage' | 'reload' | 'speed' | 'resist'): number;
+  private moduleStat(player: Player, stat: 'armor' | 'damage' | 'reload' | 'speed' | 'resist'): number {
+    const additive = stat === 'armor';
+    let value = additive ? 0 : 1;
+    for (const id of player.equipped) {
+      const item = royaleModule(id);
+      const amount = item?.[stat];
+      if (typeof amount !== 'number') continue;
+      value = additive ? value + amount : value * amount;
+    }
+    return value;
+  }
+
+  private equipBotRoyaleModules(bot: Player, difficulty: number): void {
+    const count = Math.min(MODULE_SLOT_COUNT, 2 + Math.max(0, difficulty));
+    const start = Math.floor(Math.random() * MODULE_SLOT_COUNT);
+    for (let i = 0; i < count; i++) {
+      const slot = (start + i) % MODULE_SLOT_COUNT;
+      const maxTier = Math.min(3, 1 + Math.floor(difficulty / 2) + (Math.random() < 0.2 ? 1 : 0));
+      const candidates = ROYALE_MODULES.filter((entry) => entry.slot === slot && entry.tier <= maxTier);
+      bot.equipped[slot] = candidates[Math.floor(Math.random() * candidates.length)].id;
+    }
+  }
+
+  /** После гибели всё найденное остаётся на земле: и рюкзак, и установленное. */
+  private dropRoyaleLoadout(player: Player): void {
+    const items = [...player.inventory, ...player.equipped.filter(Boolean)];
+    player.inventory.length = 0;
+    player.equipped.fill(0);
+    for (const kind of items) {
+      const spot = this.royaleLootSpot(
+        player.state.x + (Math.random() - 0.5) * 8,
+        player.state.z + (Math.random() - 0.5) * 8,
+      );
+      if (!spot) continue;
+      this.bonuses.push({ id: this.nextBonusId++, kind, x: spot.x, z: spot.z, until: Number.MAX_SAFE_INTEGER });
+    }
+  }
+
+  /** Серверная команда с UI: индекс указывает на предмет в текущем рюкзаке. */
+  manageRoyaleLoadout(player: Player, op: 'equip' | 'drop', index: number): void {
+    if (this.mode !== MODE_ROYALE || player.dead || !Number.isInteger(index)) return;
+    const kind = player.inventory[index];
+    const item = royaleModule(kind);
+    if (!item || item.slot < 0 || item.heal !== undefined) return;
+    if (op === 'equip') {
+      player.inventory.splice(index, 1);
+      const previous = player.equipped[item.slot];
+      player.equipped[item.slot] = kind;
+      if (previous) player.inventory.push(previous);
+      // Если поменяли броню, не даём текущему HP перепрыгнуть новый максимум.
+      player.hp = Math.min(player.hp, this.maxHealth(player));
+      return;
+    }
+    if (op === 'drop') {
+      player.inventory.splice(index, 1);
+      // Не даём тут же подобрать предмет в следующем тике, пока танк ещё стоит
+      // над ним. Двух секунд достаточно отъехать; другим игрокам лут доступен сразу.
+      this.bonuses.push({
+        id: this.nextBonusId++,
+        kind,
+        x: player.state.x,
+        z: player.state.z,
+        until: Number.MAX_SAFE_INTEGER,
+        pickupBlockedFor: player.id,
+        pickupBlockedUntil: this.tick + 2 * TICK_HZ,
+      });
+    }
   }
 
   /** Сдвигает задуманный контейнер к ближайшему свободному месту в том же POI. */
@@ -1613,8 +1687,8 @@ export class Room {
     this.bonusAt = this.tick;
     for (const player of this.players.values()) {
       player.fx.fill(0);
-      player.royaleLootMask = 0;
-      player.royaleArmor = 0;
+      player.inventory.length = 0;
+      player.equipped.fill(0);
       player.stealth = false;
       player.zoneDamageRemainder = 0;
     }
@@ -1625,12 +1699,15 @@ export class Room {
     for (let kind = 0; kind < BONUS_KINDS; kind++) {
       if (player.fx[kind] > this.tick) mask |= 1 << kind;
     }
-    if (this.mode === MODE_ROYALE) mask |= player.royaleLootMask;
     return mask;
   }
 
   snapshotBonuses(): SnapshotBonus[] {
     return this.bonuses.map((b) => ({ i: b.id, k: b.kind, x: round(b.x), z: round(b.z) }));
+  }
+
+  snapshotLoadout(player: Player): { inventory: number[]; equipped: number[] } {
+    return { inventory: [...player.inventory], equipped: [...player.equipped] };
   }
 
   get bonusCount(): number {

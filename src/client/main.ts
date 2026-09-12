@@ -11,13 +11,10 @@ import {
   BONUS_SPEED_MUL,
   BONUS_STEALTH,
   BONUS_STEALTH_RANGE,
-  ROYALE_LOOT_ARMOR,
-  ROYALE_LOOT_DAMAGE,
-  ROYALE_LOOT_NAMES,
-  ROYALE_LOOT_RELOAD,
-  ROYALE_LOOT_SPEED,
-  ROYALE_LOOT_SPEED_MUL,
-  ROYALE_LOOT_RELOAD_MUL,
+  MODULE_SLOT_COUNT,
+  MODULE_SLOT_NAMES,
+  ROYALE_MODULE_BY_ID,
+  ROYALE_MODULE_TIER_COLORS,
   DIFFICULTY_NAMES,
   DT,
   hasEffect,
@@ -66,6 +63,7 @@ import {
   type SnapshotBonus,
   type SnapshotContact,
   type SnapshotEntry,
+  type SnapshotLoadout,
   type SnapshotShell,
 } from '../shared/types.js';
 
@@ -298,6 +296,7 @@ let myEffects = 0;
 const effectUntil = new Array<number>(BONUS_KINDS).fill(0);
 let wave: WaveState = { wave: 0, phase: 'break', left: 0, until: 0, best: 0 };
 let royaleZone: RoyaleZoneState | null = null;
+let royaleLoadout: SnapshotLoadout = { inventory: [], equipped: new Array<number>(MODULE_SLOT_COUNT).fill(0) };
 let expeditionBasePower = 1;
 /** Момент, когда кончится передышка или экран итогов: сервер прислал остаток в секундах. */
 let waveUntilAt = 0;
@@ -378,6 +377,7 @@ function handleMessage(msg: ServerMessage): void {
         msg.bonuses ?? [],
         msg.contacts ?? [],
         msg.zone,
+        msg.loadout,
       );
       break;
     case 'kill':
@@ -482,6 +482,8 @@ function applyConfig(next: RoomConfig): void {
   teamSize = next.teamSize;
   royaleSquadSize = next.royaleSquadSize;
   scene.setRoyaleLootVisual(mode === MODE_ROYALE);
+  inventoryToggle.hidden = mode !== MODE_ROYALE;
+  if (mode !== MODE_ROYALE) inventoryPanel.hidden = true;
   applyFactions();
   if (mode !== MODE_ROYALE) {
     royaleZone = null;
@@ -592,9 +594,11 @@ function refreshSelfBoost(): void {
   self.boost =
     expeditionBasePower *
     upgradeSpeed *
-    (hasEffect(myEffects, mode === MODE_ROYALE ? ROYALE_LOOT_SPEED : BONUS_SPEED)
-      ? mode === MODE_ROYALE ? ROYALE_LOOT_SPEED_MUL : BONUS_SPEED_MUL
-      : 1);
+    (mode === MODE_ROYALE ? royaleModuleMultiplier('speed') : hasEffect(myEffects, BONUS_SPEED) ? BONUS_SPEED_MUL : 1);
+}
+
+function royaleModuleMultiplier(stat: 'reload' | 'speed'): number {
+  return royaleLoadout.equipped.reduce((value, id) => value * (ROYALE_MODULE_BY_ID.get(id)?.[stat] ?? 1), 1);
 }
 
 function expeditionReloadMultiplier(): number {
@@ -614,6 +618,7 @@ function onSnapshot(
   bonuses: SnapshotBonus[],
   contacts: SnapshotContact[],
   zone?: RoyaleZoneState,
+  loadout?: SnapshotLoadout,
 ): void {
   const now = performance.now();
   royaleZone = zone ?? (mode === MODE_ROYALE ? royaleZone : null);
@@ -622,6 +627,15 @@ function onSnapshot(
   if (mode === MODE_ROYALE) updateModeChip();
   // Ящики стоят на месте, интерполировать нечего — ставим их сразу.
   scene.syncBonuses(bonuses);
+  if (loadout) {
+    const changed = !sameLoadout(royaleLoadout, loadout);
+    royaleLoadout = loadout;
+    refreshSelfBoost();
+    if (changed) {
+      renderRoyaleLoadout();
+      updateEffectsHud();
+    }
+  }
   const map = new Map<number, SnapshotEntry>();
   for (const entry of entries) map.set(entry.i, entry);
   snapshots.push({ time: now, entries: map, shells });
@@ -723,9 +737,7 @@ function frame(now: number): void {
           RELOAD_S *
           1000 *
           expeditionReloadMultiplier() *
-          (hasEffect(myEffects, mode === MODE_ROYALE ? ROYALE_LOOT_RELOAD : BONUS_RELOAD)
-            ? mode === MODE_ROYALE ? ROYALE_LOOT_RELOAD_MUL : BONUS_RELOAD_MUL
-            : 1);
+          (mode === MODE_ROYALE ? royaleModuleMultiplier('reload') : hasEffect(myEffects, BONUS_RELOAD) ? BONUS_RELOAD_MUL : 1);
         reloadUntil = now + reloadSpan;
         crosshair.classList.remove('is-firing');
         void crosshair.offsetWidth;
@@ -1243,6 +1255,10 @@ const hintReticle = el('hint-reticle');
 const leaderboardToggle = el<HTMLButtonElement>('leaderboard-toggle');
 const leaderboardPanel = el('leaderboard');
 const leaderboardRows = el('leaderboard-rows');
+const inventoryToggle = el<HTMLButtonElement>('inventory-toggle');
+const inventoryPanel = el('inventory');
+const inventorySlots = el('inventory-slots');
+const inventoryBag = el('inventory-bag');
 
 function renderExpeditionChoices(): void {
   const show = mode === MODE_EXPEDITION && wave.phase === 'upgrade' && (wave.choices?.length ?? 0) > 0;
@@ -1281,6 +1297,71 @@ function updateHud(): void {
   hudOnline.textContent = String(humans);
   hudAlive.hidden = mode !== MODE_ROYALE;
   hudAliveValue.textContent = String(wave.royaleAlive ?? 0);
+}
+
+function moduleColor(id: number): string {
+  const tier = ROYALE_MODULE_BY_ID.get(id)?.tier ?? 1;
+  return `#${ROYALE_MODULE_TIER_COLORS[tier].toString(16).padStart(6, '0')}`;
+}
+
+function moduleCard(id: number, emptyLabel?: string): HTMLElement {
+  const item = ROYALE_MODULE_BY_ID.get(id);
+  const card = document.createElement('div');
+  card.className = `module-card${item ? '' : ' is-empty'}`;
+  card.style.setProperty('--module', item ? moduleColor(id) : '#65747b');
+  if (item) card.innerHTML = `<b>T${item.tier} · ${item.name}</b><small>${item.short}</small>`;
+  else card.innerHTML = `<b>${emptyLabel ?? 'Пусто'}</b><small>Нет модуля</small>`;
+  return card;
+}
+
+function sameLoadout(a: SnapshotLoadout, b: SnapshotLoadout): boolean {
+  if (a.inventory.length !== b.inventory.length || a.equipped.length !== b.equipped.length) return false;
+  return a.inventory.every((id, index) => id === b.inventory[index]) &&
+    a.equipped.every((id, index) => id === b.equipped[index]);
+}
+
+/** Рисуем только собственный рюкзак: содержимое противников клиент не получает. */
+function renderRoyaleLoadout(): void {
+  inventorySlots.replaceChildren();
+  inventoryBag.replaceChildren();
+  for (let slot = 0; slot < MODULE_SLOT_COUNT; slot++) {
+    const card = moduleCard(royaleLoadout.equipped[slot] ?? 0, MODULE_SLOT_NAMES[slot]);
+    inventorySlots.appendChild(card);
+  }
+  royaleLoadout.inventory.forEach((id, index) => {
+    const item = ROYALE_MODULE_BY_ID.get(id);
+    const wrapper = document.createElement('div');
+    wrapper.className = 'module-item';
+    wrapper.style.setProperty('--module', item ? moduleColor(id) : '#65747b');
+    const card = moduleCard(id);
+    card.title = 'Выбери действие ниже';
+    card.classList.add('is-interactive');
+    card.addEventListener('click', () => net.manageLoadout('equip', index));
+    wrapper.appendChild(card);
+    const actions = document.createElement('div');
+    actions.className = 'module-actions';
+    const equip = document.createElement('button');
+    equip.type = 'button';
+    equip.className = 'module-action is-primary';
+    equip.textContent = 'Установить';
+    equip.disabled = !item || item.slot < 0 || item.heal !== undefined;
+    equip.title = equip.disabled ? 'Расходуется автоматически при подборе' : 'Установить в слот модуля';
+    equip.addEventListener('click', (event) => {
+      event.stopPropagation();
+      net.manageLoadout('equip', index);
+    });
+    const drop = document.createElement('button');
+    drop.type = 'button';
+    drop.className = 'module-action';
+    drop.textContent = 'Выбросить';
+    drop.addEventListener('click', (event) => {
+      event.stopPropagation();
+      net.manageLoadout('drop', index);
+    });
+    actions.append(equip, drop);
+    wrapper.appendChild(actions);
+    inventoryBag.appendChild(wrapper);
+  });
 }
 
 // --- Волны ---
@@ -1757,12 +1838,16 @@ function escapeHtml(text: string): string {
 }
 
 leaderboardToggle.addEventListener('click', () => toggleLeaderboard());
+inventoryToggle.addEventListener('click', () => {
+  if (mode === MODE_ROYALE) inventoryPanel.hidden = !inventoryPanel.hidden;
+});
 
 window.addEventListener('keydown', (event) => {
   if (event.target instanceof HTMLInputElement) return;
   if (hud.hidden) return; // до входа в бой настраивать нечего
   if (event.code === 'KeyM') toggleSetup();
   else if (event.code === 'KeyF') setFpv(!fpv, true);
+  else if (event.code === 'KeyI' && mode === MODE_ROYALE) inventoryPanel.hidden = !inventoryPanel.hidden;
 });
 
 function updateHealthHud(): void {
@@ -1805,11 +1890,10 @@ function pushFeed(text: string, extra = ''): void {
 
 /** Чипы старых таймерных бонусов; «Ремонт» мгновенный, поэтому чипа у него нет. */
 const TIMED_BONUSES = [BONUS_DAMAGE, BONUS_RELOAD, BONUS_SPEED, BONUS_STEALTH];
-/** Постоянные модули BR: в HUD нет обратного отсчёта, они живут до конца матча. */
-const ROYALE_MODULES = [ROYALE_LOOT_ARMOR, ROYALE_LOOT_DAMAGE, ROYALE_LOOT_RELOAD, ROYALE_LOOT_SPEED];
 const fxChips = new Map<number, HTMLElement>();
+const royaleModuleChips = new Array<HTMLElement>(MODULE_SLOT_COUNT);
 
-for (const kind of [...TIMED_BONUSES, ...ROYALE_MODULES]) {
+for (const kind of TIMED_BONUSES) {
   const chip = document.createElement('span');
   chip.className = 'hud-chip fx-chip';
   chip.style.setProperty('--fx', `#${BONUS_COLORS[kind].toString(16).padStart(6, '0')}`);
@@ -1817,10 +1901,17 @@ for (const kind of [...TIMED_BONUSES, ...ROYALE_MODULES]) {
   hudFx.appendChild(chip);
   fxChips.set(kind, chip);
 }
+for (let slot = 0; slot < MODULE_SLOT_COUNT; slot++) {
+  const chip = document.createElement('span');
+  chip.className = 'hud-chip fx-chip';
+  chip.hidden = true;
+  hudFx.appendChild(chip);
+  royaleModuleChips[slot] = chip;
+}
 
 function onPickup(id: number, kind: number): void {
   const who = players.get(id);
-  const name = mode === MODE_ROYALE ? ROYALE_LOOT_NAMES[kind] : BONUS_NAMES[kind];
+  const name = mode === MODE_ROYALE ? ROYALE_MODULE_BY_ID.get(kind)?.name : BONUS_NAMES[kind];
   pushFeed(`${who?.name ?? 'Кто-то'} ◆ ${name ?? 'Контейнер'}`, 'is-bonus');
   if (id !== selfId) return;
 
@@ -1842,11 +1933,15 @@ function updateEffectsHud(now = performance.now()): void {
     const text = `${BONUS_NAMES[kind]} ${left}`;
     if (chip.textContent !== text) chip.textContent = text;
   }
-  for (const kind of ROYALE_MODULES) {
-    const chip = fxChips.get(kind)!;
-    const on = mode === MODE_ROYALE && hasEffect(myEffects, kind);
+  for (let slot = 0; slot < MODULE_SLOT_COUNT; slot++) {
+    const chip = royaleModuleChips[slot];
+    const item = ROYALE_MODULE_BY_ID.get(royaleLoadout.equipped[slot] ?? 0);
+    const on = mode === MODE_ROYALE && item !== undefined;
     chip.hidden = !on;
-    if (on) chip.textContent = ROYALE_LOOT_NAMES[kind];
+    if (item) {
+      chip.style.setProperty('--fx', moduleColor(item.id));
+      chip.textContent = `T${item.tier} ${item.name}`;
+    }
   }
 }
 
@@ -1992,6 +2087,9 @@ function resetWorld(): void {
   bannerHideAt = 0;
   myEffects = 0;
   effectUntil.fill(0);
+  royaleLoadout = { inventory: [], equipped: new Array<number>(MODULE_SLOT_COUNT).fill(0) };
+  inventoryPanel.hidden = true;
+  renderRoyaleLoadout();
   scene.clearBonuses();
   updateEffectsHud();
   updateHealthHud();

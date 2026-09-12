@@ -456,26 +456,74 @@ export const BONUS_RADIUS = 3.2;
 /** Сколько ящик лежит, если его не подобрали, с. */
 export const BONUS_LIFETIME_S = 45;
 
-// --- Лут королевской битвы ---
+/**
+ * Модули BR живут отдельно от старых временных бонусов. Идентификаторы начинаются
+ * далеко за BONUS_KINDS, поэтому один формат наземного лута можно передавать и
+ * для обычных режимов, и для королевской битвы.
+ */
+export const MODULE_FIRST = 16;
+export const MODULE_SLOT_ARMOR = 0;
+export const MODULE_SLOT_GUN = 1;
+export const MODULE_SLOT_LOADER = 2;
+export const MODULE_SLOT_ENGINE = 3;
+export const MODULE_SLOT_UTILITY = 4;
+export const MODULE_SLOT_COUNT = 5;
+export const MODULE_SLOT_NAMES = ['Броня', 'Орудие', 'Заряжание', 'Двигатель', 'Система'] as const;
+export const MODULE_MAX_INVENTORY = 8;
 
-/** В BR контейнеры не дают таймерные эффекты: модуль действует до конца матча. */
-export const ROYALE_LOOT_ARMOR = BONUS_KINDS;
-export const ROYALE_LOOT_DAMAGE = BONUS_KINDS + 1;
-export const ROYALE_LOOT_RELOAD = BONUS_KINDS + 2;
-export const ROYALE_LOOT_SPEED = BONUS_KINDS + 3;
-export const ROYALE_LOOT_NAMES: Record<number, string> = {
-  [BONUS_HEAL]: 'Ремкомплект',
-  [ROYALE_LOOT_ARMOR]: 'Бронепластины',
-  [ROYALE_LOOT_DAMAGE]: 'Модуль орудия',
-  [ROYALE_LOOT_RELOAD]: 'Механизм заряжания',
-  [ROYALE_LOOT_SPEED]: 'Модуль двигателя',
-};
+export interface RoyaleModule {
+  id: number;
+  slot: number;
+  tier: 1 | 2 | 3;
+  name: string;
+  short: string;
+  /** Дополнительная прочность корпуса. */
+  armor?: number;
+  /** Множитель урона снаряда. */
+  damage?: number;
+  /** Множитель перезарядки: меньше — быстрее. */
+  reload?: number;
+  /** Множитель скорости и разгона. */
+  speed?: number;
+  /** Получаемый урон: меньше — лучше. */
+  resist?: number;
+  /** Мгновенное восстановление здоровья при подборе; такие модули не занимают слот. */
+  heal?: number;
+}
 
-/** Один подобранный модуль заметно меняет танк, но не превращает его в другой класс. */
-export const ROYALE_LOOT_ARMOR_HP = 300;
-export const ROYALE_LOOT_DAMAGE_MUL = 1.25;
-export const ROYALE_LOOT_RELOAD_MUL = 0.78;
-export const ROYALE_LOOT_SPEED_MUL = 1.18;
+const module = (entry: Omit<RoyaleModule, 'id'>, offset: number): RoyaleModule => ({
+  id: MODULE_FIRST + offset,
+  ...entry,
+});
+
+/** 15 постоянных модулей в пяти слотах и три расходуемые хилки. */
+export const ROYALE_MODULES: readonly RoyaleModule[] = [
+  module({ slot: MODULE_SLOT_ARMOR, tier: 1, name: 'Накладная броня', short: '+160 HP', armor: 160 }, 0),
+  module({ slot: MODULE_SLOT_ARMOR, tier: 2, name: 'Композитная броня', short: '+300 HP', armor: 300 }, 1),
+  module({ slot: MODULE_SLOT_ARMOR, tier: 3, name: 'Реактивная броня', short: '+440 HP', armor: 440 }, 2),
+  module({ slot: MODULE_SLOT_GUN, tier: 1, name: 'Калибровка ствола', short: '+10% урон', damage: 1.1 }, 3),
+  module({ slot: MODULE_SLOT_GUN, tier: 2, name: 'Усиленный затвор', short: '+22% урон', damage: 1.22 }, 4),
+  module({ slot: MODULE_SLOT_GUN, tier: 3, name: 'Форсированный заряд', short: '+34% урон', damage: 1.34 }, 5),
+  module({ slot: MODULE_SLOT_LOADER, tier: 1, name: 'Укладка первой очереди', short: '−9% зарядка', reload: 0.91 }, 6),
+  module({ slot: MODULE_SLOT_LOADER, tier: 2, name: 'Механический досылатель', short: '−19% зарядка', reload: 0.81 }, 7),
+  module({ slot: MODULE_SLOT_LOADER, tier: 3, name: 'Автомат заряжания', short: '−30% зарядка', reload: 0.7 }, 8),
+  module({ slot: MODULE_SLOT_ENGINE, tier: 1, name: 'Полевой турбонаддув', short: '+9% ход', speed: 1.09 }, 9),
+  module({ slot: MODULE_SLOT_ENGINE, tier: 2, name: 'Силовая передача', short: '+19% ход', speed: 1.19 }, 10),
+  module({ slot: MODULE_SLOT_ENGINE, tier: 3, name: 'Газотурбинный блок', short: '+30% ход', speed: 1.3 }, 11),
+  module({ slot: MODULE_SLOT_UTILITY, tier: 1, name: 'Противоосколочный подбой', short: '−7% входящий урон', resist: 0.93 }, 12),
+  module({ slot: MODULE_SLOT_UTILITY, tier: 2, name: 'Активная защита', short: '−14% входящий урон', resist: 0.86 }, 13),
+  module({ slot: MODULE_SLOT_UTILITY, tier: 3, name: 'Комплекс выживания', short: '−20% входящий урон', resist: 0.8 }, 14),
+  module({ slot: -1, tier: 1, name: 'Медкапсула', short: '+280 HP сразу', heal: 280 }, 15),
+  module({ slot: -1, tier: 2, name: 'Ремонтный инжектор', short: '+520 HP сразу', heal: 520 }, 16),
+  module({ slot: -1, tier: 3, name: 'Наноремонт', short: '+820 HP сразу', heal: 820 }, 17),
+];
+
+export const ROYALE_MODULE_BY_ID = new Map(ROYALE_MODULES.map((entry) => [entry.id, entry]));
+export const ROYALE_MODULE_TIER_COLORS = [0x7f9099, 0x45bf8d, 0x5e9cff, 0xc76cff] as const;
+
+export function royaleModule(id: number): RoyaleModule | undefined {
+  return ROYALE_MODULE_BY_ID.get(id);
+}
 
 /** Активен ли эффект в маске снапшота. */
 export function hasEffect(mask: number, kind: number): boolean {
